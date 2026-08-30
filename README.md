@@ -31,7 +31,14 @@ build step (`npm run build` inside `functions/`).
 - Node.js 20+ (developed against Node 24; Cloud Functions itself targets the Node 22 runtime —
   see `functions/package.json`'s `engines.node`).
 - A JVM (Java 11+) on `PATH` — the Firestore and Functions emulators are Java-based and will
-  fail to start without one. Not needed to run `npm run check`, only `npm run emulators`.
+  fail to start without one. Not needed to run `npm run check`, only `npm run emulators` /
+  `npm run test:integration`. A fresh terminal opened after installing a JDK picks up `PATH`
+  automatically. A terminal / shell session that was already open when the JDK was installed
+  will NOT see it until that session's `PATH` is refreshed (or the session is restarted) —
+  `java -version` failing right after an install usually means this, not a failed install.
+  To refresh an already-open session without restarting it:
+  - PowerShell: `$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')`
+  - Bash (Git Bash): `export PATH="$PATH:/c/Program Files/Microsoft/jdk-<version>/bin"` (adjust the path to the actual install)
 - The [Firebase CLI](https://firebase.google.com/docs/cli). It's installed locally as a dev
   dependency (`npx firebase ...`), so a global install isn't required, but `firebase login` /
   gcloud auth is still needed for anything that touches the real project.
@@ -51,7 +58,8 @@ npm --prefix functions install   # functions/ has its own node_modules — see l
 | `npm run typecheck`               | `tsc --noEmit` for both the root project and `functions/`                                                  |
 | `npm run lint`                    | ESLint (flat config, `typescript-eslint` strict + stylistic)                                               |
 | `npm run format` / `format:check` | Prettier write / check                                                                                     |
-| `npm test`                        | Vitest, single run                                                                                         |
+| `npm test`                        | Vitest, single run — excludes `*.emulator.test.ts` (see below)                                             |
+| `npm run test:integration`        | Emulator-backed tests only (`*.emulator.test.ts`), via `firebase emulators:exec` (needs Java)              |
 | `npm run emulators`               | Firebase emulator suite: Firestore, Auth, Functions (see Prerequisites — needs Java)                       |
 | `npm run verify-credentials`      | A0 deliverable — proves live Meta/Shopify/Anthropic credentials work                                       |
 
@@ -65,10 +73,29 @@ Starts Firestore (`:8080`), Auth (`:9099`) and Functions (`:5001`), with the Emu
 `http://127.0.0.1:4000`. Project ID and region come from `.firebaserc` / `scripts/config.ts`
 (`sng-meta-ads-optimizer`, Firestore region `asia-south1`, fixed permanently — see `SETUP.md`).
 
-`firestore.rules` currently denies all client reads/writes (§17.1 of the design) as a
-bootstrap; A2 replaces it with the full per-collection rule set and rules tests.
+`firestore.rules` denies all client reads/writes on every collection (§17.1 of the design) —
+a blanket `{document=**}` deny already covers every collection identically, so there's no
+per-collection detail to add. Proven against every collection in §8 by
+`test/firestore.rules.emulator.test.ts` (A2) — see "Emulator-backed tests" below.
 `functions/src/index.ts` is intentionally empty — the first real Cloud Functions entrypoints
 land in B1.
+
+## Emulator-backed tests
+
+Some tests need a real (emulated) Firestore — rules tests (which need actual security-rule
+enforcement) and integration coverage of `shared/firestore/versionGuard.ts`'s Firestore
+transaction wiring. Those live in files named `*.emulator.test.ts` and are deliberately kept
+out of `npm run test` / `npm run check`, so those stay usable on a machine without Java (e.g.
+CI that hasn't provisioned one). Run them with:
+
+```bash
+npm run test:integration
+```
+
+This wraps `vitest run -c vitest.emulator.config.ts` in `firebase emulators:exec`, which
+starts the Firestore emulator, sets `FIRESTORE_EMULATOR_HOST`, runs the tests, then tears the
+emulator down — no manual `npm run emulators` step needed first. Needs Java (see
+Prerequisites).
 
 ## Path aliases
 

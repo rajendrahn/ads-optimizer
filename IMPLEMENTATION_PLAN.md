@@ -328,7 +328,11 @@ enough.
 
 ### A2 — Firestore schema, security rules and data access layer
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean; `npm run test:integration` (Firestore emulator,
+`firebase emulators:exec`) passes 103/103: 99 rules-deny tests across every collection in §8, plus 4
+emulator-backed `upsertWithVersionGuard` tests (in-order, out-of-order, equal-version, a concurrency
+race). See Notes below for the version-guard API shape and several ambiguities later steps should know
+about.
 **Depends on:** A1
 **Design refs:** §8, §9.5, §17.1
 **Size:** M
@@ -352,6 +356,126 @@ in-order, out-of-order and equal-version writes.
 
 **Notes for the planning agent.** The version-guard helper is the single most reused primitive in Phase B —
 get its ergonomics right. Every Shopify write and every reconciled Meta insight goes through it.
+
+**Notes from implementation:**
+
+- **Layout as built.** `shared/schema/{common,meta,shopify,creative,features,decisions,sync,ai,settings,index}.ts`
+  — one file per §8 collection group, barrel-exported from `index.ts`. `shared/firestore/{client,collections,
+  repository,versionGuard,index}.ts` — the data-access layer. **`shared/firestore/` is a new subdirectory not
+  named in §0.2's layout table** (which lists only `/shared/schema` and `/shared/canon`); A2's deliverables
+  needed a home for the repository layer, key helpers and version guard that is neither "document types/zod
+  validators" (schema) nor "reporting canon" (canon, and not A2's to touch — that's A3). If this should live
+  somewhere else instead, it's a rename, not a rewrite. Test files sit next to what they test (`*.test.ts` for
+  pure unit tests, `*.emulator.test.ts` for emulator-backed ones), plus `test/firestore.rules.emulator.test.ts`
+  for the rules suite.
+- **The version-guard API** (`shared/firestore/versionGuard.ts`):
+  - `compareVersions(incoming: Date, current: Date | undefined): "no-existing-doc" | "newer" | "equal" | "older"`
+    and `decideVersionGuard(...)` are pure — no Firestore — and are what "in-order/out-of-order/equal-version"
+    actually means. Fully unit-tested without an emulator.
+  - `upsertWithVersionGuard<T>({ db, collectionName, docId, incoming, schema, getUpdatedAt?, onRejected? })`
+    wraps that decision in one Firestore transaction (read-compare-write), so two concurrent writers for the
+    same doc can't both see "no existing doc". Returns `{action:"written", comparison, data}` or
+    `{action:"rejected", comparison:"older", rejection}`. **Only `older` is rejected — `equal` writes are
+    accepted.** This was a deliberate call, not an oversight: every sync task must be idempotent (§10.2), and
+    a retried task resubmitting the same payload at the same source timestamp must succeed, not fail.
+  - `db` is typed as a narrow structural interface (`VersionGuardFirestoreLike`/`VersionGuardTransactionLike`
+    — just `collection().doc()` and `runTransaction(tx => {get, set})`), not the real `Firestore` type. A real
+    `Firestore` instance satisfies it automatically (no adapter/cast needed at call sites); this is what let
+    the in-order/out-of-order/equal/rejection-logging matrix get fully unit-tested against a hand-rolled fake
+    in `versionGuard.test.ts`, independent of `versionGuard.emulator.test.ts`'s real-emulator coverage of the
+    same cases.
+  - `onRejected` fires **after** the transaction commits, exactly once — never inside the transaction body,
+    which Firestore may retry on write contention; a side effect there could otherwise fire more than once
+    per logical rejection. A rejection is always logged via `console.warn` regardless of `onRejected` — the
+    debuggable minimum until B1 wires rejections into `syncRuns` for real (see next point).
+  - **Callers must supply `db`, `collectionName`, `docId` and a schema whose parsed type exposes a
+    `sourceUpdatedAt: Date` field** (or pass `getUpdatedAt` to read a differently-named field). Every
+    version-guarded schema in `shared/schema` (`metaInsightsDailySchema`, `shopifyOrderSchema`,
+    `shopifyOrderLineSchema`, `shopifyRefundSchema`) already has one.
+- **Deterministic keys** live in `shared/firestore/collections.ts` (`COLLECTIONS` map + a helper function per
+  composite key: `metaInsightsDailyKey`, `metaEntitySnapshotKey`, `metaChangeEventKey`, `shopifyOrderLineKey`,
+  `shopifyRefundKey`, `recommendationOutcomeKey`, `syncStateKey`). Entities keyed directly by their own
+  platform ID (`metaCampaigns/{campaignId}`, `shopifyOrders/{shopifyOrderId}`, `creativeAssets/{assetHash}`,
+  etc.) need no helper — just use the ID. A handful of collections generate their own ID at write time
+  (`recommendations`, `syncRuns`, `decisionPackets`, `creativeFamilies`, `backtestRuns`, `aiConversations`,
+  `accountMemory`) — no helper was invented for those; whichever step owns that ID scheme should add one here
+  rather than hand-building it inline, to keep this file the single place document IDs are decided.
+- **Ambiguities in the design resolved, and how:**
+  1. **§9.5's "source's own `updated_at`" is unambiguous for Shopify but Meta's Insights API has no per-row
+     version field.** Resolved: for `metaInsightsDaily`, `sourceUpdatedAt` is *our own fetch/reconciliation-run
+     timestamp*, not something Meta returns. This still delivers what §9.5 actually protects against — a slow
+     retry finishing after a newer scheduled fetch must not clobber it — without inventing a field Meta
+     doesn't provide. Documented in both `versionGuard.ts`'s module comment and `metaInsightsDailySchema`'s.
+  2. **§12 computes metrics "at ad, ad set, campaign, creative family and account level" (five levels) but
+     §8 lists only three feature collections** (`adFeatures`, `adsetFeatures`, `accountFeatures`) — no
+     `campaignFeatures` or family-level features collection. Resolved pragmatically, not definitively: one
+     generic `entityFeaturesSchema` (with an `entityType` discriminator) backs all three named collections, so
+     C2 can decide later — store campaign features in `adsetFeatures` keyed by campaign ID with
+     `entityType:"CAMPAIGN"`, put family metrics directly on `creativeFamilies` docs (§11.3 already lists them
+     as fields there), or add a fourth collection — without this schema forcing the answer. **C2 needs to
+     actually decide this**; it's flagged, not solved.
+  3. **§14's evidence JSON uses flat window-suffixed field names** (`roas28d`, `roas28dShrunk`, `cpa28d`)
+     but that's the shape of the assembled *evidence object*, not necessarily the feature-store document.
+     `entityFeaturesSchema` instead nests metrics under `windows: {"7d"|"14d"|"28d"|"56d": {...}}`
+     (`z.partialRecord`) to avoid hand-writing ~20 §12 metrics four times over. Flattening this into §14's
+     shape is a small mechanical step for D1; the reverse would not have been. If C2 lands on the flat shape
+     instead, that's a schema revision this file's comment already anticipates, not a design violation.
+  4. **A3's own spec claims "settings/ document schema" as ITS deliverable, but A2's spec says to type every
+     collection in §8, and `settings/` is one of them.** Resolved: A2 defines only the four reporting-canon
+     fields §5 already gives verbatim (unambiguous, no judgment call needed) and fixes the key convention
+     (`settings/{accountId}`, the real Meta ad account ID — not a magic singleton string, for consistency with
+     every other level). A3 owns the loader, the throw-on-absence/invalid behaviour, and any extension (model
+     config §19.2, statistical thresholds §15.1) — extend `reportingCanonSettingsSchema` with `.extend(...)`
+     rather than replacing it.
+  5. **`aiConversations`/`accountMemory`** have no step in this plan claiming them as an explicit deliverable
+     yet (§21.3 describes them only briefly; account memory is Phase F per the deferred-work table). Typed as
+     thinly as the design text supports, deliberately not embellished.
+- **Composite indexes** (`firestore.indexes.json`) are a starting set for the query patterns clearly implied
+  by the design — `metaInsightsDaily` by (adId|adsetId|campaignId, date), `metaChangeEvents` by (entityId,
+  field, detectedAt desc) for §13's `hoursSinceLast*` family, `shopifyOrders` by (customerId, createdAt) for
+  B5's new-vs-repeat derivation, `recommendations` by (status, createdAt desc), `syncRuns` by (taskType,
+  startedAt desc). JSON has no comment syntax, so the rationale for each lives in a comment in
+  `shared/firestore/collections.ts` instead of in the index file itself. Not exhaustive — extend as real
+  queries land; a missing index fails loudly in the emulator/console with a direct link to add it.
+- **`firestore.rules` is unchanged from A1's blanket `{document=**}` deny** — that already covers every
+  collection identically, so there was no per-collection detail to add (§17.1 itself says as much). What A2
+  added is the proof: `test/firestore.rules.emulator.test.ts` asserts deny-read and deny-write, for both an
+  unauthenticated and an authenticated client, against every collection in `COLLECTIONS` (24 collections × 4
+  assertions = 96 tests, plus 3 more: a collection-list denial, an arbitrary-unlisted-collection denial, and a
+  count-matches-§8 guard against this test file silently drifting from `collections.ts`). All pass against
+  the real emulator.
+- **Java/emulator status: the JVM arrived mid-task.** It was not on `PATH` when this step started (verified
+  via both the Bash tool's git-bash and PowerShell); a JDK install completed partway through and was
+  confirmed working (`java -version` succeeds once `PATH` is refreshed — a shell open before the install needs
+  that refresh explicitly, a fresh one does not). All emulator-backed tests were then actually run, not just
+  written: `npm run test:integration` passes 103/103. Doing so caught one real bug before it could reach
+  another step — `versionGuard.emulator.test.ts`'s own local test schema initially used a bare `z.date()`
+  instead of `shared/schema/common.ts`'s `firestoreTimestamp`, which failed against a real Firestore
+  `Timestamp` on read (the fake in `versionGuard.test.ts` never round-trips through real Firestore, so that
+  mismatch couldn't have shown up there) — fixed, then re-verified green. **Anyone hitting `ZodError: expected
+  date, received Timestamp` should suspect this same mismatch: schemas reading real Firestore documents must
+  use `firestoreTimestamp`, not bare `z.date()`.**
+- **The emulator-test split**: `*.emulator.test.ts` files are excluded from `vitest.config.ts` (used by
+  `npm run test` / `npm run check`) and picked up only by `vitest.emulator.config.ts` (used by
+  `npm run test:integration`, which wraps it in `firebase emulators:exec` so `FIRESTORE_EMULATOR_HOST` is set
+  and torn down automatically). `tsc` still typechecks emulator test files either way (they're under
+  `shared/**` / `test/**`, which `tsconfig.json` already includes), so a broken emulator test still fails
+  `npm run check` at the typecheck stage even when it can't run — it just won't fail at the test stage.
+- **Package additions:** `firebase-admin` and `zod` moved from transitive to direct `dependencies`;
+  `@firebase/rules-unit-testing` added as a `devDependency`. `npm audit` now reports 15 vulnerabilities
+  (13 moderate/1 high/1 critical), up from A1's 8–13 — same story as A1: all transitive through
+  `google-gax`/`teeny-request`/`protobufjs` pulled in by `firebase-admin` and `@firebase/rules-unit-testing`,
+  not a direct dependency of ours. Not addressed here; still flagged for whoever next touches dependency
+  versions.
+- **⚠️ Orchestrator note (added at A2 review; accepted as-is, but know the failure mode).**
+  `upsertWithVersionGuard` calls `schema.parse(snap.data())` on the **stored** document inside the
+  transaction, though the only value it needs from it is `sourceUpdatedAt`. Consequence: a stored document
+  that no longer satisfies the current schema makes every subsequent upsert to that document throw, rather
+  than being overwritten by the fresher data that would have fixed it. Adding an *optional* field is safe
+  (zod strips unknowns); adding a **required** field to a collection that already holds documents is not,
+  and would break B3/B5/B6 writes across the whole collection at once. Either add new fields as optional
+  with a default, or relax this to read just the timestamp. Verified at review: `npm run check` green,
+  `npm run test:integration` 103/103 against a real emulator.
 
 ---
 

@@ -13,6 +13,10 @@ export default defineConfig({
   },
   test: {
     include: ["test/**/*.test.ts", "services/**/*.test.ts", "shared/**/*.test.ts"],
-    exclude: ["node_modules/**", "functions/**"],
+    // Emulator-backed tests (name pattern *.emulator.test.ts) need a live Firestore emulator,
+    // which needs a JVM on PATH. Keep them out of the default `npm run test` / `npm run check`
+    // path so those stay usable on a machine without Java — see vitest.emulator.config.ts and
+    // the `test:integration` script, which run only these files under `firebase emulators:exec`.
+    exclude: ["node_modules/**", "functions/**", "**/*.emulator.test.ts"],
   },
 });
