@@ -1,8 +1,9 @@
 # Implementation Plan
 
 **Design reference:** `meta_ads_genai_recommendation_system_design_v2.md` (cited below as **§n**)
-**Structure:** 26 steps across five phases. Each step is sized to be planned and implemented in one agent
-session — except A0, which is mostly yours (see below).
+**Structure:** 27 steps across five phases. Each step is sized to be planned and implemented in one agent
+session — except A0, which is mostly yours (see below). (C5 was added after B2, at the user's direction, and
+is not derived from the design document — see that step for why.)
 
 ---
 
@@ -108,7 +109,8 @@ A1 scaffold
  │           └─ B7 attribution join ◀── needs B2 + B5
  │
  └─────────────────► C1 normalization ◀── needs B3 + B5 + A3
-                      └─ C2 features
+                      ├─ C5 calendar/seasonality
+                      └─ C2 features ◀── consumes C5
                           ├─ C3 statistics
                           └─ C4 change/learning features ◀── needs B4
                               │
@@ -1344,10 +1346,34 @@ invalid signature is refused.
 - `AUDIT_AD_URL_TAGS` task: parse every live ad's destination URL; any ad that does not yield a resolvable
   ad ID is flagged and **excluded from Shopify-attributed metrics rather than reported as zero revenue**
 - `attributionCoverageRatio` computed at entity and account level (§6.3)
+- **A name-matching fallback** for orders whose `utm_content`/`utm_campaign` is an ad/campaign **name**
+  rather than an ID (user decision — see Open Question #1, which measured names as the dominant case).
+  Match against B2's entity names. ⚠️ Ad names are neither unique nor stable over time, so a name match can
+  attribute revenue to the **wrong** ad: store the resolution method (`AD_ID` | `NAME_MATCH` | `UNRESOLVED`)
+  and a lower confidence on every name-resolved order, and never silently pool them with ID-resolved ones.
+  Normalize the inconsistent `utm_source` spellings (`meta`, `roi_meta`, `facebook`, `RM_META`) when
+  deciding what counts as Meta traffic.
+
+**⚠️ An untagged order is NOT evidence that no ad drove it.** 96.7% of this account's orders carry no UTM at
+all (Open Question #1), and many carry only an opaque `fbclid`. Ads running at the time drive order volume
+whether or not the link was tagged, so a missing tag is **missing measurement, not absent influence**. Three
+consequences, all binding on B7 and on everything downstream:
+
+1. **Never write per-ad Shopify revenue of zero for an unresolved order.** The existing "excluded rather than
+   reported as zero" rule is load-bearing precisely because of this — a zero would read as "this ad sells
+   nothing" when it means "we could not see the link".
+2. **Meta-attributed conversions already capture untagged ad-driven orders**, because Meta attributes via its
+   own pixel/CAPI rather than the URL. That, not the UTM join, is the per-ad decision signal while coverage is
+   this low. The UTM join is an independent cross-check on it, and §6.2 still forbids merging the two.
+3. **Emit an account-level blended efficiency metric that needs no attribution at all** — total Shopify
+   revenue ÷ total Meta spend per reporting window (commonly MER). At ~0% attribution coverage this is the
+   only honest account-level read on whether the ad spend is working, and it is immune to the tagging problem
+   entirely. C2 consumes it; D1 should cite it whenever `attributionCoverageRatio` is low.
 
 **Out of scope.** Reconciling the disagreement between Meta-attributed and Shopify-attributed figures —
 §6.2 says they disagree structurally and must never be merged. The job here is to measure the gap, not close
-it.
+it. Blended MER is not a reconciliation of the two: it deliberately uses neither attribution, dividing one
+account total by another.
 
 **Done when.** Orders resolve to ads on real data; an untagged ad appears in the audit output; the coverage
 ratio computes and is stored.
@@ -1428,8 +1454,15 @@ attributed to; the timezone stamp is present on every record.
 - Computed at ad, ad set, campaign, creative family and account level
 - `accountDataVersion` bumped once per sync run
 - Funnel rates sourced from Meta action counts, per §7.2
+- **Blended account efficiency (MER)** per window — total Shopify revenue ÷ total Meta spend, using no
+  attribution at all (see B7). With attribution coverage near zero this is the account-level truth; carry it
+  alongside the attributed metrics, clearly labelled as blended, never merged with either attributed view.
+- **Calendar/seasonality features from C5** attached to every window: the seasonal label(s) the window spans,
+  and a `windowSpansSeasonalBoundary` flag. C3 and D1 need to know when a comparison straddles a regime
+  change; see C5 for why this is not optional at this account.
 
-**Out of scope.** Intervals and shrinkage — C3 layers those on. Learning-phase features — C4.
+**Out of scope.** Intervals and shrinkage — C3 layers those on. Learning-phase features — C4. Deriving the
+calendar itself — C5.
 
 **Done when.** A full recompute over real data completes well inside a sync interval; spot-checked metrics
 reconcile against Meta Ads Manager for the same window and attribution setting.
@@ -1458,7 +1491,9 @@ evidence-first premise true rather than decorative.**
   values stored, since D1 gates on the shrunk one and the UI shows both
 
 **Out of scope.** Change-point and anomaly detection (§15.5). Historical analogues — deferred in §15.4
-until minimum-N is reachable.
+until minimum-N is reachable. Seasonality — that is C5, which you consume rather than build. **Do not
+de-seasonalise any stored value**; carry C5's context beside the number instead, so the verdict stays
+auditable.
 
 **Done when.** A low-volume entity returns `NOT_DISTINGUISHABLE` where a naive point estimate would have
 claimed a difference; shrinkage pulls a small-sample outlier toward the mean by a defensible amount, with
@@ -1496,6 +1531,62 @@ set below the conversion threshold reports `inLearningPhase: true`.
 **Notes for the planning agent.** §13.1 explains why this matters more here than at a larger account: at
 20–35 conversions per ad set per week against a ~50 threshold, several ad sets sit below it indefinitely,
 and that is frequently the true answer to "why did ROAS move?".
+
+---
+
+### C5 — Calendar and seasonality context
+
+**Status:** Not started
+**Depends on:** C1
+**Design refs:** §12, §15.3, §21.1 (not specified in the design — added to the plan after A0–B2, see below)
+**Size:** M
+
+> **Added to the plan by the user, not carried over from the design document.** The design has no seasonality
+> concept at all. It needs one: this is an Indian jewellery store (INR, `sparkleandglow.co.in`) whose order
+> volume is strongly festive-driven — Diwali, Navratri, Dhanteras, Akshaya Tritiya and the wedding season
+> move demand far more than any budget edit does. Evidence from the account already shows it: a live ad set
+> is literally named `Navratri sale 15% OFF| AD`.
+
+**Goal.** Make seasonality an explicit, inspectable signal, so that a demand swing driven by the calendar is
+never silently attributed to an ad change.
+
+**Why this is not cosmetic.** Every comparison in this system is a window against a baseline — C3's shrunk
+baseline, D1's evidence, E2's outcome evaluation. **If a 28-day window lands on Diwali and its baseline does
+not, the festive lift is credited to whatever change happened to precede it.** That is a false positive the
+rest of the design has no defence against: §15.3's shrinkage corrects for small samples, not for a demand
+regime change. Without this step, E2 will systematically record seasonally-timed recommendations as
+successes and off-season ones as failures, and E3's calibration will then be measuring the calendar.
+
+**Deliverables**
+- A `calendar/` collection or settings-backed table mapping reporting days to **seasonal labels** — named
+  festive windows, wedding season, and an off-season default. Store it as **data, not code**, so the dates
+  (which move every year on the lunar calendar) can be corrected without a deploy.
+- `seasonalityContextFor(window)`: the labels a window spans, and `spansSeasonalBoundary: true` when a window
+  and its comparison baseline sit in different regimes.
+- Day-of-week and month-of-year features — weekend/weekday effects are real and much cheaper to establish
+  than festive ones.
+- A **demand index per seasonal label**, derived from the account's own order history (B5), expressed
+  relative to the trailing off-season baseline. Keep it descriptive: this is a stated context number, not a
+  forecast, and not a correction applied silently to any metric.
+- Surface the context in the D2 packet **as text**, the way §15.2 requires intervals to appear in text — the
+  model must reason over "this window covers Diwali; its baseline does not", not be expected to infer it.
+
+**Out of scope.** Forecasting demand. De-seasonalising or otherwise adjusting stored metrics — **store the
+context beside the metric, never mutate the metric**; a silently adjusted number is unauditable and D1/E2
+would have no way to show its work. Automatic guardrails from seasonality — D5 may consume this later, but
+this step only produces the signal.
+
+**Done when.** A window covering a festive period is labelled as such; a window/baseline pair straddling a
+festive boundary sets `spansSeasonalBoundary`; the demand index for a festive label is measurably above the
+off-season baseline on this account's own data.
+
+**Notes for the planning agent.** ⚠️ **Check how much history actually exists before promising a demand
+index.** B5's seed covers 2025-01-15 → 2025-12-13 with a known gap from 2025-12-13 to ~2026-07-01, so there
+is roughly one incomplete year — enough for one observation of each festive window and **not** enough for a
+year-over-year comparison. Say so plainly rather than computing a confident-looking index from a single
+occurrence; a label with `n=1` and wide uncertainty is the honest output, and C3's whole premise is that
+uncertainty travels with the number. If the later Matrixify exports fill the gap, this becomes materially
+better — design for recompute.
 
 ---
 
@@ -1720,6 +1811,12 @@ the archive read boundary), not a convention that later code can forget.
 - Classification stored per §21.1
 
 **Out of scope.** Feeding outcomes back into prompts — that is account memory, Phase F.
+
+**⚠️ Seasonality is a first-class confound here (C5).** An accepted recommendation whose evaluation window
+lands on a festive period will look successful whatever it did, and an off-season one will look like a
+failure. Record C5's seasonal context on every outcome, and **flag — do not silently score — an outcome
+whose evaluation window and baseline sit in different seasonal regimes.** E3's calibration is only
+meaningful if it is not secretly measuring the calendar.
 
 **Done when.** A recommendation with unmet recheck conditions is not evaluated; one that meets them is
 evaluated against its shrunk baseline.
