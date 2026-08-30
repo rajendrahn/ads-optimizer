@@ -1,0 +1,12 @@
+node_modules
+functions/lib
+functions/node_modules
+coverage
+package-lock.json
+*.csv
+
+# Pre-existing prose docs from A0/design, not part of A1's scope — reformatting them
+# would produce a large unrelated diff.
+IMPLEMENTATION_PLAN.md
+meta_ads_genai_recommendation_system_design_v2.md
+SETUP.md

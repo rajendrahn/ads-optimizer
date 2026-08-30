@@ -1,0 +1,13 @@
+rules_version = '2';
+
+// §17.1: Firestore rules deny all client reads and writes. Every document is served
+// through the API (Cloud Run), which uses the Admin SDK and bypasses these rules entirely.
+// A2 builds out the full collection schema and rules tests; this bootstrap rule set only
+// needs to be correct in the meantime, not exhaustive.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

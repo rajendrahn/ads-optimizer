@@ -233,7 +233,10 @@ B5 with a confusing error; credentials that are *verified* fail here, where the 
 
 ### A1 — Repository scaffold and local development
 
-**Status:** Not started
+**Status:** Done — `npm run check` (typecheck + lint + format:check + test) passes clean; the
+Firebase emulator suite (Firestore, Auth, Functions) starts cleanly with `npm run emulators`,
+verified locally. See Notes below for two things later steps need to know: a Java prerequisite
+for the emulators, and that `functions/` is its own npm package.
 **Depends on:** A0 (needs the project ID and region)
 **Design refs:** §16.2
 **Size:** S
@@ -255,6 +258,71 @@ directory layout in §0.2 in place.
 **Notes for the planning agent.** Keep this deliberately thin — its only job is to make every later step
 cheap to start. Do not create placeholder modules for future steps; empty directories with a `.gitkeep` are
 enough.
+
+**Notes from implementation:**
+
+- **Layout as built:** `/functions`, `/services/{ingest,analytics,evidence,reasoner}`,
+  `/shared/{schema,canon}`, `/web` are empty except for `.gitkeep` (and, for `/functions`, the
+  minimal package described below). `/test` holds one real file, `test/sanity.test.ts` — the
+  "trivial passing test" deliverable.
+- **`/functions` is a separate npm package, not part of the root TS project.** Firebase requires
+  Cloud Functions source to be self-contained (its own `package.json`, its own `node_modules`,
+  its own build). It has its own `tsconfig.json` (CommonJS, `outDir: lib`) and depends on
+  `firebase-admin` + `firebase-functions` — added now (not business logic, just what the
+  Functions emulator needs to load the codebase without erroring) with `functions/src/index.ts`
+  intentionally empty (`export {}`). Run `npm --prefix functions install` after `npm install` at
+  the root. B1 is the first step that puts real code in `functions/src/index.ts`.
+- **Root `tsconfig.json` needed `allowImportingTsExtensions: true` + `noEmit: true`.**
+  `scripts/verify-credentials.ts` (A0) imports `./config.ts` with an explicit `.ts` extension,
+  which TS rejects by default even under `moduleResolution: "Bundler"`. This was never caught
+  before because A0 had no typecheck script. Fixed by adding those two compiler options — no
+  change to A0's code or its import. `npm run verify-credentials` still passes on all three
+  credentials (confirmed live).
+- **Path aliases** (`@shared/*` → `shared/*`, `@services/*` → `services/*`) are defined once in
+  `tsconfig.json` `paths` and mirrored in `vitest.config.ts`'s `resolve.alias`. Verified working
+  end-to-end for `tsc --noEmit`, Vitest, and `tsx` (all three resolve `tsconfig.json` paths
+  natively — no extra resolver package needed) using throwaway probe files, since deleted per
+  the "no placeholder modules" instruction.
+- **The Firestore/Functions emulators require a JVM on `PATH`; this machine didn't have one.**
+  `java -version` failed outright. A `winget install` of a JDK requires interactive UAC
+  elevation, which isn't available non-interactively — so this was verified instead with a
+  portable (no-installer) Temurin JDK 21 zip, extracted outside the repo and pointed to via
+  `JAVA_HOME`/`PATH` for the verification run only; nothing was installed system-wide or added
+  to the repo. **Whoever runs `npm run emulators` next needs a real Java install** (`winget
+  install Microsoft.OpenJDK.21`, accepting the elevation prompt interactively, or any JDK 11+ on
+  `PATH`) — this is now called out in `README.md` under Prerequisites. `npm run check` itself
+  has no Java dependency and is unaffected.
+- **`functions/package.json` pins `engines.node: "22"`** (a current Cloud Functions Gen 2
+  runtime) even though the local dev machine runs Node 24 — the emulator just logs a harmless
+  mismatch warning and uses the host's Node anyway. Revisit the pinned version at whichever step
+  first deploys `functions/` for real, since Cloud Functions' supported runtime list moves
+  independently of local Node.
+- **`npm audit`** reports 8–13 moderate/high findings, all transitive through
+  `google-gax`/`teeny-request` pulled in by `@google-cloud/secret-manager` (A0) and
+  `firebase-admin`/`firebase-tools` (A1) — no direct dependency of ours. Not addressed here;
+  flagging for whoever next touches dependency versions.
+- **`firestore.rules`** is a minimal blanket deny-all, matching §17.1's requirement but with none
+  of A2's per-collection detail or rules tests — treat it as a bootstrap the emulator needs to
+  start, not as A2's deliverable already done.
+- **Ambiguity surfaced, resolved pragmatically:** the "no placeholder modules" instruction is in
+  tension with "emulator suite for … Functions" — an empty `/functions` directory (just
+  `.gitkeep`) cannot be loaded by the Functions emulator at all (no `package.json` to find a
+  runtime with). Resolved by treating `functions/` as necessary infrastructure scaffolding (an
+  empty, zero-logic entrypoint) rather than a placeholder for future business logic, since
+  Firebase's own tooling requires the package to exist as a precondition for the emulator to run
+  — distinct from the services/shared directories, which genuinely need nothing more than
+  `.gitkeep` at this stage.
+- **⚠️ Orchestrator note (added at A1 review, unresolved by design — B1 owns the fix).**
+  `functions/` as scaffolded cannot import `/shared` or `/services`: it is CommonJS
+  (`module: "CommonJS"`, no `"type": "module"`) while the root project is ESM; it declares no
+  `paths`, so `@shared/*` does not resolve inside it; and its `rootDir: "src"` means `tsc` will
+  refuse to compile any file outside `functions/src`. This is fine through A2–A4, which are all
+  root-project code, but **B1 is the first step to put real logic in `functions/` and it depends
+  on A2's schema and repository layer.** B1 must resolve this deliberately — the plausible
+  options are making `functions/` ESM to match, or building `/shared` to a package that
+  `functions/` depends on, or having functions be a thin deploy shim that imports a bundled root
+  artifact. Pick one with the deploy story in mind; do not paper over it with relative
+  `../../shared` imports, which defeat `rootDir` anyway.
 
 ---
 

@@ -3,14 +3,28 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "verify-credentials": "tsx scripts/verify-credentials.ts"
+    "verify-credentials": "tsx scripts/verify-credentials.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p functions/tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
+    "emulators": "firebase emulators:start --only firestore,auth,functions"
   },
   "dependencies": {
     "@google-cloud/secret-manager": "^5.6.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.10.0",
+    "eslint": "^9.39.5",
+    "eslint-config-prettier": "^9.1.2",
+    "firebase-tools": "^15.28.2",
+    "prettier": "^3.9.6",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.68.0",
+    "vitest": "^2.1.9"
   }
 }

@@ -2,3 +2,15 @@ node_modules/
 *.csv
 .env
 .env.*
+
+# Build output / tooling caches
+functions/lib/
+dist/
+coverage/
+
+# Firebase local emulator / CLI state
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+*-debug.log
