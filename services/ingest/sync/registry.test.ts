@@ -36,9 +36,17 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers SYNC_NOOP plus B2's two real task types", () => {
+  it("registers SYNC_NOOP plus B2's, B3's and B5's real task types", () => {
     const registry = createDefaultRegistry();
-    expect(registry.list()).toEqual([SYNC_NOOP, "META_SYNC_ENTITIES", "META_SNAPSHOT_CONFIG"]);
+    expect(registry.list()).toEqual([
+      SYNC_NOOP,
+      "META_SYNC_ENTITIES",
+      "META_SNAPSHOT_CONFIG",
+      "META_SYNC_INSIGHTS",
+      "META_POLL_ASYNC_REPORT",
+      "SHOPIFY_IMPORT_ORDERS_CSV",
+      "SHOPIFY_SYNC_ORDERS",
+    ]);
   });
 
   it("SYNC_NOOP reports newRowCount:1 by default (healthy)", async () => {

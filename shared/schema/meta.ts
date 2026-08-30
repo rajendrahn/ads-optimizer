@@ -171,3 +171,61 @@ export const metaChangeEventSchema = z.object({
   actor: z.string().nullable(),
 });
 export type MetaChangeEvent = z.infer<typeof metaChangeEventSchema>;
+
+// ---------------------------------------------------------------------------------------
+// metaInsightsReportJobs/{reportRunId} — B3's own bookkeeping for the async report job state
+// machine (§7.1: "submit the request, poll report_run_id, then page the results"). NOT one of
+// §8's named collections — §8 was written before the implementation detail of a stateful async
+// poll loop was worked out. Treated the same way `syncRuns`/`syncState` are: infrastructure the
+// task framework needs, not a namespace §8's "do not namespace speculatively" warns against.
+//
+// Wholesale-overwritten on every state transition, like `syncRuns` — NOT run through
+// `upsertWithVersionGuard`. That guard exists for Meta/Shopify-*sourced* business data that can
+// arrive out of order from multiple writers (§9.5); this document has exactly one writer (the
+// META_SYNC_INSIGHTS/META_POLL_ASYNC_REPORT task chain advancing its own job) and no source
+// `updated_at` of its own to compare against — it's process state, not a measurement.
+//
+// `attribution` is captured here at SUBMISSION time and carried through every later phase
+// transition, rather than re-read from `loadReportingCanon()` while paging results — a
+// long-running backfill could in principle span a canon change mid-flight (§5.3: "when either
+// changes, emit a first-class change event"), and every row this job produces must carry the
+// attribution that was ACTUALLY used to generate the underlying Meta report, not whatever the
+// canon says today.
+// ---------------------------------------------------------------------------------------
+
+export const metaInsightsReportJobReasonSchema = z.enum([
+  "backfill",
+  "reconciliation_incremental",
+  "reconciliation_deep",
+]);
+export type MetaInsightsReportJobReason = z.infer<typeof metaInsightsReportJobReasonSchema>;
+
+export const metaInsightsReportJobPhaseSchema = z.enum([
+  "SUBMITTED", // report_run_id obtained from Meta, not yet polled
+  "POLLING", // Meta has reported a non-terminal async_status at least once
+  "PAGING", // Meta reported "Job Completed"; paging results, possibly across >1 invocation
+  "DONE", // fully paged, every row upserted
+  "FAILED", // Meta reported a terminal failure, or pollAttempts exceeded the configured cap
+]);
+export type MetaInsightsReportJobPhase = z.infer<typeof metaInsightsReportJobPhaseSchema>;
+
+export const metaInsightsReportJobSchema = z.object({
+  reportRunId: z.string().min(1),
+  reason: metaInsightsReportJobReasonSchema,
+  since: reportingDay, // inclusive
+  until: reportingDay, // inclusive
+  attribution: attributionProvenance, // §5.3 — pinned at submission, see module comment
+  phase: metaInsightsReportJobPhaseSchema,
+  // Meta's `after` cursor to resume paging from — set once PAGING starts, advanced (or reset to
+  // null on completion) after every processed page. Lets a bounded-per-invocation poll resume
+  // exactly where the previous invocation left off rather than re-paging from the start.
+  pageCursor: z.string().nullable(),
+  rowsWritten: z.number().int().nonnegative(), // cumulative across every invocation
+  pollAttempts: z.number().int().nonnegative(),
+  // The META_SYNC_INSIGHTS syncRuns id that submitted this job — traceability only.
+  submittedByRunId: z.string().min(1),
+  lastError: z.string().nullable(),
+  createdAt: firestoreTimestamp,
+  updatedAt: firestoreTimestamp,
+});
+export type MetaInsightsReportJob = z.infer<typeof metaInsightsReportJobSchema>;

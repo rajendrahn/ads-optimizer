@@ -11,7 +11,7 @@ import {
 } from "./collections.ts";
 
 describe("COLLECTIONS", () => {
-  it("lists every collection in §8, and the name equals the key", () => {
+  it("lists every collection in §8 plus B3's metaInsightsReportJobs, and the name equals the key", () => {
     const names = [
       "metaCampaigns",
       "metaAdsets",
@@ -20,6 +20,9 @@ describe("COLLECTIONS", () => {
       "metaInsightsDaily",
       "metaEntitySnapshots",
       "metaChangeEvents",
+      // Not one of §8's named collections — B3's own async-report-job bookkeeping, see
+      // shared/schema/meta.ts's module comment on metaInsightsReportJobSchema.
+      "metaInsightsReportJobs",
       "shopifyOrders",
       "shopifyOrderLines",
       "shopifyRefunds",

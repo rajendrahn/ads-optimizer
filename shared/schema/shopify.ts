@@ -23,6 +23,15 @@ export const shopifyOrderSchema = z.object({
   totalPriceMinorUnits: z.number().int(),
   subtotalPriceMinorUnits: z.number().int(),
   totalDiscountsMinorUnits: z.number().int(),
+  // Added by B5, optional/defaulted per A2's schema-evolution rule (empty collection at the
+  // time this landed, so this is precautionary, not a live-migration need). Neither the
+  // Matrixify CSV nor the GraphQL Admin API expose a single "shipping revenue" field on the
+  // *order* the way they do subtotal/discounts/total — B5 derives it from the CSV's "Price:
+  // Total Shipping" order-summary column / GraphQL's `totalShippingPriceSet`, both of which
+  // are the *original* (pre-refund) shipping charge, matching how totalPriceMinorUnits etc.
+  // are also original, not current, values (see B5 notes on current vs. original Shopify
+  // money fields).
+  totalShippingMinorUnits: z.number().int().nullable().optional(),
   financialStatus: z.string().nullable(),
   fulfillmentStatus: z.string().nullable(),
   cancelledAt: firestoreTimestamp.nullable(),
@@ -32,9 +41,27 @@ export const shopifyOrderSchema = z.object({
   // misclassify historical orders). Null until that pass has run.
   isNewCustomer: z.boolean().nullable(),
   country: z.string().nullable(),
-  landingSite: z.string().nullable(), // raw query string, verbatim (§6.1, §7.2)
+  // Raw query string, verbatim (§6.1, §7.2) — B7's join parses this. Populated for
+  // MATRIXIFY_IMPORT orders straight from the CSV's "Browser: Landing Page"/"Browser:
+  // Referrer" columns. **For GRAPHQL_SYNC and WEBHOOK orders these are always null** — verified
+  // live against this store's real Shopify Admin API (2025-01): `Order.landingSite`/
+  // `.referringSite` do not exist in the GraphQL schema at all (removed upstream of this API
+  // version); the intended replacement, `Order.customerJourneySummary.firstVisit/lastVisit`,
+  // is queryable but returns null for every real order sampled — this store is not on Shopify
+  // Plus, and per §6.2 that summary requires it. REST still exposes these fields but is
+  // off-limits per §0.2 ("REST is legacy — do not use it"). Net effect: **post-CSV-backfill
+  // orders currently have no landing-page attribution data at all via any sanctioned path** —
+  // B7's join only has query strings for the ~10k orders MATRIXIFY_IMPORT actually covers.
+  // B6 should check whether webhook payloads (a different delivery mechanism, historically
+  // REST-shaped even for GraphQL-API apps) still carry these fields before assuming this gap
+  // is permanent.
+  landingSite: z.string().nullable(),
   referringSite: z.string().nullable(),
-  rawAttributionTag: z.string().nullable(), // §6.1: raw tag stored alongside the resolved ID
+  // §6.1: raw tag stored alongside the resolved ad ID, for replay without re-fetching. B5
+  // deliberately leaves this null on every order it writes — parsing UTMs out of landingSite
+  // is explicitly B7's job, not B5's (IMPLEMENTATION_PLAN.md B5 "Out of scope"); B7 populates
+  // this alongside resolvedAdId/resolvedCampaignId when it does the join.
+  rawAttributionTag: z.string().nullable(),
   resolvedAdId: z.string().nullable(), // populated by B7's join, not B5
   resolvedCampaignId: z.string().nullable(), // populated by B7's join, not B5
   source: shopifyOrderSourceSchema,
@@ -53,6 +80,10 @@ export const shopifyOrderLineSchema = z.object({
   priceMinorUnits: z.number().int(),
   currency: z.string().length(3),
   productTags: z.array(z.string()).nullable(),
+  // Added by B5, optional/defaulted per A2's schema-evolution rule. Cheap to capture from
+  // both sources (CSV's "Line: Product Type" column, GraphQL's `product.productType`) — kept
+  // alongside productTags for §7.2/§12's "product mix" metrics.
+  productType: z.string().nullable().optional(),
   sourceUpdatedAt: firestoreTimestamp, // version-guard field (parent order's updated_at)
   syncedAt: firestoreTimestamp,
 });

@@ -17,6 +17,14 @@ import {
   metaSnapshotConfigRegistration,
   metaSyncEntitiesRegistration,
 } from "../meta/entities/index.ts";
+import {
+  metaPollAsyncReportRegistration,
+  metaSyncInsightsRegistration,
+} from "../meta/insights/index.ts";
+import {
+  matrixifyImportRegistration,
+  shopifySyncOrdersRegistration,
+} from "../shopify/orders/index.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -93,5 +101,14 @@ export function createDefaultRegistry(): TaskRegistry {
   });
   registry.register(metaSyncEntitiesRegistration);
   registry.register(metaSnapshotConfigRegistration);
+  // B3's async report job state machine — see services/ingest/meta/insights/pollAsyncReport.ts's
+  // module comment for why these two task types exist and how they hand off to each other.
+  registry.register(metaSyncInsightsRegistration);
+  registry.register(metaPollAsyncReportRegistration);
+  // B5's Shopify orders ingestion — the one-time (but re-runnable, see matrixifyImport.ts's
+  // module comment) Matrixify CSV backfill and the ongoing GraphQL watermark sync. Both share
+  // `syncState/shopify_orders` (see ordersSync.ts's module comment for why).
+  registry.register(matrixifyImportRegistration);
+  registry.register(shopifySyncOrdersRegistration);
   return registry;
 }

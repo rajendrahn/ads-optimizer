@@ -116,6 +116,8 @@ describe("runSyncTask — task with a syncStateTarget", () => {
       attributionWindow: "7d_click_1d_view",
       status: "healthy",
       lastRunId: "prior-run",
+      backfillCoverageThroughDate: null,
+      knownGaps: null,
     });
 
     const result = await runSyncTask({
@@ -441,5 +443,105 @@ describe("runSyncTask — version-guard rejection logging (A2 orchestrator note)
     expect(result.status).toBe("FAILED");
     const run = await syncStore.getSyncRun("run-vg-2");
     expect(run?.versionGuardRejections).toHaveLength(1);
+  });
+});
+
+describe("runSyncTask — knownGaps / backfillCoverageThroughDate carry-forward (B5 addition)", () => {
+  function registryWithShopifyOrders(handler: TaskHandler) {
+    const registry = createTaskRegistry();
+    registry.register({
+      taskType: "SHOPIFY_SYNC_ORDERS",
+      runSource: "shopify",
+      syncStateTarget: { source: "shopify", resource: "orders" },
+      handler,
+    });
+    return registry;
+  }
+
+  it("writes knownGaps/backfillCoverageThroughDate when the handler sets them", async () => {
+    const registry = registryWithShopifyOrders(async () => ({
+      newRowCount: 1,
+      backfillCoverageThroughDate: "2025-12-13",
+      knownGaps: [{ startDate: "2025-12-14", endDateExclusive: "2026-07-02", reason: "gap" }],
+    }));
+    const syncStore = createInMemorySyncStore();
+
+    await runSyncTask({
+      syncStore,
+      registry,
+      taskType: "SHOPIFY_SYNC_ORDERS",
+      payload: {},
+      archiver: dummyArchiver,
+      taskId: "run-gap-1",
+    });
+
+    const state = await syncStore.getSyncState("shopify_orders");
+    expect(state?.backfillCoverageThroughDate).toBe("2025-12-13");
+    expect(state?.knownGaps).toEqual([
+      { startDate: "2025-12-14", endDateExclusive: "2026-07-02", reason: "gap" },
+    ]);
+  });
+
+  it("leaves knownGaps/backfillCoverageThroughDate untouched when the handler omits them", async () => {
+    const syncStore = createInMemorySyncStore();
+    await syncStore.setSyncState("shopify_orders", {
+      source: "shopify",
+      resource: "orders",
+      accountId: "acct",
+      lastSuccessfulSyncAt: new Date(),
+      lastDataDate: "2026-08-01",
+      reconciliationDays: null,
+      attributionWindow: null,
+      status: "healthy",
+      lastRunId: "prior",
+      backfillCoverageThroughDate: "2025-12-13",
+      knownGaps: [{ startDate: "2025-12-14", endDateExclusive: "2026-07-02", reason: "gap" }],
+    });
+    const registry = registryWithShopifyOrders(async () => ({ newRowCount: 1 }));
+
+    await runSyncTask({
+      syncStore,
+      registry,
+      taskType: "SHOPIFY_SYNC_ORDERS",
+      payload: {},
+      archiver: dummyArchiver,
+      taskId: "run-gap-2",
+    });
+
+    const state = await syncStore.getSyncState("shopify_orders");
+    expect(state?.backfillCoverageThroughDate).toBe("2025-12-13");
+    expect(state?.knownGaps).toEqual([
+      { startDate: "2025-12-14", endDateExclusive: "2026-07-02", reason: "gap" },
+    ]);
+  });
+
+  it("explicitly clears knownGaps when the handler returns an empty array (gap closed)", async () => {
+    const syncStore = createInMemorySyncStore();
+    await syncStore.setSyncState("shopify_orders", {
+      source: "shopify",
+      resource: "orders",
+      accountId: "acct",
+      lastSuccessfulSyncAt: new Date(),
+      lastDataDate: "2026-08-01",
+      reconciliationDays: null,
+      attributionWindow: null,
+      status: "healthy",
+      lastRunId: "prior",
+      backfillCoverageThroughDate: "2025-12-13",
+      knownGaps: [{ startDate: "2025-12-14", endDateExclusive: "2026-07-02", reason: "gap" }],
+    });
+    const registry = registryWithShopifyOrders(async () => ({ newRowCount: 1, knownGaps: [] }));
+
+    await runSyncTask({
+      syncStore,
+      registry,
+      taskType: "SHOPIFY_SYNC_ORDERS",
+      payload: {},
+      archiver: dummyArchiver,
+      taskId: "run-gap-3",
+    });
+
+    const state = await syncStore.getSyncState("shopify_orders");
+    expect(state?.knownGaps).toEqual([]);
   });
 });

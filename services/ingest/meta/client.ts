@@ -76,12 +76,39 @@ export class MetaClient {
     path: string,
     params: Record<string, string> = {},
   ): Promise<MetaGetResult<T>> {
+    return this.request<T>("GET", path, params);
+  }
+
+  /**
+   * One POST against the Graph API — B3 needs this to submit an async insights report job
+   * (`POST /{ad_account_id}/insights` returns `{report_run_id}`; Meta's async report submission
+   * is a POST, not a GET). Same BUC/retry handling as `get()`; parameters (including the token
+   * and `appsecret_proof`) go in a form-encoded body rather than the query string, matching how
+   * the Graph API itself accepts POST bodies.
+   */
+  async post<T = unknown>(
+    path: string,
+    params: Record<string, string> = {},
+  ): Promise<MetaGetResult<T>> {
+    return this.request<T>("POST", path, params);
+  }
+
+  private async request<T>(
+    method: "GET" | "POST",
+    path: string,
+    params: Record<string, string>,
+  ): Promise<MetaGetResult<T>> {
     await this.preemptiveThrottle();
 
     return withRetry(
       async () => {
-        const url = this.buildUrl(path, params);
-        const res = await this.fetchImpl(url);
+        const res =
+          method === "GET"
+            ? await this.fetchImpl(this.buildUrl(path, params))
+            : await this.fetchImpl(`${this.baseUrl}/${this.apiVersion}${path}`, {
+                method: "POST",
+                body: this.buildBody(params),
+              });
 
         this.lastUsage = parseBucHeader(res.headers.get("x-business-use-case-usage"));
 
@@ -93,6 +120,15 @@ export class MetaClient {
       },
       { sleep: this.sleepImpl },
     );
+  }
+
+  private buildBody(params: Record<string, string>): URLSearchParams {
+    const body = new URLSearchParams(params);
+    body.set("access_token", this.accessToken);
+    if (this.appSecret) {
+      body.set("appsecret_proof", this.computeAppSecretProof());
+    }
+    return body;
   }
 
   /**

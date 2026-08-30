@@ -30,3 +30,10 @@ export {
 export { fetchAllMetaEntities, type FetchedMetaEntities } from "./fetchAll.ts";
 export { metaSyncEntitiesHandler, metaSyncEntitiesRegistration } from "./entitySync.ts";
 export { metaSnapshotConfigHandler, metaSnapshotConfigRegistration } from "./configSnapshot.ts";
+export {
+  diffEntitySnapshots,
+  deriveAndWriteChangeEvents,
+  type DiffSnapshotPairOptions,
+  type DeriveAndWriteChangeEventsOptions,
+  type DeriveAndWriteChangeEventsResult,
+} from "./changeEvents.ts";

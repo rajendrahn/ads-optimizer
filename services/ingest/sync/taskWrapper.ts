@@ -31,7 +31,12 @@
 //     regardless of whether the run overall succeeds or fails.
 
 import type { VersionGuardRejection } from "@shared/firestore/index.ts";
-import type { ReportingDay, SyncRun, VersionGuardRejectionLogEntry } from "@shared/schema/index.ts";
+import type {
+  ReportingDay,
+  SyncRun,
+  SyncState,
+  VersionGuardRejectionLogEntry,
+} from "@shared/schema/index.ts";
 import { syncStateKey } from "@shared/firestore/index.ts";
 import { randomUUID } from "node:crypto";
 import { META_AD_ACCOUNT_ID } from "../../../scripts/config.ts";
@@ -55,6 +60,16 @@ export interface TaskHandlerResult {
   /** Free-form, for logs/debugging — not currently persisted onto `syncRuns` (that schema has
    * no field for it yet); surfaced on `RunSyncTaskResult` for a caller/test to inspect. */
   summary?: Record<string, unknown>;
+  /** B5's addition to `syncState` (shared/schema/sync.ts) — see that file's field comments.
+   * Both follow the same carry-forward-if-omitted rule as everything else `syncState` keeps
+   * across runs (`reconciliationDays`, `attributionWindow` below): a handler that doesn't know
+   * how to compute one of these for its resource should simply not set it, leaving whatever
+   * the previous run stored untouched. Passing `null` explicitly clears it (distinct from
+   * `undefined`, which leaves it alone) — needed so a handler can actually close a gap once
+   * its data closes it, not just widen or ignore one. Ignored for task types with
+   * `syncStateTarget: null`. */
+  backfillCoverageThroughDate?: ReportingDay | null;
+  knownGaps?: SyncState["knownGaps"];
 }
 
 export interface TaskContext {
@@ -216,6 +231,13 @@ export async function runSyncTask(opts: RunSyncTaskOptions): Promise<RunSyncTask
         attributionWindow: priorState?.attributionWindow ?? null,
         status: classifySyncStatus({ authorized: true, newRowCount: result.newRowCount }),
         lastRunId: runId,
+        // B5's carry-forward-unless-set fields — see TaskHandlerResult's comment.
+        backfillCoverageThroughDate:
+          result.backfillCoverageThroughDate !== undefined
+            ? result.backfillCoverageThroughDate
+            : (priorState?.backfillCoverageThroughDate ?? null),
+        knownGaps:
+          result.knownGaps !== undefined ? result.knownGaps : (priorState?.knownGaps ?? null),
       });
     }
 

@@ -10,7 +10,8 @@
 // registers `SYNC_NOOP` (below), the framework's own no-op/health-check task, which is not
 // one of §10.2's business task types and is never expected to move a watermark.
 
-/** §10.2, verbatim. Not yet all registered — see each step's own file under services/ingest. */
+/** §10.2, verbatim, plus one B5 addition below. Not yet all registered — see each step's own
+ * file under services/ingest. */
 export const SYNC_TASK_TYPES = [
   "META_SYNC_ENTITIES",
   "META_SYNC_INSIGHTS",
@@ -23,6 +24,14 @@ export const SYNC_TASK_TYPES = [
   "RECOMPUTE_FEATURES",
   "GENERATE_RECOMMENDATION",
   "EVALUATE_RECOMMENDATION_OUTCOME",
+  // B5's addition — not in §10.2's original list. The Matrixify CSV backfill is a genuinely
+  // different operation from SHOPIFY_SYNC_ORDERS (reads a GCS object, not the Shopify API; row-
+  // grouping parse, not GraphQL pagination) and needed its own retryable task type rather than
+  // being folded into SHOPIFY_SYNC_ORDERS's handler. It is also, per IMPLEMENTATION_PLAN.md B5's
+  // orchestrator brief, deliberately re-runnable against successive export files — not the
+  // one-time-only operation §10.2/B5's original "Out of scope" line assumed before the real
+  // export turned out to be a partial (~10k of ~22.6k orders) snapshot.
+  "SHOPIFY_IMPORT_ORDERS_CSV",
 ] as const;
 export type KnownTaskType = (typeof SYNC_TASK_TYPES)[number];
 

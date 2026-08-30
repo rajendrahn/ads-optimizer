@@ -1208,7 +1208,14 @@ it does not know.
 
 ### B3 — Meta insights sync
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+334/334 unit tests — up from B2's 267, this step's own 67 new). `npm run test:integration`
+passes 146/146 against a real Firestore emulator (up from B2's 116, this step's own 15 new:
+6 for `metaSyncInsightsHandler`, 9 for `metaPollAsyncReportHandler`). The async report state
+machine was verified against the **live** Meta API (real report submission, real polling, real
+paging) with every write going to the Firestore **emulator**, never production — see Notes
+below for exact row counts and timings. No mutating Meta call was made; no live/production
+Firestore was touched; no cloud resource was created, modified or deployed.
 **Depends on:** B2
 **Design refs:** §5.3, §7.1, §9.4
 
@@ -1234,11 +1241,204 @@ recent day without duplicating it; every stored record carries its attribution p
 substantially different from a normal paged fetch — plan it as its own state machine inside the task
 framework, not as a loop.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/ingest/meta/insights/{attributionWindow,concurrency,reportRequest,
+  normalize,reportJobStore,insightsSync,pollAsyncReport,index}.ts`, each with a co-located
+  `*.test.ts`; `insightsSync.ts` and `pollAsyncReport.ts` additionally have `*.emulator.test.ts`,
+  and both share `testFixtures.ts` (not itself a test file, mirrors B2's own convention).
+  `services/ingest/sync/registry.ts`'s `createDefaultRegistry()` now also registers
+  `metaSyncInsightsRegistration` and `metaPollAsyncReportRegistration` — B1's documented
+  extension point, so `functions/src/index.ts` was not touched. `services/ingest/meta/client.ts`
+  (A4) gained a `post()` method alongside `get()` — the Marketing API's async report submission
+  is a POST, and A4 had no write primitive at all yet; same BUC/retry handling as `get()`, params
+  in a form-encoded body rather than the query string. `shared/schema/meta.ts` gained
+  `metaInsightsReportJobSchema` (a new `metaInsightsReportJobs/{reportRunId}` collection — see
+  next point); `shared/firestore/collections.ts`, `firestore.indexes.json`,
+  `test/firestore.rules.emulator.test.ts` and `shared/firestore/collections.test.ts` were updated
+  to match (collection count 24 → 25).
+
+- **The async report state machine — how it survives retries, in one paragraph.** Each Cloud
+  Tasks HTTP delivery is one bounded, synchronous handler call — never a `while(true){sleep()}`.
+  All real progress lives in a new Firestore doc, `metaInsightsReportJobs/{reportRunId}` (keyed by
+  Meta's own report-run id — not one of §8's named collections; this is B3's own bookkeeping,
+  the same category of infrastructure as `syncRuns`/`syncState`, not a business collection, and
+  is wholesale-overwritten like they are — NOT version-guarded, unlike the insight rows
+  themselves). `META_SYNC_INSIGHTS` submits the job and writes `phase:"SUBMITTED"`, done.
+  `META_POLL_ASYNC_REPORT` advances that doc by exactly one step per invocation: `SUBMITTED`/
+  `POLLING` → poll `async_status` once; still pending → save `phase:"POLLING"` +
+  incremented `pollAttempts`, then **throw a plain (non-`ApiError`) `Error`** — `taskWrapper.ts`'s
+  `classifyTaskError` treats that as retryable by default, `httpHandler.ts` turns it into an
+  HTTP 500, and Cloud Tasks redelivers the **same task id** later per the queue's own backoff —
+  which lands on the **same `syncRuns` doc** (idempotency-by-taskId, B1), so a job that polls 40
+  times before it's ready produces ONE `syncRuns` doc, not 40. `"Job Completed"` → transitions to
+  `PAGING` and immediately starts paging in the same invocation (no wasted round trip). Paging is
+  itself capped (`maxPagesPerInvocation`, default 5 × `pageLimit` default 500 rows/page); when
+  more pages remain, the Meta `after` cursor and cumulative `rowsWritten` are saved to the job doc
+  and the same retryable-throw pattern yields back to the framework — the next redelivery resumes
+  from exactly that cursor. Only the invocation that finishes paging with no more pages returns
+  `newWatermarkDate`, which is the **only** thing that ever advances `syncState/meta_insights` —
+  a partial/failed invocation never does. `phase:"FAILED"` (Meta reported `"Job Failed"`/
+  `"Job Skipped"`, or `pollAttempts` exceeded `maxPollAttempts`, default 90) and `phase:"DONE"`
+  are both terminal-idempotent: FAILED throws a non-retryable `ApiError` (never resumed), DONE
+  returns a no-op success (a duplicate/redelivered poll after completion does nothing). All of
+  this — pending→retry, resumable paging across a forced 1-page cap, DONE idempotency, FAILED
+  terminality, and (via the real `runSyncTask`) the "same taskId → same syncRuns doc, watermark
+  only advances on the completing invocation" behavior — is covered by
+  `pollAsyncReport.emulator.test.ts` against a real Firestore emulator, not just asserted in
+  prose.
+
+- **Attribution provenance (§5.3) — how it's actually pinned, not just typed.** `attributionWindow`
+  and `purchaseActionType` are read from the canon **once, at submission time** in
+  `insightsSync.ts`, and stored on the `metaInsightsReportJobs` doc itself
+  (`job.attribution: AttributionProvenance`) — every later `META_POLL_ASYNC_REPORT` invocation for
+  that job reads `job.attribution`, **not** a fresh `loadReportingCanon()` call, and stamps it
+  onto every `metaInsightsDaily` row it writes (`normalize.ts`'s `NormalizeInsightsRowCtx`). This
+  is deliberate: a real backfill can span many invocations over real wall-clock time, and §5.3
+  itself says a canon change mid-flight must be a first-class event, not something that silently
+  reinterprets rows already in flight. `attribution_attribution_windows` sent to Meta is derived
+  from the same pinned string via `parseAttributionWindowTokens` (`"7d_click_1d_view"` →
+  `["7d_click","1d_view"]`), which throws rather than silently omitting the parameter if the
+  configured string doesn't parse — an empty `action_attribution_windows` would make Meta fall
+  back to its own platform default, exactly the un-pinned behavior §5.3 rules out.
+  `pollAsyncReport.emulator.test.ts` proves this concretely: a job seeded with an attribution
+  different from the seeded canon (indeed, with **no** `settings/{accountId}` document present at
+  all) still writes that job's own attribution onto every row.
+
+- **Funnel actions (§7.2, needed by C2).** `landing_page_view`, `add_to_cart`,
+  `initiate_checkout` are read from Meta's `actions[]` array by exact `action_type` match
+  (`findActionValue` in `reportRequest.ts`) and stored as plain counts — `purchases`/
+  `purchaseValueMinorUnits` use the same mechanism against the **pinned** `purchaseActionType`,
+  never a hardcoded `"purchase"`. A missing action type on a given ad-day is a genuine zero
+  (`findActionValue` defaults to `"0"`), not an error — confirmed live: several real ad-days in
+  the verification run below have `purchases: 0` with real spend/impressions/clicks present.
+
+- **Reconciliation (§9.4) — routed through the SAME async-job machinery as backfill, not a
+  separate synchronous path.** `computeReconciliationWindow` (B1) still decides the date range
+  (`mode: "incremental"` for the rolling 14-day window unioned with "new since watermark",
+  `mode: "deep"` for the weekly 60-day pass — both configurable via payload), but the actual fetch
+  for either mode submits an async report job exactly like backfill does. This was a deliberate
+  call, not a shortcut: B2 measured this account live at **410 campaigns, 534 ad sets, 1,139
+  ads** — an order of magnitude past §7.1's "under 100 ads" assumption — so even a 14-day
+  reconciliation window is thousands of rows, squarely in "don't risk a synchronous call" territory
+  rather than a case worth special-casing onto a different, less-tested code path.
+  `META_SYNC_INSIGHTS` itself has **no watermark of its own**
+  (`syncStateTarget: null`, mirroring B2's `META_SNAPSHOT_CONFIG` precedent) — it only submits;
+  `META_POLL_ASYNC_REPORT` is the sole owner of `syncState/meta_insights`, since it's the only
+  task that knows when a job's rows are actually fully written. Re-running reconciliation for a
+  day already covered upserts through A2's `upsertWithVersionGuard` (bounded concurrency via a
+  hand-rolled `mapWithConcurrency`, no new dependency — see next point) — same `adId_date` key,
+  same-or-newer `sourceUpdatedAt` (this run's own fetch timestamp) always wins per the version
+  guard's documented "equal-version writes are accepted" rule, so a re-fetched day updates in
+  place rather than duplicating.
+
+- **The real account-scale finding, and what it means for a full-year backfill's actual cost.**
+  B2's live measurement (1,139 ads) implies a worst-case ceiling of **~415K** ad-day insight rows
+  for a year, which is why the async-job-and-resumable-paging design here is treated as load-
+  bearing rather than optional polish. **Live verification this step actually ran** (see below)
+  found the REAL density is far below that ceiling: Meta's Insights API only returns a row for an
+  ad-day that had actual delivery (impressions/spend) — a 30-day live window returned **1,399
+  rows**, i.e. ~47 active ad-days/day, not 1,139. Naively extrapolated (real seasonality/campaign-
+  count changes over a year are not accounted for, so treat this as an order-of-magnitude
+  estimate, not a forecast), a real year is closer to **~17K rows**, not ~415K. Both numbers are
+  worth knowing: the 415K ceiling is what the *design* must not fall over on (a spend spike, a
+  catalog-wide campaign launch, or simply this account growing), and the ~17K figure is what a
+  *typical* year should actually cost to fetch. **A literal full year backfill was NOT run live**
+  in this step (only 7-day and 30-day live windows — see below) — extrapolating cost from a
+  smaller window rather than overclaiming a run that didn't happen.
+
+- **What was actually run live (Meta API), writing only to the Firestore emulator.** Two full
+  submit→poll→page round trips against the real ad account, both from a throwaway script in the
+  scratchpad directory (never committed; imports used absolute repo file paths since the script
+  lives outside the repo tree, which is what let tsx resolve the repo's own `@shared`/`@services`
+  aliases and `node_modules` correctly from each *module's own* location — the entry script
+  itself imports nothing via a bare specifier):
+  1. **2026-08-24 .. 2026-08-30 (7 days), default paging (500/page).** Submitted → 3 real polls
+     (`"Job Not Started"` → `"Job Running"` ×2) → ready → paged in ONE invocation.
+     **444 rows written**, real spend/impressions/clicks/funnel actions, e.g. ad
+     `120239462136600171` on 2026-08-25: spend ₹1,020.67, 2,330 impressions, 151 clicks, 120
+     landing-page views, 12 add-to-carts, 1 initiate-checkout, 2 purchases — every row carrying
+     `attribution: {attributionWindow:"7d_click_1d_view", purchaseActionType:"omni_purchase"}`.
+     Submission took 1.3s; end-to-end (including real poll waits) 22.9s across 4 invocations.
+  2. **2026-08-01 .. 2026-08-30 (30 days), deliberately capped at `maxPagesPerInvocation:1`,
+     `pageLimit:200`** to force genuine cross-invocation resumption against LIVE data (not just
+     the mocked emulator tests). Result: 5 real "not ready" polls, then **7 real paging
+     invocations**, each saving its cursor and resuming correctly (`rowsWritten` climbing
+     200→400→600→800→1000→1200→1399 across invocations 6–12) — **1,399 rows total**, 81.5s
+     end-to-end across 12 invocations. This is the live proof that resumable paging isn't just a
+     mocked-fetch test artifact.
+  Neither Meta call made was mutating (`POST /insights` submits a **report job**, not a write to
+  any ad/campaign; `GET` polls/pages results) — no `ads_management` scope was used or needed. All
+  Firestore writes in both runs went to a local emulator (`firebase emulators:exec --only
+  firestore`) seeded with a throwaway `settings/{accountId}` document; nothing reached production
+  Firestore.
+
+- **Bounded concurrency, not one-row-at-a-time.** `upsertWithVersionGuard` (A2) is one Firestore
+  transaction per document, and the step's own constraints require every insight write to go
+  through it (no bulk/version-guarded write primitive exists) — at this account's real row
+  volume, writing serially would be impractically slow. `mapWithConcurrency` (hand-rolled, no new
+  dependency — `services/ingest/meta/insights/concurrency.ts`) runs up to `writeConcurrency`
+  (default 20) `upsertWithVersionGuard` calls in flight at once per page. Combined with bounded
+  paging (`maxPagesPerInvocation` × `pageLimit`), this is the concrete answer to "plan your write
+  batching and Firestore document count deliberately" — a reconciliation run's total document
+  count is bounded and predictable per invocation, not a single unbounded burst.
+
+- **Meta client gained `post()` (A4's `client.ts`), not just `get()`.** A4 had no write-shaped
+  primitive at all (its own scope was "no specific resource"); the async report submission is a
+  `POST /{ad_account_id}/insights`. Mirrors `get()`'s BUC/retry handling exactly; params
+  (including the token and `appsecret_proof`) go in a form-encoded body rather than the query
+  string. Verified live as part of the runs above (real `report_run_id`s returned), plus 4 new
+  unit tests against synthetic responses (`client.test.ts`).
+
+- **Ambiguities resolved (design didn't specify these; each is a judgment call worth recording):**
+  1. **§8 has no collection for async-report-job bookkeeping.** Resolved by adding
+     `metaInsightsReportJobs/{reportRunId}` as B3's own infrastructure collection (same category
+     as `syncRuns`/`syncState`, not a namespace violation of §8's "one brand, one ad account, do
+     not namespace speculatively" — that guidance is about business-data namespacing, not about
+     whether the task framework gets to have process-state bookkeeping). Documented in both
+     `shared/schema/meta.ts` and `shared/firestore/collections.ts`.
+  2. **Whether reconciliation should use a separate synchronous fetch path instead of the async
+     job machinery, since §9.4 doesn't say either way.** Resolved to reuse the async path
+     unconditionally — see the reconciliation note above; at this account's real scale a 14-day
+     window is already thousands of rows, and maintaining two independently-tested fetch code
+     paths (one sync, one async) for what is fundamentally the same operation seemed like the
+     worse trade.
+  3. **`purchaseActionType`'s real value is not yet decided by anyone** — A3's notes already flag
+     that no real `settings/{accountId}` document exists yet. This step's live verification used
+     `"omni_purchase"` (Meta's own cross-channel aggregate action type) as a reasonable default,
+     but **this is an operational decision for whoever writes the real settings document, not
+     something B3 gets to decide unilaterally** — flagging it again here since it's now
+     load-bearing on every stored insight row's `attribution.purchaseActionType`.
+  4. **What "day" to archive a multi-day report page under (§23's archive path is per-day).**
+     A single insights page can span the whole requested date range. Resolved to bucket every
+     `insights_page` archive entry under the job's own `until` date (its natural anchor, already
+     on the job doc, no extra Firestore/canon read needed) rather than trying to split a page by
+     the days it actually contains — documented in `pollAsyncReport.ts`'s module comment as an
+     approximation, not a precise per-day archive.
+  5. **`shared/schema/sync.ts`'s `syncStateSchema` gained two new required-on-output fields
+     (`backfillCoverageThroughDate`, `knownGaps`) from a concurrently-running B5** partway through
+     this step — `services/ingest/sync/taskWrapper.test.ts` and this step's own
+     `insightsSync.emulator.test.ts` needed small fixes (add the two new fields, `null`, to
+     existing `syncState` object literals) to keep typechecking. Both are B5's fields per that
+     file's own comment (Shopify backfill-coverage tracking); B3 doesn't populate either.
+
 ---
 
 ### B4 — Change event derivation
 
-**Status:** Not started
+**Status:** Done — `npx vitest run` (all unit tests): 316/316 pass, including this step's own
+new `changeEvents.test.ts` (18 tests). `npm run test:integration` (real Firestore emulator):
+131/131 pass, including this step's own new `changeEvents.emulator.test.ts` (7 tests) and 4
+new B4 tests appended to B2's `configSnapshot.emulator.test.ts` (now 8 tests total there).
+`npm run typecheck` and `npm run lint` pass clean across every file this step touched or
+added. **`npm run format:check` and the full `npm run check` currently fail, but not because
+of this step** — the working tree already contained uncommitted, unrelated B3 (insights) work
+before this step started (`services/ingest/meta/insights/**`, plus a `metaInsightsReportJobs`
+addition to `shared/firestore/collections.ts`) with its own pre-existing formatting issue
+(7 files) and a pre-existing `collections.test.ts` failure (`metaInsightsReportJobs` missing
+from that test's expected list) — confirmed via `git diff`/`git log` to predate and be
+disjoint from every file this step added or changed. Every file this step touched is itself
+prettier-clean and typechecks/lints clean; see Notes below for the isolated verification.
 **Depends on:** B2
 **Design refs:** §9.2, §13
 
@@ -1257,11 +1457,142 @@ framework, not as a loop.
 **Done when.** A simulated budget edit between two snapshots produces exactly one correctly typed change
 event, and an unchanged snapshot pair produces none.
 
+**Notes from implementation:**
+
+- **Layout as built.** One new file, `services/ingest/meta/entities/changeEvents.ts`, plus its
+  two test files (`changeEvents.test.ts`, pure/no-emulator; `changeEvents.emulator.test.ts`,
+  against a real Firestore emulator). It exports two things: `diffEntitySnapshots` (pure —
+  `(previous: MetaEntitySnapshot | null, current: MetaEntitySnapshot, opts) => MetaChangeEvent[]`,
+  zero Firestore/Meta calls, this is what actually satisfies this step's "Done when" bar) and
+  `deriveAndWriteChangeEvents` (the orchestration wrapper — finds the previous consecutive
+  snapshot run, batch-reads each current entity's counterpart, diffs, writes via A2's
+  `upsertWithVersionGuard`). Both re-exported from `services/ingest/meta/entities/index.ts`.
+  `shared/schema/meta.ts` needed **zero changes** — A2 had already fully specified
+  `metaChangeEventSchema`/`metaChangeEventFieldSchema` exactly matching this step's needs
+  (including the `budgetChangePercent` and optional-`actor` fields), so this step is pure
+  addition, no schema migration.
+
+- **No new task type — wired directly into B2's existing `META_SNAPSHOT_CONFIG` handler**,
+  not a separate `META_DERIVE_CHANGE_EVENTS` registration. §9.2 describes both halves as one
+  sentence, one config-sync cycle ("on every config sync, snapshot ... derive change events by
+  diffing consecutive snapshots"), and §10.2's task-type list has no slot for a standalone
+  diff task. `configSnapshot.ts` now calls `deriveAndWriteChangeEvents` right after computing
+  `allSnapshots` in memory and **before** the `BulkWriter` writes them — ordering that matters
+  (see next point) — and folds `changeEventsWritten`/`previousSyncRunId` into the task's
+  existing `summary`. This does touch a B2 "Done" file, deliberately: B2's own spec explicitly
+  scoped this out ("Diffing snapshots into change events — that is B4"), anticipating exactly
+  this extension. `registry.ts`'s `createDefaultRegistry()` and `functions/src/index.ts` were
+  **not** touched — no new registration was needed since B2's `metaSnapshotConfigRegistration`
+  already runs through the task wrapper.
+
+- **How "the previous consecutive run" is found — self-contained, no `syncState` dependency.**
+  Every entity snapshot written by one `META_SNAPSHOT_CONFIG` run shares exactly one `takenAt`
+  (set once per run in `configSnapshot.ts`). So `findPreviousSyncRunId` just queries
+  `metaEntitySnapshots` for the single most-recently-`takenAt` doc and reads **its**
+  `syncRunId` — one cheap query, no need to know run ids ahead of time, no per-entity querying
+  at this account's real scale (2,000+ entities, per B2's notes). This **must** run before
+  this run's own snapshots are written, or it would find its own about-to-be-written docs
+  instead of the genuinely previous run's — `configSnapshot.ts`'s call ordering is load-bearing
+  and commented as such. A same-task-id retry (B2's own idempotent-retry guarantee: re-running
+  with the same `runId` overwrites rather than duplicates) is defended against explicitly: if
+  the "most recent" query finds a doc whose `syncRunId` equals the CURRENT run's id, that's
+  treated as "no previous run" rather than diffing a run against itself — covered by both
+  `changeEvents.emulator.test.ts` and (implicitly, via B2's own "re-running with the SAME run
+  id" test) `configSnapshot.emulator.test.ts`. Each current entity's previous-snapshot doc is
+  then looked up by its **deterministic** id (`metaEntitySnapshotKey`, no query) — batched via
+  `Promise.all` in chunks of 300, not `Firestore#getAll` (that method's TS overload can't be
+  called with a spread of a generically-typed `DocumentReference<T>[]`; reads have no
+  ordering/lock need `getAll`'s single-snapshot guarantee would buy here, so the simpler,
+  fully-typed per-doc `.get()` was the right trade — noted in `changeEvents.ts` in case a
+  future step wants to revisit).
+
+- **UNKNOWN budget ownership — resolved as: never a BUDGET event, on either side of the
+  transition.** B2's `budgetOwnership` has three states per entity: `null` (not the owner,
+  unambiguously), a real owning value (`ownerLevel: "CAMPAIGN"|"ADSET"` with real
+  daily/lifetime figures), and `{ownerLevel:"UNKNOWN", dailyBudgetMinorUnits:null,
+  lifetimeBudgetMinorUnits:null,...}` (genuinely ambiguous — B2 saw this live for 4 old
+  orphaned campaigns whose ad sets Meta had already deleted). UNKNOWN carries **no** budget
+  figures at all, so a transition into or out of it cannot represent an advertiser editing a
+  number — it can only mean our own ownership-detection logic became more or less able to
+  resolve ownership between two syncs (e.g. Meta transiently returning a different/empty
+  ad-set list). Treating that as "budget changed" would be pure noise: no real `before`/`after`
+  amount, no meaningful percent, no real edit to reason about. So `diffEntitySnapshots` skips
+  the BUDGET comparison entirely whenever either snapshot's budget is UNKNOWN — not just
+  "reported with a null percent". A resolved-to-resolved change (including a genuine ownership
+  move, e.g. CBO toggled off so the ad set now owns it — `null` on one side, real values on the
+  other) still fires normally, with `budgetChangePercent: null` in that specific case since
+  there's no prior figure to divide by (before/after are still recorded in full either way).
+  Covered by 5 dedicated cases in `changeEvents.test.ts` (into UNKNOWN, out of UNKNOWN,
+  null-to-UNKNOWN, UNKNOWN-to-UNKNOWN, and the two null-vs-owning transitions that DO fire).
+
+- **`budgetChangePercent` — whole-percent (matches §14's `"suggestedChangePercent": 15`
+  convention, not a 0–1 fraction), rounded to 2 decimals, computed from `dailyBudgetMinorUnits`
+  when both sides have one, falling back to `lifetimeBudgetMinorUnits` only when daily is
+  absent on both sides, and `null` when there's no defined base (before is 0, or a null↔owning
+  ownership transition with nothing to divide by).** `before`/`after` on a BUDGET event are the
+  **full** `BudgetOwnership` object (or `null`), not just the changed number — same convention
+  as every other field (STATUS/TARGETING/BID_STRATEGY/CREATIVE_ASSIGNMENT all store the raw
+  field value on both sides), so a consumer sees the whole picture (owner level, both budget
+  types, currency) without a second lookup.
+
+- **TARGETING and CREATIVE_ASSIGNMENT diffing is order/key-order insensitive.** `targeting` is
+  an opaque `Record<string, unknown>` — compared via a stable (key-sorted) JSON stringify, so
+  the same object with keys in a different order is never a false-positive change.
+  `creativeAssignment` is a small `string[] | null` — compared via a sorted-and-stringified
+  key, so a reorder of the same creative ids alone (order carries no meaning — it's a set, not
+  a ranking) doesn't fire an event either. Both have dedicated "reordering alone is not a
+  change" tests.
+
+- **Idempotency and write semantics, reusing A2's version guard exactly as B1 intended.** Each
+  change event's doc id is `metaChangeEventKey(entityType, entityId, field, toSnapshotKey)`
+  (A2) — deterministic in the diffed pair, so re-deriving the same diff (a retried task run)
+  recomputes the identical doc id and identical content, and `upsertWithVersionGuard`'s
+  "equal-version writes are accepted, not rejected" rule (§9.5's idempotency requirement) means
+  a retry is a safe no-op rather than a spurious rejection. `detectedAt` (the version-guard
+  field, via an explicit `getUpdatedAt: (doc) => doc.detectedAt` override — this schema has no
+  `sourceUpdatedAt`) is stamped from the **current snapshot's own `takenAt`**, never
+  `new Date()`, specifically so a retry is fully deterministic rather than racing its own prior
+  attempt's timestamp. `ctx.recordVersionGuardRejection` is threaded through as `onRejected`,
+  matching every other B-phase write.
+
+- **Actor attribution (the optional half of this step's spec) was skipped, as explicitly
+  invited** ("Optional... Skip it if it complicates the step"). `actor` is always `null`. No
+  live Meta activity-feed call of any kind was made — this step makes **no** live Meta call at
+  all, consistent with its "Make no mutating Meta call" constraint and its own framing
+  ("diffing stored snapshots").
+
+- **What C4 needs from this.** `metaChangeEvents` docs have `entityType`, `entityId`, `field`
+  (`"BUDGET"|"STATUS"|"TARGETING"|"BID_STRATEGY"|"CREATIVE_ASSIGNMENT"`), `detectedAt`
+  (the moment the CURRENT snapshot revealed the change — use this, not any write-time
+  timestamp, for `hoursSinceLast*` math), `before`/`after` (full field values, typed `unknown`
+  — cast per `field`), `budgetChangePercent` (populated only when `field === "BUDGET"` and a
+  base was computable — may be `null` even for a real BUDGET event), and `actor` (always
+  `null` from this step). The `firestore.indexes.json` composite index
+  `metaChangeEvents(entityId, field, detectedAt desc)` (already added by A2) is exactly what
+  §13's `hoursSinceLastBudgetChange`/`…ChangesLastNDays` family needs: "most recent change of
+  field X for entity Y" is a single indexed query. **One gap to be aware of**: an entity that
+  disappears entirely from Meta's fetch between two runs (as opposed to changing `status` to
+  `DELETED`/`ARCHIVED`, which Meta still returns and which DOES fire a normal STATUS event)
+  produces no "removed" event, since diffing is keyed off the CURRENT run's entity list — not
+  observed live (B2's fetch is all-time/all-statuses, so entities persist even when
+  deleted-looking), but worth knowing if C4 ever needs to reason about an entity's absence
+  rather than its last-known state.
+
 ---
 
 ### B5 — Shopify orders, lines and refunds
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+369/369 unit tests, including this step's own 91 new). `npm run test:integration` passes 154/154
+against a real Firestore emulator (up from 46 — this step's own 8 new emulator tests, covering
+the Matrixify import and the GraphQL sync end to end, including through the real `runSyncTask`
+path). The real production Matrixify export (10.14 MiB, 37,172 rows) was inspected directly and
+used to develop and validate every parsing decision below; live, read-only Shopify GraphQL calls
+were made against the real store during planning (confirmed protected-customer-data access,
+confirmed the exact money-field and line-item shapes, and confirmed a real, load-bearing gap —
+see Notes). No live/production Firestore was touched (Firestore emulator only); no cloud
+resource was created, modified or deployed; no webhook was created (that is B6); no mutating
+Shopify call was made.
 **Depends on:** B1, A3
 **Design refs:** §7.2, §9.1, §9.5
 
@@ -1303,6 +1634,191 @@ spot-checking new-vs-repeat against a known customer's order history matches.
 own row-grouping parser — it is a flat sheet with one row per line item/refund/transaction, not the nested
 JSONL Bulk Operations would have produced. Confirm the export file's column headers match what §7.2 lists
 before writing the parser; Matrixify lets users customize which columns are included in a given export.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/ingest/shopify/orders/{timestamps,csvParser,csvNormalize,csvSource,
+  matrixifyImport,graphqlNormalize,graphqlFetch,ordersSync,gap,newVsRepeat,index}.ts`, each with a
+  co-located `*.test.ts`; `matrixifyImport.ts` and `ordersSync.ts` additionally have
+  `*.emulator.test.ts`. `services/ingest/sync/registry.ts`'s `createDefaultRegistry()` now also
+  registers `matrixifyImportRegistration` and `shopifySyncOrdersRegistration` (B1's documented
+  extension point, same as B2/B3). New dependency: `csv-parse` (a real, tested CSV parser — no
+  hand-rolled quoting, per this step's explicit constraint); `package-lock.json` updated
+  accordingly. No other dependency changes.
+
+- **The real export, inspected directly (not taken on faith from the brief).** Verified myself
+  against both the local scratchpad copy and (for structure only) the live GraphQL API:
+  - **37,172 CSV rows, but only 10,000 real orders, not 10,001** — two rows are not order data at
+    all: one fully-blank row, and one literal
+    `"###### YOUR PLAN ALLOWS FILE SIZE TILL HERE ###### UPGRADE IF YOU NEED LARGER FILES"` row.
+    That second row is direct, load-bearing evidence that the ~10k-of-~22.6k row count is a
+    **tool-enforced plan/size cap on the export itself**, not an arbitrary one-time choice — matters
+    for expectation-setting on future exports (a paid-tier export may return everything in one file,
+    or may still need to be split). Both rows are filtered by `isJunkMatrixifyRow`
+    (`csvParser.ts`), matching the task brief's "2 blank Line: Type rows" — they weren't malformed
+    order data, they were never orders.
+  - **The "2 orders with no customer ID" in the brief is actually 1 real order + the 2 junk rows
+    above** (which also have blank IDs and got counted before I identified them as junk). The one
+    real case is order `6618759561531` — a `shopify_draft_order` cancelled by the customer before
+    ever being assigned a customer ID (`Cancel: Reason: "customer"`, `Payment: Status: "pending"`).
+    Handled explicitly: `customerId: null`, excluded from new-vs-repeat (stays `null`, not guessed).
+  - **Field-population patterns, verified across all 10,000 real orders, not assumed:** the
+    `Price: Subtotal/Total Discount/Total Shipping/Total` order-summary columns are populated on
+    exactly one row per order — always that order's first "Line Item" row — in 10,000/10,000 cases;
+    `Browser: Landing Page`/`Referrer` and `Customer: ID`, when set, are repeated identically on
+    every row of the order, never "first row only." `csvNormalize.ts`'s `firstNonBlank` (scan every
+    row, take the first non-blank value) handles both patterns uniformly without needing to know
+    which one a given column follows — more robust than the brief's "order-level fields appear on
+    the first row" framing, which turned out to describe only half of what's actually in the file.
+  - **Matrixify's own export has no line-item ID column at all** — not merely omitted from this
+    account's column selection, absent from the format entirely (the 42 columns listed in the brief
+    were confirmed exhaustive). `shopifyOrderLineKey`/`shopifyOrderLineSchema.lineItemId` need
+    *something* deterministic, so `csvNormalize.ts` synthesizes `csvline-{n}` (1-based position
+    among an order's "Line Item" rows). Stable across re-imports of the *same* file; not guaranteed
+    stable if a later, larger export reorders an order's lines relative to this one — accepted as a
+    known limitation (bounded to duplicate/orphaned line docs within one order, never the order
+    itself; moot for any order once GraphQL/webhook sync starts writing its lines under Shopify's
+    real line-item IDs instead, and orders old enough to have been CSV-imported will never again
+    fall inside `read_orders`' 60-day incremental window anyway).
+  - **`Line: Type` has five real values** (`Line Item` 20,071, `Shipping Line` 9,871, `Discount`
+    6,663, `Refund Line` 380, `Refund Shipping` 185) and only `Line Item` rows become
+    `shopifyOrderLines` documents. `Shipping Line` rows have no product identity (no productId/sku)
+    and no field in the A2 schema to hold shipping revenue at all — see next point. `Discount` rows
+    represent an order-level discount *code* (title `"fixed_amount"`/`"percentage"`, no product),
+    already captured via `totalDiscountsMinorUnits`. `Refund Line`/`Refund Shipping` rows become
+    `shopifyRefunds` docs, grouped by `Refund: ID` (an order can have more than one refund event;
+    verified live on order `6604680298811`, which has two).
+  - **Money fields are the *original* (pre-refund) values, both in the CSV and in the GraphQL Admin
+    API's `subtotalPriceSet`/`totalDiscountsSet`/`totalShippingPriceSet`/`totalPriceSet`** — verified
+    on a real refunded/cancelled order (`Price: Total: "5404.40"` unchanged by its later refund;
+    4580 × 1.18 GST ≈ 5404.4, confirming it's the as-placed total including tax, not a live-adjusted
+    figure). `graphqlNormalize.ts` deliberately uses these fields, not Shopify's `current*`
+    variants (`currentTotalPriceSet` etc., which shrink as an order is refunded) — using `current*`
+    would have made `totalPriceMinorUnits` mean two different things depending on which source wrote
+    the order, silently corrupting revenue totals the moment a webhook/incremental sync order gets
+    refunded. Refund activity is visible instead through the separate `shopifyRefunds` collection,
+    never by a shrinking order total.
+  - **Timestamps are `YYYY-MM-DD HH:mm:ss ±HHMM`** (e.g. `2025-01-15 14:27:06 +0530`) — parsed by a
+    hand-written regex + explicit UTC-offset arithmetic (`timestamps.ts`), not the platform `Date`
+    parser (which happens to get this exact format right on V8/Node, but that's implementation-
+    defined behaviour for a non-ISO string, not a contract — the brief explicitly asked not to lean
+    on an IST assumption, and this doesn't).
+
+- **A genuine, verified gap in the design/brief: `landing_site`/`referring_site` are NOT retrievable
+  via the GraphQL Admin API for this store, at all, for any order synced after the CSV backfill.**
+  Confirmed live against the real store (Admin API `2025-01`): `Order.landingSite`/`.referringSite`
+  do not exist in the GraphQL schema (removed upstream of this API version — introspection confirms
+  no such fields on `Order`). The documented replacement, `Order.customerJourneySummary`, *is*
+  queryable, but `firstVisit`/`lastVisit` return `null` for every real order sampled — this store is
+  not on Shopify Plus, and per §6.2 that summary requires it. REST still exposes `landing_site` on
+  the classic Order resource, but is off-limits per §0.2 ("REST is legacy — do not use it"), which
+  this step did not relitigate. **Net effect: only the ~10,000 CSV-backfilled orders will ever carry
+  a `landingSite`/`referringSite` value; every order arriving via `GRAPHQL_SYNC` has both fields
+  hard-null, permanently, via any currently-sanctioned path.** This directly affects B7 — its
+  attribution join will only ever have query strings for the historical backfill window, never for
+  anything after 2025-12-13, unless B6 finds that webhook payloads (a different delivery mechanism)
+  still carry these fields. Documented prominently in `shared/schema/shopify.ts`'s field comment and
+  flagged here for B7/B6 to actually act on, not just note.
+
+- **The Dec 2025 → Jul 2026 data gap, recorded loudly as the brief asked, and precisely as it
+  actually behaves — not as a static date range.** `shared/schema/sync.ts`'s `syncStateSchema`
+  gained two new optional/defaulted fields: `backfillCoverageThroughDate` (the furthest order-
+  *created* reporting day the historical backfill actually reached, measured from data — not
+  hardcoded) and `knownGaps` (an array of `{startDate, endDateExclusive, reason}`). Both are carried
+  into `syncState/shopify_orders` by `runSyncTask` itself — `services/ingest/sync/taskWrapper.ts`'s
+  `TaskHandlerResult` gained matching optional fields with an explicit carry-forward-if-omitted /
+  clear-if-set-to-`[]`-or-`null` contract (small, additive change to B1's framework file, covered by
+  3 new unit tests in `taskWrapper.test.ts`; did not touch any other part of that file's behaviour).
+  `gap.ts`'s `computeShopifyOrdersGap` is the pure computation, called fresh on **every** run of
+  both `SHOPIFY_IMPORT_ORDERS_CSV` and `SHOPIFY_SYNC_ORDERS` — deliberately not cached or computed
+  once, because **the gap's end boundary is `today - 59 days`, which moves forward every single day
+  nothing closes it, so the gap WIDENS over time**, not shrinks, until a further Matrixify export or
+  B6 webhooks intervene. Recomputing fresh every run means this stays accurate automatically; a
+  cached value would have silently understated the hole more and more with every passing day. As of
+  this step's implementation date (today = 2026-08-30 per the environment), the gap reads
+  `[2025-12-14, 2026-07-02)` — the second boundary will already have moved by the time anyone reads
+  this. C1/C2 must treat a reporting day inside a recorded `knownGaps` entry as genuinely-no-data,
+  never as zero-activity, when computing windowed aggregates.
+
+- **New-vs-repeat is recomputed over the full accumulated `shopifyOrders` collection on every run of
+  both task types** (`newVsRepeat.ts`), not decided once at import time — exactly what the brief
+  asked for ("recomputable across the full accumulated dataset"), verified with a dedicated test
+  that simulates a customer's true first order arriving in a *later* import than their first-seen
+  order, and confirms the recompute flips the earlier (necessarily provisional) verdict correctly.
+  A full collection scan is cheap at this account's scale (tens of thousands of orders, not
+  millions) and matches §10.1's "full recompute over incremental complexity" precedent already
+  established for Meta features. Writes go back through the same A2 version guard, using each
+  order's own already-stored `sourceUpdatedAt` — an equal-version write, which the guard accepts by
+  design (idempotency), so this never fights with the version-guard rule the rest of B5 depends on.
+
+- **`SHOPIFY_IMPORT_ORDERS_CSV` is a new task-type name, not in §10.2's original list** — added to
+  `services/ingest/sync/taskTypes.ts` with an explicit comment explaining why: the Matrixify import
+  is a fundamentally different operation from `SHOPIFY_SYNC_ORDERS` (reads one GCS object, not the
+  Shopify API; row-grouping parse, not GraphQL pagination) and per this step's own brief is
+  **deliberately re-runnable against successive export files**, contradicting this step's original
+  "Out of scope: Re-running the Matrixify import — it is one-time" line above, which was written
+  before the real export turned out to be a partial (~10k of ~22.6k) snapshot. Both facts (task-type
+  addition, re-runnability) are flagged here rather than silently diverging, per §0.2's instruction
+  to raise rather than relitigate silently. `SHOPIFY_RECONCILE_ORDERS` (also in §10.2's list) was
+  **not** implemented — Shopify's `updated_at` watermark is authoritative and doesn't "mature" the
+  way Meta's attribution-windowed conversions do (§9.4's whole rationale for a separate
+  reconciliation pass), so the ordinary incremental sync already achieves what a distinct
+  reconciliation task would; revisit only if a real need for a deeper re-fetch pass emerges.
+
+- **`SHOPIFY_SYNC_ORDERS` and `SHOPIFY_IMPORT_ORDERS_CSV` share one `syncState/shopify_orders`
+  document** (`source: "shopify", resource: "orders"`), a deliberate choice: the CSV import seeds
+  `lastDataDate` (max order `updated_at` seen) so the very first incremental sync run has a sane
+  starting watermark, and `backfillCoverageThroughDate` so `knownGaps` is accurate even before any
+  incremental sync has run at all. `read_orders` (no `read_all_orders`) restricts the visible order
+  set to roughly the last 60 days **based on order creation date, regardless of the `updated_at`
+  query filter used** — verified live (a query filtered to `updated_at:>=<many months in the past>`
+  still only returned recently-created orders) — which is what makes a null/very-old watermark on
+  `SHOPIFY_SYNC_ORDERS`'s first-ever run safe rather than something requiring
+  `computeReconciliationWindow`'s "throw with no watermark" precedent: there's no risk of
+  accidentally re-fetching unbounded history, because Shopify's own scope already bounds it.
+  Watermark reads follow the same pattern the concurrent B3 insights task already established
+  (`services/ingest/meta/insights/insightsSync.ts`: construct a `SyncStore` directly inside the
+  handler and read `syncState` from it, rather than `TaskContext` exposing it) — noticed and
+  matched rather than inventing a second convention.
+
+- **Schema additions, all optional/defaulted per A2's rule** (and, for `syncStateSchema`'s two new
+  fields, `.optional()` rather than `.default()` specifically so the *TypeScript* output type stays
+  non-required too — several other steps, including B3's `insightsSync.ts`, already construct
+  `SyncState` object literals directly rather than through `.parse()`, and `.default()` would have
+  made those fail to compile): `shopifyOrderSchema.totalShippingMinorUnits` (neither the CSV nor
+  GraphQL expose shipping revenue as part of subtotal/discount/total, and nothing else in the A2
+  schema could hold it — filled the gap rather than dropping the data), `shopifyOrderLineSchema
+  .productType`, and `syncStateSchema.backfillCoverageThroughDate`/`knownGaps` (see above).
+
+- **`rawAttributionTag` (§6.1) is left `null` by every B5 write**, deliberately — it's described as
+  living "alongside the resolved ad ID," and resolving IDs from `landingSite` is explicitly B7's job,
+  not B5's, per this step's own Out-of-scope line. B7 should populate it when it does the join.
+
+- **Spot-check of new-vs-repeat against real data, as the Done-when bar asks.** Verified against the
+  actual production export (not synthetic data): customer `9231937929531` placed two orders in the
+  file, `6489142231355` (2025-01-15, the earlier) and `6591893668155` (later) — the derivation
+  correctly marks the first `true` and the second `false`. 8,894 distinct customers across the
+  10,000 real orders; 804 of them have more than one order in this partial window. Full
+  order/line/refund counts from actually running the importer against the real export (local
+  scratchpad copy, Firestore emulator, not production) are in this step's final report rather than
+  repeated here, to keep this file from duplicating numbers that will look stale the moment a
+  second export lands.
+
+- **⚠️ Orchestrator note: this environment's emulator Java setup needed a different JDK than the one
+  A1 documented.** A1's README points at a portable, no-installer Temurin JDK 21 zip extracted
+  outside the repo. That zip's `bin/` directory turned out to be **missing several native libraries**
+  (`management.dll` and others — only 15 files present where a complete JDK 21 `bin/` has 30+),
+  which crashes the Firestore emulator deterministically on its first real request
+  (`NoClassDefFoundError` inside `FirestoreEmulatorQuerySemantics`/`SizeOf`, a Java class-
+  initialization failure that then poisons every subsequent call in that JVM process — explaining
+  why it looked instant-and-total once triggered). Root-caused by comparing its `bin/` listing
+  against a complete, already-installed JDK found elsewhere on this machine
+  (`C:\Program Files\Microsoft\jdk-21.0.12.101-hotspot`, same OpenJDK 21.0.12.1 build, different
+  vendor packaging) — the emulator ran correctly under that one. **Whoever next runs
+  `npm run test:integration` on this machine should point `PATH` at that Microsoft JDK install (or
+  any other complete JDK 11+), not the scratchpad zip** — the zip's own extraction is the defect,
+  not JDK 21 itself. Not fixed at the source (the zip lives in a session-scratch temp directory
+  outside the repo, out of this step's reach), only diagnosed and routed around.
 
 ---
 

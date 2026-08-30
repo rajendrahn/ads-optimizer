@@ -8,11 +8,15 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { GCP_PROJECT_ID } from "../../../../scripts/config.ts";
 import { COLLECTIONS, createRepository, metaEntitySnapshotKey } from "@shared/firestore/index.ts";
 import { canonSettingsSchema, resetReportingCanonCacheForTests } from "@shared/canon/index.ts";
-import { metaEntitySnapshotSchema, type MetaEntitySnapshot } from "@shared/schema/index.ts";
+import {
+  metaChangeEventSchema,
+  metaEntitySnapshotSchema,
+  type MetaEntitySnapshot,
+} from "@shared/schema/index.ts";
 import type { RawArchiveStore } from "../../sync/archiver.ts";
 import { MetaClient } from "../client.ts";
 import { metaSnapshotConfigHandler } from "./configSnapshot.ts";
-import { TEST_CANON, buildTestFetchImpl } from "./testFixtures.ts";
+import { TEST_CANON, buildTestFetchImpl, type TestFetchImplOptions } from "./testFixtures.ts";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -30,7 +34,11 @@ const dummyArchiver: RawArchiveStore = {
 };
 
 async function cleanupCollections() {
-  for (const name of [COLLECTIONS.metaEntitySnapshots, COLLECTIONS.settings]) {
+  for (const name of [
+    COLLECTIONS.metaEntitySnapshots,
+    COLLECTIONS.metaChangeEvents,
+    COLLECTIONS.settings,
+  ]) {
     const snaps = await db.collection(name).listDocuments();
     await Promise.all(snaps.map((ref) => ref.delete()));
   }
@@ -61,10 +69,10 @@ function makeCtx(runId: string, client: MetaClient) {
   };
 }
 
-function newTestClient(): MetaClient {
+function newTestClient(options: TestFetchImplOptions = {}): MetaClient {
   return new MetaClient({
     accessToken: "tok",
-    fetchImpl: buildTestFetchImpl(),
+    fetchImpl: buildTestFetchImpl(options),
     sleepImpl: vi.fn().mockResolvedValue(undefined),
   });
 }
@@ -74,7 +82,14 @@ describe("metaSnapshotConfigHandler (emulator)", () => {
     const result = await metaSnapshotConfigHandler(makeCtx("run_1", newTestClient()));
 
     expect(result.newRowCount).toBe(3 + 2 + 3);
-    expect(result.summary).toEqual({ campaigns: 3, adsets: 2, ads: 3 });
+    expect(result.summary).toEqual({
+      campaigns: 3,
+      adsets: 2,
+      ads: 3,
+      // B4: first-ever run — no previous snapshot run exists yet to diff against.
+      changeEventsWritten: 0,
+      previousSyncRunId: null,
+    });
 
     const snapshotsRepo = createRepository(
       db,
@@ -142,5 +157,90 @@ describe("metaSnapshotConfigHandler (emulator)", () => {
     )) as MetaEntitySnapshot;
     expect(doc.syncRunId).toBe("run_1");
     expect(doc.takenAt).toBeInstanceOf(Date);
+  });
+
+  // --- B4: change events are derived and written as part of this same task, wired end to
+  // end through the real handler (not just the standalone deriveAndWriteChangeEvents unit —
+  // see changeEvents.emulator.test.ts for that). "Done when: a simulated budget edit between
+  // two snapshots produces exactly one correctly typed change event, and an unchanged
+  // snapshot pair produces none. Test both directions explicitly." ---
+
+  it("B4: a budget INCREASE between two consecutive config-sync runs produces exactly one correctly typed BUDGET change event", async () => {
+    await metaSnapshotConfigHandler(
+      makeCtx("run_1", newTestClient({ cmpCboDailyBudget: "50000" })),
+    );
+    const result = await metaSnapshotConfigHandler(
+      makeCtx("run_2", newTestClient({ cmpCboDailyBudget: "60000" })),
+    );
+
+    expect(result.summary).toMatchObject({ changeEventsWritten: 1, previousSyncRunId: "run_1" });
+
+    const changeEventsRepo = createRepository(
+      db,
+      COLLECTIONS.metaChangeEvents,
+      metaChangeEventSchema,
+    );
+    const allEvents = await db.collection(COLLECTIONS.metaChangeEvents).listDocuments();
+    expect(allEvents).toHaveLength(1);
+
+    const event = await changeEventsRepo.get(allEvents[0].id);
+    expect(event).toMatchObject({
+      entityType: "CAMPAIGN",
+      entityId: "cmp_cbo",
+      field: "BUDGET",
+      budgetChangePercent: 20,
+      fromSnapshotKey: metaEntitySnapshotKey("CAMPAIGN", "cmp_cbo", "run_1"),
+      toSnapshotKey: metaEntitySnapshotKey("CAMPAIGN", "cmp_cbo", "run_2"),
+    });
+  });
+
+  it("B4: a budget DECREASE between two consecutive config-sync runs also produces exactly one correctly typed BUDGET change event (both directions)", async () => {
+    await metaSnapshotConfigHandler(
+      makeCtx("run_1", newTestClient({ cmpCboDailyBudget: "60000" })),
+    );
+    const result = await metaSnapshotConfigHandler(
+      makeCtx("run_2", newTestClient({ cmpCboDailyBudget: "50000" })),
+    );
+
+    expect(result.summary).toMatchObject({ changeEventsWritten: 1 });
+    const allEvents = await db.collection(COLLECTIONS.metaChangeEvents).listDocuments();
+    expect(allEvents).toHaveLength(1);
+
+    const changeEventsRepo = createRepository(
+      db,
+      COLLECTIONS.metaChangeEvents,
+      metaChangeEventSchema,
+    );
+    const event = await changeEventsRepo.get(allEvents[0].id);
+    expect(event?.field).toBe("BUDGET");
+    expect(event?.budgetChangePercent).toBeCloseTo(-16.67, 2);
+  });
+
+  it("B4: an unchanged snapshot pair across two consecutive config-sync runs produces no change events", async () => {
+    await metaSnapshotConfigHandler(makeCtx("run_1", newTestClient()));
+    const result = await metaSnapshotConfigHandler(makeCtx("run_2", newTestClient()));
+
+    expect(result.summary).toMatchObject({ changeEventsWritten: 0, previousSyncRunId: "run_1" });
+    const allEvents = await db.collection(COLLECTIONS.metaChangeEvents).listDocuments();
+    expect(allEvents).toHaveLength(0);
+  });
+
+  it("B4: a status change alongside an unrelated stable budget produces exactly one STATUS event, not a BUDGET one", async () => {
+    await metaSnapshotConfigHandler(makeCtx("run_1", newTestClient({ cmpCboStatus: "ACTIVE" })));
+    const result = await metaSnapshotConfigHandler(
+      makeCtx("run_2", newTestClient({ cmpCboStatus: "PAUSED" })),
+    );
+
+    expect(result.summary).toMatchObject({ changeEventsWritten: 1 });
+    const allEvents = await db.collection(COLLECTIONS.metaChangeEvents).listDocuments();
+    expect(allEvents).toHaveLength(1);
+
+    const changeEventsRepo = createRepository(
+      db,
+      COLLECTIONS.metaChangeEvents,
+      metaChangeEventSchema,
+    );
+    const event = await changeEventsRepo.get(allEvents[0].id);
+    expect(event).toMatchObject({ field: "STATUS", before: "ACTIVE", after: "PAUSED" });
   });
 });

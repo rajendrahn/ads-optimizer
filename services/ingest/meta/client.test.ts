@@ -125,6 +125,81 @@ describe("MetaClient.get", () => {
   });
 });
 
+describe("MetaClient.post", () => {
+  it("performs a POST with params, access_token and appsecret_proof in a form-encoded body, not the query string", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ report_run_id: "rr_1" }));
+    const client = new MetaClient({
+      accessToken: "tok-123",
+      appSecret: "shh",
+      fetchImpl,
+      sleepImpl: noopSleep(),
+    });
+
+    const result = await client.post<{ report_run_id: string }>("/act_123/insights", {
+      level: "ad",
+    });
+
+    expect(result.data).toEqual({ report_run_id: "rr_1" });
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(new URL(url).searchParams.get("access_token")).toBeNull(); // not in the query string
+    expect(init.method).toBe("POST");
+    const body = init.body as URLSearchParams;
+    expect(body.get("level")).toBe("ad");
+    expect(body.get("access_token")).toBe("tok-123");
+    const expectedProof = createHmac("sha256", "shh").update("tok-123").digest("hex");
+    expect(body.get("appsecret_proof")).toBe(expectedProof);
+  });
+
+  it("stores BUC usage from a POST response and pre-emptively throttles the next call", async () => {
+    const highUsageHeader = JSON.stringify({ act_123: [{ call_count: 96 }] });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(
+          { report_run_id: "rr_1" },
+          { headers: { "x-business-use-case-usage": highUsageHeader } },
+        ),
+      )
+      .mockResolvedValueOnce(jsonResponse({ report_run_id: "rr_2" }));
+    const sleepImpl = noopSleep();
+    const client = new MetaClient({ accessToken: "tok", fetchImpl, sleepImpl });
+
+    await client.post("/act_123/insights", {});
+    await client.post("/act_123/insights", {});
+
+    expect(sleepImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a rate-limited POST and eventually succeeds", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({ error: { message: "limited", code: 17 } }, { status: 400 }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ report_run_id: "rr_1" }));
+    const client = new MetaClient({ accessToken: "tok", fetchImpl, sleepImpl: noopSleep() });
+
+    const result = await client.post<{ report_run_id: string }>("/act_123/insights", {});
+
+    expect(result.data.report_run_id).toBe("rr_1");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry an unauthorized POST", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ error: { message: "bad token", code: 190 } }, { status: 400 }),
+      );
+    const client = new MetaClient({ accessToken: "bad-tok", fetchImpl, sleepImpl: noopSleep() });
+
+    await expect(client.post("/act_123/insights", {})).rejects.toMatchObject({
+      kind: "unauthorized",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("MetaClient.checkAuth", () => {
   it("reports authorized:true on a successful call", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "act_456833154967349" }));

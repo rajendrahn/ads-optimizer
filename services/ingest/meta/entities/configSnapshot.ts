@@ -6,10 +6,15 @@
 // snapshot's document id is `{entityType}_{entityId}_{syncRunId}` (`metaEntitySnapshotKey`,
 // A2), so re-running this task type for the SAME run id overwrites its own partial output
 // rather than accumulating duplicates, while every distinct run id (the normal case) adds a
-// new, distinct point-in-time snapshot for later diffing — B4's job, out of scope here.
+// new, distinct point-in-time snapshot for later diffing.
 //
-// Diffing consecutive snapshots into `metaChangeEvents` is explicitly B4's job (out of scope
-// here, per this step's spec).
+// B4: diffing this run's snapshots against the previous run's into `metaChangeEvents` happens
+// right here, via `deriveAndWriteChangeEvents` (changeEvents.ts) — §9.2 describes "snapshot...
+// derive change events by diffing consecutive snapshots" as one sentence, one config-sync
+// cycle, and doing it here (rather than a separate task type not named anywhere in §10.2's
+// list) means it always runs against the exact in-memory snapshots this run just computed,
+// with no extra live Meta fetch. It MUST run before the bulk write below — see
+// changeEvents.ts's `findPreviousSyncRunId` for why the ordering matters.
 
 import { getDb } from "@shared/firestore/index.ts";
 import { COLLECTIONS, collectionRef, metaEntitySnapshotKey } from "@shared/firestore/index.ts";
@@ -18,6 +23,7 @@ import { loadReportingCanon, toReportingDay } from "@shared/canon/index.ts";
 import type { TaskRegistration } from "../../sync/registry.ts";
 import type { TaskHandler } from "../../sync/taskWrapper.ts";
 import { determineAdsetBudget, determineCampaignBudgetGivenChildren } from "./budgetOwnership.ts";
+import { deriveAndWriteChangeEvents } from "./changeEvents.ts";
 import { fetchAllMetaEntities } from "./fetchAll.ts";
 
 export const metaSnapshotConfigHandler: TaskHandler = async (ctx) => {
@@ -122,6 +128,15 @@ export const metaSnapshotConfigHandler: TaskHandler = async (ctx) => {
 
   const allSnapshots = [...campaignSnapshots, ...adsetSnapshots, ...adSnapshots];
 
+  // B4: must run BEFORE the bulk write below, so it diffs against the previous run's
+  // snapshots rather than the ones about to be written this run — see changeEvents.ts.
+  const changeEventsResult = await deriveAndWriteChangeEvents({
+    db,
+    currentSnapshots: allSnapshots,
+    currentSyncRunId: ctx.runId,
+    onVersionGuardRejected: ctx.recordVersionGuardRejection,
+  });
+
   const bulkWriter = db.bulkWriter();
   const ref = collectionRef(db, COLLECTIONS.metaEntitySnapshots, metaEntitySnapshotSchema);
   for (const snapshot of allSnapshots) {
@@ -136,6 +151,8 @@ export const metaSnapshotConfigHandler: TaskHandler = async (ctx) => {
       campaigns: campaignSnapshots.length,
       adsets: adsetSnapshots.length,
       ads: adSnapshots.length,
+      changeEventsWritten: changeEventsResult.changeEventsWritten,
+      previousSyncRunId: changeEventsResult.previousSyncRunId,
     },
   };
 };

@@ -31,6 +31,9 @@ export const COLLECTIONS = {
   metaInsightsDaily: "metaInsightsDaily",
   metaEntitySnapshots: "metaEntitySnapshots",
   metaChangeEvents: "metaChangeEvents",
+  // B3's async-report-job bookkeeping — not one of §8's named collections; see
+  // shared/schema/meta.ts's module comment on metaInsightsReportJobSchema for why.
+  metaInsightsReportJobs: "metaInsightsReportJobs",
 
   shopifyOrders: "shopifyOrders",
   shopifyOrderLines: "shopifyOrderLines",
@@ -75,7 +78,10 @@ function assertValidIdSegment(segment: string, label: string): string {
 
 // ---------------------------------------------------------------------------------------
 // Entities keyed directly by Meta's own platform ID — no helper needed, just use the ID:
-// metaCampaigns/{campaignId}, metaAdsets/{adsetId}, metaAds/{adId}, metaCreatives/{creativeId}
+// metaCampaigns/{campaignId}, metaAdsets/{adsetId}, metaAds/{adId}, metaCreatives/{creativeId},
+// metaInsightsReportJobs/{reportRunId} (Meta's own async report job id — naturally idempotent:
+// re-submitting the same window twice cannot collide since Meta mints a fresh id per submission,
+// and every phase transition of one job writes to the same doc keyed by its own id)
 // ---------------------------------------------------------------------------------------
 
 /** metaInsightsDaily/{adId}_{date} — §9.5's given example. `date` is a reportingDay string. */

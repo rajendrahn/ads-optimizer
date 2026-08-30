@@ -31,7 +31,18 @@ function jsonResponse(body: unknown): Response {
   });
 }
 
-export function buildTestFetchImpl() {
+export interface TestFetchImplOptions {
+  /** cmp_cbo's `daily_budget`, in minor units — parameterized so B4's tests can simulate a
+   * budget edit between two consecutive META_SNAPSHOT_CONFIG runs. Defaults to "50000",
+   * matching every pre-existing (B2) caller that doesn't pass this. */
+  cmpCboDailyBudget?: string;
+  /** cmp_cbo's `status` — parameterized so B4's tests can simulate a status edit the same way. */
+  cmpCboStatus?: string;
+}
+
+export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
+  const cmpCboDailyBudget = options.cmpCboDailyBudget ?? "50000";
+  const cmpCboStatus = options.cmpCboStatus ?? "ACTIVE";
   return vi.fn(async (url: string | URL | Request) => {
     const u = new URL(url as string);
     if (u.pathname.endsWith(`/${META_AD_ACCOUNT_ID}`)) return jsonResponse({ currency: "INR" });
@@ -41,10 +52,10 @@ export function buildTestFetchImpl() {
           {
             id: "cmp_cbo",
             name: "CBO campaign",
-            status: "ACTIVE",
+            status: cmpCboStatus,
             objective: "OUTCOME_SALES",
             buying_type: "AUCTION",
-            daily_budget: "50000",
+            daily_budget: cmpCboDailyBudget,
             bid_strategy: "LOWEST_COST_WITHOUT_CAP",
             created_time: "2026-01-01T00:00:00+0530",
             updated_time: "2026-01-01T00:00:00+0530",

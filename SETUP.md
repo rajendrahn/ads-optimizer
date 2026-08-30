@@ -138,16 +138,25 @@ runtime gets credentials from the metadata server. This wiring happens in A4/B1,
 
 ---
 
-## 3. Shopify — 🟡 Mostly done (Matrixify upload pending)
+## 3. Shopify — ✅ Done
 
 - [x] Create a **custom app** in store admin (not a public app)
 - [x] Admin API scopes: `read_orders`, `read_products`, `read_customers`
 - [x] ~~Request `read_all_orders`~~ — **not requested, resolved differently.** See note below.
-- [ ] Confirm protected customer data access status (requested — awaiting confirmation from user whether it
-      was instant or is pending review)
+- [x] Confirm protected customer data access status — **confirmed live during B5**: a read-only
+      GraphQL query for `order.customer.id` against the real store succeeds (no `ACCESS_DENIED`),
+      so this was auto-approved (or already granted) rather than pending review. Not otherwise
+      re-verified for every possible customer field — B5 only ever reads `customer.id`, per §17.2's
+      PII boundary.
 - [x] Record: shop domain, Admin API access token, webhook signing secret, API version
-- [ ] Upload the Matrixify full-order-history export to the restricted PII bucket (below) — export already
-      run once and returned ~22.6K orders; user will upload when the file is ready
+- [x] Upload the Matrixify full-order-history export to the restricted PII bucket (below) — uploaded
+      to `gs://sng-meta-ads-optimizer-pii-imports/shopify-orders-backfill.csv` (10.14 MiB). This
+      first export turned out to be **partial**: 37,172 CSV rows covering only the earliest ~10,000
+      of the ~22.6K orders quoted above, truncated by the exporting tool's own plan/row-size limit
+      (a literal "###### YOUR PLAN ALLOWS FILE SIZE TILL HERE ###### UPGRADE IF YOU NEED LARGER
+      FILES" row is present in the file). B5's importer is built to accept further, larger exports
+      later without duplicating or regressing already-imported data — see `IMPLEMENTATION_PLAN.md`
+      B5 notes.
 
 **Values recorded:**
 
@@ -168,8 +177,12 @@ restriction. B5 now seeds historical data from this one-time CSV export instead 
 sync uses plain `read_orders` (sufficient — nothing ongoing ever looks further back than 60 days). Full
 reasoning recorded in `IMPLEMENTATION_PLAN.md` under B5 and the Open Questions section.
 
-**The CSV contains customer PII** (name, email, address) — it must **not** go in the general raw archive
-bucket or the repo. Restricted storage location:
+**Correction (verified during B5): the real export contains no name, email, address or phone —
+only a numeric `Customer: ID`, `Billing: Country Code` and `Shipping: Country Code`.** This line
+previously claimed otherwise before the actual file was inspected. A bare customer ID is still
+personal data worth protecting carefully (§17.2), so the restricted-bucket handling below stands
+regardless — it just isn't the name/email/address kind of PII originally assumed. The CSV must
+still **not** go in the general raw archive bucket or the repo. Restricted storage location:
 
 ```powershell
 gcloud storage buckets create "gs://sng-meta-ads-optimizer-pii-imports" `
@@ -187,8 +200,9 @@ gcloud storage cp "<local path to export>.csv" "gs://sng-meta-ads-optimizer-pii-
 No explicit access was granted beyond `sync-functions` (`roles/storage.objectAdmin`, scoped to this bucket) —
 B5 (not a human) is the intended reader. The project owner's account retains inherent access via the
 project-level Owner role (GCS's default legacy bucket bindings), which is unavoidable and expected for the
-account that owns the project; no other identity has access. **Status: bucket created ✅, file not yet
-uploaded** — pending Matrixify export.
+account that owns the project; no other identity has access. **Status: bucket created ✅, file uploaded ✅**
+(`shopify-orders-backfill.csv`, see above — a partial export; further, larger exports can be uploaded under a
+different object key and imported without re-running or duplicating anything).
 
 ### Webhook signing secret note
 
@@ -284,10 +298,9 @@ import (§3), not by an API scope, per the resolved open question below.
 2. ~~Has Shopify granted `read_all_orders`?~~ — resolved: not needed, see §3.
 3. ~~Does the Anthropic org's retention setting permit Fable 5?~~ — resolved: confirmed via the live call above.
 
-**Loose ends not blocking A0 completion, but needed before B5:**
+**Loose ends carried from A0 — both resolved by B5, see §3:**
 
-- Confirm whether Shopify's protected customer data access request was auto-approved or is still pending
-  review (needed for `read_customers` fields on *ongoing* incremental orders, separate from the Matrixify
-  historical seed)
-- Upload the Matrixify CSV export to `gs://sng-meta-ads-optimizer-pii-imports/` once the file is ready
-  (bucket already created and IAM-scoped to `sync-functions`)
+- ~~Confirm whether Shopify's protected customer data access request was auto-approved or is still pending
+  review~~ — resolved: confirmed live, auto-approved.
+- ~~Upload the Matrixify CSV export to `gs://sng-meta-ads-optimizer-pii-imports/`~~ — resolved: uploaded
+  (partial export, ~10k of ~22.6k orders — see §3).
