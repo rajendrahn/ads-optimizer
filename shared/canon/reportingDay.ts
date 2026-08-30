@@ -169,3 +169,26 @@ export function reportingDayToUtcRange(day: ReportingDay, timezone: string): Rep
 
   return { startUtc, endUtcExclusive };
 }
+
+/**
+ * Adds (or subtracts, for a negative `delta`) whole calendar days to a reporting day,
+ * returning another reporting day — pure calendar arithmetic on the `YYYY-MM-DD` string, with
+ * no timezone involved. This is deliberately a *different* operation from
+ * `reportingDayToUtcRange`: that one needs an IANA zone to place a calendar day onto the UTC
+ * instant line; this one never leaves calendar-day space, so it needs no zone at all and is
+ * safe to use for windowing math (B1's reconciliation window, later steps' N-day windows)
+ * without re-deriving anything from an instant.
+ *
+ * `Date.UTC` is used only as a calendar (month/year rollover) calculator, exactly as
+ * `reportingDayToUtcRange` already does internally for the same reason — the `Date` produced
+ * is never treated as a real instant.
+ */
+export function addCalendarDays(day: ReportingDay, delta: number): ReportingDay {
+  const parsed = reportingDay.parse(day);
+  const [y, m, d] = parsed.split("-").map(Number) as [number, number, number];
+  const shifted = new Date(Date.UTC(y, m - 1, d + delta));
+  const yyyy = String(shifted.getUTCFullYear()).padStart(4, "0");
+  const mm = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(shifted.getUTCDate()).padStart(2, "0");
+  return reportingDay.parse(`${yyyy}-${mm}-${dd}`);
+}

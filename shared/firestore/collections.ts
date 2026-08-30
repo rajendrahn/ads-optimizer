@@ -159,8 +159,16 @@ export function syncStateKey(source: "meta" | "shopify", resource: string): stri
   return `${source}_${resource}`;
 }
 
-// decisionPackets/{id}, recommendations/{id}, syncRuns/{runId}, backtestRuns/{id},
-// aiConversations/{id}, accountMemory/{id} — each generates its own ID at write time
-// (a request UUID, a task-framework run ID, etc.), not derived from source data. Later
-// steps that own those ID schemes should add a helper here rather than hand-building one
-// inline, to keep this file the single place document IDs are decided.
+// decisionPackets/{id}, recommendations/{id}, backtestRuns/{id}, aiConversations/{id},
+// accountMemory/{id} — each generates its own ID at write time (a request UUID, etc.), not
+// derived from source data. Later steps that own those ID schemes should add a helper here
+// rather than hand-building one inline, to keep this file the single place document IDs are
+// decided.
+
+// syncRuns/{runId} — B1 decided this ID scheme: `runId` is the task's own idempotency key,
+// supplied by whatever enqueues the task (services/ingest/sync/taskQueue.ts) or generated
+// fresh (crypto.randomUUID()) when none is given. It is deliberately NOT derived from
+// (taskType, inputs) the way the keys above are — a retried/redelivered task reuses the SAME
+// runId on purpose, so services/ingest/sync/taskWrapper.ts's `runSyncTask` can look the doc up
+// by that id and treat an already-SUCCEEDED one as a no-op (§10.2's idempotency requirement).
+// See services/ingest/sync/taskWrapper.ts's module comment for the full lifecycle.

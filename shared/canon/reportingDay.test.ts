@@ -10,7 +10,7 @@
 // transition-scan commands run during planning, reproduced in comments below.
 
 import { describe, expect, it } from "vitest";
-import { reportingDayToUtcRange, toReportingDay } from "./reportingDay.ts";
+import { addCalendarDays, reportingDayToUtcRange, toReportingDay } from "./reportingDay.ts";
 
 describe("toReportingDay — day boundary in the reporting timezone (Asia/Kolkata, +5:30, no DST)", () => {
   it("an instant just before local midnight lands on the earlier day", () => {
@@ -116,5 +116,35 @@ describe("round-trip and error handling", () => {
 
   it("throws on an invalid Date instant", () => {
     expect(() => toReportingDay(new Date("not a date"), "UTC")).toThrow();
+  });
+});
+
+describe("addCalendarDays — pure calendar arithmetic, no timezone", () => {
+  it("adds within a month", () => {
+    expect(addCalendarDays("2026-08-10", 5)).toBe("2026-08-15");
+  });
+
+  it("subtracts within a month via a negative delta", () => {
+    expect(addCalendarDays("2026-08-10", -5)).toBe("2026-08-05");
+  });
+
+  it("rolls over a month boundary", () => {
+    expect(addCalendarDays("2026-08-30", 3)).toBe("2026-09-02");
+  });
+
+  it("rolls over a year boundary", () => {
+    expect(addCalendarDays("2026-12-30", 3)).toBe("2027-01-02");
+  });
+
+  it("rolls backward over a month boundary", () => {
+    expect(addCalendarDays("2026-09-01", -2)).toBe("2026-08-30");
+  });
+
+  it("delta of 0 is a no-op", () => {
+    expect(addCalendarDays("2026-08-10", 0)).toBe("2026-08-10");
+  });
+
+  it("throws on a malformed reporting-day string", () => {
+    expect(() => addCalendarDays("2026/08/10", 1)).toThrow();
   });
 });

@@ -796,7 +796,14 @@ component with its own tests, not an afterthought inside the request function.
 
 ### B1 — Sync framework
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both the root ESM project and
+`functions/`'s CommonJS project, lint, format, 230/230 unit tests — up from A4's 177, this step's own
+53 new: 46 across `services/ingest/sync/**` + 7 for `addCalendarDays`). `npm run test:integration`
+passes 110/110 against a real Firestore emulator (103 from A2 + 4 from A3 + 3 new
+`taskWrapper.emulator.test.ts` cases). The `functions/` esbuild bundle was actually
+built (`npm --prefix functions run build`) and its compiled artifact was actually executed end to end
+against a live Firestore emulator (not just typechecked) — see Notes below. No real cloud resource
+(Cloud Tasks queue, Cloud Storage bucket, live Firestore, deploy) was created, modified or touched.
 **Depends on:** A2, A4
 **Design refs:** §9.3, §9.4, §10.2, §23
 
@@ -815,6 +822,181 @@ component with its own tests, not an afterthought inside the request function.
 
 **Done when.** A no-op task can be enqueued, executed, retried on failure, and leaves correct `syncRuns`
 state; the archiver round-trips a payload.
+
+**Notes from implementation:**
+
+- **Layout as built.** All real logic lives in the root ESM project, under
+  `services/ingest/sync/`: `taskTypes.ts` (the §10.2 task-type list + `SYNC_NOOP`),
+  `reconciliationWindow.ts` (§9.4, pure), `store.ts` (`SyncStore` — the `syncState`/`syncRuns`
+  get/set seam), `archiver.ts` (§23, `RawArchiveStore`/`GcsRawArchiveStore`), `taskQueue.ts`
+  (§10.2's controller/enqueue side, `TaskQueueClient`/`CloudTasksQueueClient`), `registry.ts`
+  (the task-type → handler map, `createDefaultRegistry()` registers `SYNC_NOOP`),
+  `taskWrapper.ts` (`runSyncTask` — the uniform wrapper), `httpHandler.ts`
+  (`handleTaskRequest` — the framework-agnostic Cloud Tasks HTTP-target logic, pure
+  request-in/response-out), `runtime.ts` (`handleSyncTaskDispatch` — the same thing wired to
+  real Firestore/registry/archiver), and `index.ts` (barrel + esbuild entry point). Every file
+  has a co-located `*.test.ts`; `taskWrapper.emulator.test.ts` is the emulator-backed proof of
+  this step's own "Done when" line. `scripts/config.ts` gained `RAW_ARCHIVE_BUCKET`.
+  `shared/canon/reportingDay.ts` gained `addCalendarDays` (pure calendar-day arithmetic, no
+  timezone — distinct from `reportingDayToUtcRange`), needed by the reconciliation window and
+  reusable by any later step's own N-day windowing.
+
+- **The `functions/` module-system decision (A1's orchestrator note) — resolved as a bundled
+  thin deploy shim, the third option that note listed.** `functions/` is untouched as CommonJS
+  with its original `rootDir: "src"` (A1's scaffold) and still cannot import `/shared` or
+  `/services` directly. Instead:
+  - All real logic is written, typechecked, unit-tested and emulator-tested entirely in the
+    root ESM project (as above), using the existing `@shared`/`@services` path aliases, vitest,
+    and the Firestore emulator exactly as A2–A4 already do. Nothing about this step's actual
+    logic lives in `functions/` at all.
+  - `functions/scripts/bundle.mjs` uses esbuild's JS API to bundle
+    `services/ingest/sync/index.ts` into one self-contained CommonJS file,
+    `functions/lib/generated/syncBundle.js` (gitignored, like the rest of `functions/lib/`).
+    `firebase-admin`, `firebase-functions`, and every `@google-cloud/*` package are marked
+    `external` (kept as bare `require(...)`, not inlined) so the bundle resolves them from
+    `functions/node_modules` at runtime — this is what avoids two separate copies of
+    `firebase-admin` (root's ^14.3.0 vs. functions' original ^13.0.0) ending up in the same
+    process with two separate `getApps()` registries; `functions/package.json`'s
+    `firebase-admin` was bumped to ^14.3.0 to match root's, and `@google-cloud/tasks`,
+    `@google-cloud/storage`, `@google-cloud/secret-manager`, and `esbuild` were added as real
+    dependencies there (mirroring what root already has, so the externals actually resolve).
+    Pure-JS dependencies (zod) are bundled normally, not marked external.
+  - `functions/src/generated/syncBundle.d.ts` is a **hand-written** ambient declaration
+    (checked into git) of the bundle's exported surface — currently just
+    `handleSyncTaskDispatch`. Because it sits at the exact path TypeScript's classic module
+    resolution looks for when `functions/src/index.ts` writes
+    `import { handleSyncTaskDispatch } from "./generated/syncBundle"`, `npm run typecheck`
+    (which runs `tsc --noEmit -p functions/tsconfig.json`, unchanged from A1) passes whether or
+    not the bundle has actually been built — the real `.js` is generated only by
+    `npm --prefix functions run build` (now `node scripts/bundle.mjs && tsc`, bundle first since
+    tsc doesn't clean `outDir` and would otherwise leave a stale/missing bundle next to its own
+    fresh output).
+  - `functions/src/index.ts` is now genuinely thin: one `onRequest` handler
+    (`syncTaskDispatch`) that parses the request body and calls `handleSyncTaskDispatch`. B2–B8
+    should not need to touch this file — they register real task handlers into
+    `registry.ts`'s default registry, which this already dispatches through.
+  - **Tradeoff, stated plainly (asked for explicitly):** this keeps the root project idiomatic
+    ESM and fully testable with the tooling A2–A4 already established, and keeps `functions/`'s
+    own deploy mechanics (`firebase.json`'s `predeploy: npm run build`) completely unchanged
+    from A1 — no monorepo/workspace tooling, no repo-wide module-system migration, no rootDir
+    surgery. The cost is the hand-maintained `.d.ts` mirror: nothing enforces it stays in sync
+    with `services/ingest/sync/index.ts`'s real exports except the comment saying so and
+    whoever edits one remembering the other exists. A real mismatch would only surface by
+    actually building and running the bundle, not from `tsc` alone — mitigated by keeping the
+    declared surface minimal (one function today) and by the verification below, which builds
+    and *executes* the real bundle rather than stopping at "it typechecks".
+  - **This was verified for real, not just written.** `npm --prefix functions run build`
+    actually ran esbuild + tsc and produced `functions/lib/index.js` +
+    `functions/lib/generated/syncBundle.js` (762.9kb, sourcemapped). `require()`-ing
+    `functions/lib/index.js` in a plain Node process confirmed it loads cleanly with no crash
+    and exports exactly `syncTaskDispatch`; `require()`-ing the bundle directly confirmed its
+    exports match the hand-written `.d.ts` exactly. Then, against a **real Firestore emulator**
+    (`firebase emulators:exec --only firestore "node <script requiring the built bundle>"`),
+    the bundled `handleSyncTaskDispatch(...)` was actually called with `{taskType: SYNC_NOOP,
+    ...}` and returned `{status: 200, body: {status: "SUCCEEDED", ...}}` — i.e. the compiled,
+    bundled, externals-resolved-from-`functions/node_modules` artifact really can reach a real
+    Firestore and run a task, not merely typecheck. `functions/lib/` was deleted afterward
+    (gitignored build output; nothing to commit).
+
+- **The task-wrapper API B2–B8 plug into.** Register a handler:
+  ```ts
+  registry.register({
+    taskType: "META_SYNC_INSIGHTS",       // add to SYNC_TASK_TYPES in taskTypes.ts if new
+    runSource: "meta",                     // "meta" | "shopify" | "internal"
+    syncStateTarget: { source: "meta", resource: "insights" }, // or null for no watermark
+    handler: async (ctx) => {
+      const meta = await ctx.getMetaClient();   // constructed at most once per run, memoized
+      // ... fetch, normalize, upsertWithVersionGuard({ ..., onRejected: ctx.recordVersionGuardRejection }) ...
+      await ctx.archiver.archive({ source: "meta", day, resource: "insights", runId: ctx.runId, payload: rawBody });
+      return { newWatermarkDate: latestDay, newRowCount: rows.length };
+    },
+  });
+  ```
+  `runSyncTask({ syncStore, registry, taskType, payload, archiver, taskId?, accountId?, ... })`
+  is the entry point (also reachable via `handleTaskRequest`/`handleSyncTaskDispatch` for the
+  HTTP path). It handles idempotency (a `taskId` already `SUCCEEDED` short-circuits without
+  re-running the handler or touching `syncState` again — `taskId` **is** the `syncRuns`
+  document id, a deliberate B1 ID-scheme decision recorded in
+  `shared/firestore/collections.ts`), retry classification (`ApiError.retryable` where thrown,
+  else defaults retryable — mirrors `services/ingest/http/retry.ts`), and watermark-on-success-
+  only. `computeReconciliationWindow({ watermark, today, reconciliationDays, mode,
+  deepReconciliationDays? })` (throws on a null watermark — run backfill first) is what B3/B5
+  call to turn `syncState.lastDataDate` into the date range to actually fetch.
+
+- **The A4 orchestrator note (per-client-instance BUC throttle) is directly implemented, not
+  just avoided.** `ctx.getMetaClient()`/`ctx.getShopifyClient()` are memoized async factories
+  built once per `runSyncTask` call (`memoizeAsync` in `taskWrapper.ts`) — the underlying
+  `createMetaClient()`/`createShopifyClient()` (A4) is invoked at most once per task run no
+  matter how many times or where in the handler `ctx.getMetaClient()` is called, and never
+  constructed at all if the handler never asks for it. Covered by
+  `taskWrapper.test.ts`'s "Meta/Shopify client construction" suite (asserts a call counter of
+  exactly 1, and of 0 when unused).
+
+- **The A2 orchestrator note (version-guard rejection logging) is wired, not just planned.**
+  `ctx.recordVersionGuardRejection` has exactly `upsertWithVersionGuard`'s `onRejected` shape —
+  pass it straight through:
+  `upsertWithVersionGuard({ ..., onRejected: ctx.recordVersionGuardRejection })`. Every
+  rejection during a run lands in that run's `syncRuns.versionGuardRejections`
+  (A2's `versionGuardRejectionLogEntrySchema`, with `loggedAt` stamped by the wrapper),
+  regardless of whether the run overall succeeds or fails — covered by
+  `taskWrapper.test.ts`'s version-guard-rejection suite (both branches).
+
+- **`syncState`/`syncRuns` schema needed zero changes** (A2's orchestrator note: any new field
+  on an existing collection must be optional/defaulted). `syncRunSchema.source` already allowed
+  `"internal"` and `syncStateSchema` already modeled exactly `"meta" | "shopify"` — which maps
+  cleanly onto "not every task type has a watermark" (`syncStateTarget: null` in a
+  registration) without touching either schema.
+
+- **Ambiguities resolved:**
+  1. **What should `computeReconciliationWindow` do with no watermark at all** (`syncState`
+     never successfully synced)? Resolved to throw, matching A3's `loadReportingCanon`
+     fail-loudly precedent, rather than silently returning a plausible-looking-but-wrong range
+     — reconciliation re-fetches history, it doesn't create it; a caller with no watermark
+     needs the (separate, one-time) backfill flow B3 owns instead.
+  2. **Cloud Tasks retry semantics have no native "terminal, don't retry" HTTP status** — Cloud
+     Tasks treats any non-2xx as "retry", full stop, with no 4xx/5xx distinction of its own.
+     Resolved: a retryable failure returns 500 (Cloud Tasks retries per the queue's own
+     backoff/max-attempts config); a terminal failure (including an unknown task type, or a
+     malformed request body) returns 200 anyway, with the real outcome fully visible in
+     `syncRuns` and the response body — observability comes from `syncRuns`, not from the HTTP
+     status of a task nobody will look at again. Documented in `httpHandler.ts`'s module
+     comment.
+  3. **Two independent idempotency layers, deliberately not collapsed into one.** Cloud Tasks'
+     own task *name* (not just a body field) gives queue-level dedupe of a duplicate *enqueue*
+     within its own retention window; `runSyncTask`'s `taskId`-keyed `syncRuns` lookup gives
+     idempotency at the *execution* layer regardless of how a duplicate dispatch arrives (Cloud
+     Tasks' at-least-once contract holds even for a named task). `taskQueue.ts`'s module
+     comment spells out why both exist.
+  4. **Not exercised live, by the safety constraints of this step:** `CloudTasksQueueClient`
+     (real `@google-cloud/tasks` usage) and `GcsRawArchiveStore` against the real bucket
+     (`gs://sng-meta-ads-optimizer-archive`, per SETUP.md — never connected to). Both are typed
+     against a narrow structural interface a real client satisfies automatically
+     (`CloudTasksClientLike`, `StorageBucketLike` — same seam pattern as A2's
+     `VersionGuardFirestoreLike` and A4's `SecretManagerClientLike`) and covered by unit tests
+     against hand-rolled fakes implementing those interfaces, per this step's brief.
+
+- **What real cloud provisioning is still needed before this runs for real** (none of it was
+  done here — see this step's safety constraints):
+  1. A Cloud Tasks queue, e.g.:
+     `gcloud tasks queues create sync-tasks --location=asia-south1 --project=sng-meta-ads-optimizer`
+  2. Deploy `functions/` (which creates the actual HTTPS function
+     `syncTaskDispatch` points enqueued tasks at):
+     `firebase deploy --only functions --project sng-meta-ads-optimizer`
+  3. Grant the `sync-functions` service account (already created in A0) permission to enqueue
+     Cloud Tasks and invoke the deployed function:
+     `gcloud projects add-iam-policy-binding sng-meta-ads-optimizer --member="serviceAccount:sync-functions@sng-meta-ads-optimizer.iam.gserviceaccount.com" --role="roles/cloudtasks.enqueuer"`,
+     plus `roles/run.invoker` (Cloud Functions Gen 2 runs on Cloud Run) scoped to the deployed
+     function.
+  4. Only then does `createDefaultTaskQueueClient({ location: "asia-south1", queue:
+     "sync-tasks", targetUrl: "<deployed function URL>", serviceAccountEmail:
+     "sync-functions@sng-meta-ads-optimizer.iam.gserviceaccount.com" })` (`taskQueue.ts`) have
+     anything real to point at. B2–B8 do not need any of this to land — `runSyncTask`/
+     `handleTaskRequest` are fully exercisable (as this step's own tests do) without a queue at
+     all, by calling them directly or through `createInMemoryTaskQueueClient`.
+  5. The raw archive bucket already exists (A0); `createDefaultRawArchiveStore()` (`archiver.ts`)
+     needs no further provisioning, only the `sync-functions` service account's existing
+     `roles/storage.objectAdmin` grant on it (already done in A0) to actually be used from a
+     deployed function.
 
 ---
 

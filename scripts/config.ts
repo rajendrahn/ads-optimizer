@@ -10,3 +10,7 @@ export const SHOPIFY_SHOP_DOMAIN = "shopsparkleandglow.myshopify.com";
 export const SHOPIFY_API_VERSION = "2025-01";
 
 export const ANTHROPIC_MODEL = "claude-fable-5";
+
+// §23 raw data archive bucket, created in A0 (SETUP.md §1). Same region as Firestore
+// (asia-south1), IAM-only access — never the client-facing default Firebase Storage bucket.
+export const RAW_ARCHIVE_BUCKET = "sng-meta-ads-optimizer-archive";
