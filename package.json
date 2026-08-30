@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "verify-credentials": "tsx scripts/verify-credentials.ts",
+    "verify-a4-clients": "tsx scripts/verify-a4-clients.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p functions/tsconfig.json",
     "lint": "eslint .",
     "format": "prettier --write .",

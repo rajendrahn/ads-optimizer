@@ -481,7 +481,11 @@ get its ergonomics right. Every Shopify write and every reconciled Meta insight 
 
 ### A3 — Reporting canon and settings
 
-**Status:** Not started
+**Status:** Done — `npm run check`'s typecheck/lint/format/unit-test stages all pass for this step's own
+files (`shared/canon/**`); the repo-wide `npm run check` is currently blocked by an unrelated, in-progress
+A4 typecheck error in `shared/secrets/client.ts` — see Notes below. `npm run test:integration` (Firestore
+emulator) passes 107/107 (the 103 from A2 plus 4 new `loader.emulator.test.ts` cases). See Notes below for
+the canon API, the day-boundary/DST test results, and ambiguities resolved.
 **Depends on:** A2
 **Design refs:** §5, §19.2
 **Size:** S
@@ -504,11 +508,113 @@ across a DST transition in a non-IST timezone to prove the helper is not hardcod
 **Notes for the planning agent.** §5 is emphatic that these cannot be retrofitted. Make the loader throw on
 absence rather than defaulting — a silent default here corrupts every stored record.
 
+**Notes from implementation:**
+
+- **Layout as built.** `shared/canon/{reportingDay,money,settings,loader,index}.ts`, plus
+  `reportingDay.test.ts`, `money.test.ts`, `loader.test.ts` (pure) and `loader.emulator.test.ts`
+  (emulator-backed, following A2's `*.emulator.test.ts` convention). No dependencies were added —
+  `Intl.DateTimeFormat` with a `timeZone` option does all the IANA/DST work natively.
+- **The canon API, for C1/B2/B3/B5 and later callers:**
+  - `loadReportingCanon(options?: { db?: Firestore; accountId?: string }): Promise<CanonSettings>` —
+    the ONLY way to get the canon. Defaults `db` to `shared/firestore/client.ts`'s `getDb()` and
+    `accountId` to `scripts/config.ts`'s `META_AD_ACCOUNT_ID`, so a plain `await loadReportingCanon()`
+    is normally all a caller needs. **Throws** (never defaults) if `settings/{accountId}` does not
+    exist, or exists but fails `canonSettingsSchema`. Cached per `accountId` after the first
+    successful load — call it as often as you like, it will not re-read Firestore, and per A3's
+    "treat these as write-once values" it deliberately will NOT pick up a live edit to the
+    document (proved by `loader.emulator.test.ts`'s "is loaded once" case). A failed load is NOT
+    cached, so a genuinely transient error (e.g. emulator not yet up) can be retried. Test-only:
+    `resetReportingCanonCacheForTests()` clears the cache between test cases — never call it from
+    production code.
+  - `CanonSettings` (`shared/canon/settings.ts`) = A2's four §5 fields (`accountId`,
+    `reportingTimezone`, `reportingCurrency`, `attributionWindow`, `purchaseActionType`) plus a
+    nested `modelConfig` object with §19.2's six fields verbatim
+    (`recommendationProvider`/`recommendationModel`/`creativeReasoningModel`/
+    `backgroundCreativeTaggingModel`/`taggingUsesBatchApi`/`effort`). Built via
+    `reportingCanonSettingsSchema.extend({ modelConfig: modelConfigSchema })`, per A2's note —
+    A2's original four-field schema and the `settings/{accountId}` key convention are untouched.
+    **Nobody has written a real `settings/{accountId}` document yet** — that's an operational step
+    for whoever runs this system for real (or an A0-style follow-up), not something this step does
+    (Out of scope: "Applying the canon to real data"). Every later step that calls
+    `loadReportingCanon()` against a real environment before that document exists will get the
+    loud "no settings/{accountId} document exists" throw by design — that is not a bug to route
+    around, it is the point of §5.
+  - `toReportingDay(instant: Date, timezone: string): ReportingDay` and its inverse
+    `reportingDayToUtcRange(day: ReportingDay, timezone: string): { startUtc: Date; endUtcExclusive: Date }`
+    (half-open `[startUtc, endUtcExclusive)`) in `shared/canon/reportingDay.ts` — **the only
+    sanctioned way** to move between an instant and a reporting day, per this step's spec. C1 calls
+    `toReportingDay` on every Meta/Shopify timestamp to place it on a shared day; anything that
+    needs to query "all data for reporting day D" (B3 reconciliation, C2 windowing, etc.) calls
+    `reportingDayToUtcRange` to get the UTC bounds to query against. Both throw on an invalid IANA
+    zone name or a malformed day string — never silently fall back to UTC or the host's local zone.
+  - Money helpers in `shared/canon/money.ts`, built on `shared/schema/common.ts`'s existing
+    `moneyMinorUnits` zod schema/`Money` type (A2): `makeMoney`, `zeroMoney`, `addMoney`,
+    `subtractMoney`, `negateMoney`, `sumMoney`, `compareMoney` (all throw on a currency mismatch —
+    money is never silently mixed across currencies), plus `parseDecimalToMinorUnits(decimalString,
+    currency)` and its inverse `formatMinorUnitsAsDecimal(money)`. The parse function is the one
+    B5/C1 should reach for when turning a Meta/Shopify decimal-string amount (e.g. `"199.00"`) into
+    stored minor units — it works via `BigInt` on the string's digits, never
+    `parseFloat(x) * 10^n`, which is the expression that produces `1998.9999999999998` for
+    `19.99 * 100` in plain JS. A small ISO-4217 minor-unit-exponent override table handles
+    zero-decimal (JPY, KRW, ...) and three-decimal (BHD, KWD, ...) currencies; everything else,
+    including INR, defaults to 2.
+- **Day-boundary and DST test results (all passing, `shared/canon/reportingDay.test.ts`):**
+  - Asia/Kolkata (the account's actual §5.1 timezone, no DST): `2026-08-30T18:29:59Z` →
+    `"2026-08-30"`, and one second later `2026-08-30T18:30:00Z` → `"2026-08-31"` — the exact
+    midnight tick-over, either side. `reportingDayToUtcRange("2026-08-30", "Asia/Kolkata")` inverts
+    to exactly `[2026-08-29T18:30:00Z, 2026-08-30T18:30:00Z)`, a flat 24h span.
+  - **DST test, per this step's Done-when line**, using America/New_York (verified against Node's
+    own tzdata during planning, not asserted from memory): the 2026 US spring-forward is
+    2026-03-08 (EST → EDT), fall-back is 2026-11-01 (EDT → EST).
+    `reportingDayToUtcRange("2026-03-08", "America/New_York")` returns
+    `[2026-03-08T05:00:00Z, 2026-03-09T04:00:00Z)` — **23 real hours**, not 24, because
+    `startUtc` is computed under the still-active EST offset (−05:00) and `endUtcExclusive` under
+    the now-active EDT offset (−04:00) that took effect at 2am local earlier that same day.
+    Symmetrically, `reportingDayToUtcRange("2026-11-01", "America/New_York")` returns a
+    **25-hour** span. A third test confirms `toReportingDay` and `reportingDayToUtcRange` agree
+    with each other on both sides of the exact transition instant. All of this fails immediately
+    under a hardcoded-offset (or "compute the offset once per call" without re-deriving it for
+    the end boundary) implementation — that's deliberately what makes it a real DST test rather
+    than a decorative one.
+  - `npx vitest run shared/canon` → **36/36 passed** (money 19, loader 7, reportingDay 10).
+    Full `npm run test` → **140/140 passed**. `npm run test:integration` →
+    **107/107 passed** (103 from A2 + 4 new `loader.emulator.test.ts` cases, run against the real
+    Firestore emulator with `FIRESTORE_EMULATOR_HOST` set, not mocked).
+- **§5 ambiguity resolved:** whether §19.2's model config belongs inside the same
+  `settings/{accountId}` document as the four §5 fields, or is separate app config outside
+  Firestore entirely. Resolved per A2's explicit steer ("extend `reportingCanonSettingsSchema`
+  with `.extend(...)`, ... model config §19.2") — it's the same document, nested under a
+  `modelConfig` key. A second, smaller ambiguity: §19.3 documents `output_config.effort` as the
+  reasoning-depth control but the design never enumerates its legal values, and D3's own spec
+  warns Fable 5's API "changed recently." `modelConfigSchema.effort` is therefore a non-empty
+  `z.string()`, not a guessed `z.enum([...])` — tightening it to match the real SDK type belongs to
+  D3, the first step that actually calls the API.
+- **§15.1 statistical thresholds were deliberately NOT added here**, despite A2's note flagging them
+  as a plausible `.extend(...)` target alongside model config. This step's own Deliverables list
+  only names "Model configuration per §19.2"; §15.1 ("Minimum purchase floors per window,
+  configurable") is C3's explicit deliverable. C3 should use the same `.extend(...)` mechanism on
+  `canonSettingsSchema` (not `reportingCanonSettingsSchema` — extend the already-extended schema so
+  A3's `modelConfig` addition also stays intact) when it gets there.
+- **⚠️ Orchestrator note: repo-wide `npm run check` is currently red, but not because of this
+  step.** `shared/secrets/client.ts` — A4's Secret Manager access wrapper, built concurrently with
+  this step — has two live `tsc` errors (`SecretManagerServiceClient` not assignable to a narrower
+  `SecretManagerClientLike`). Confirmed by running `npx tsc --noEmit -p tsconfig.json` in isolation:
+  the only errors reported are in that file; `shared/canon/**` typechecks, lints (`npx eslint
+  shared/canon/`) and formats (`npx prettier --check shared/canon/`) clean, and the full
+  `npm run test` (140/140) and `npm run test:integration` (107/107) both pass — including
+  `shared/secrets/client.test.ts`'s own unit tests, which apparently mock around the type mismatch
+  rather than exercising the real client. Whoever finishes A4 should re-run `npm run check` once
+  `shared/secrets/client.ts` is done; nothing in A3 needs to change for that to go green.
+
 ---
 
 ### A4 — API clients, secrets and rate limiting
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck, lint, format, 177/177 unit tests, including
+this step's own 86 new tests). `npm run verify-a4-clients` (new script, this step's live-verification
+deliverable) passes against real credentials: `MetaClient.checkAuth()` and `ShopifyClient.checkAuth()`
+both succeed live. See Notes below for the client APIs, the BUC/leaky-bucket throttle design, and what
+Phase B needs to know.
 **Depends on:** A0 (live credentials), A1
 **Design refs:** §7.1, §9.6, §16.2
 **Size:** M
@@ -537,6 +643,150 @@ response; throttle logic has unit tests against synthetic headers.
 **Notes for the planning agent.** The BUC throttle is the piece most likely to be skipped and most likely to
 cause pain later — a throttled account stalls every sync. Treat the header parsing as a first-class
 component with its own tests, not an afterthought inside the request function.
+
+**Notes from implementation:**
+
+- **Layout as built.** `shared/secrets/{names,client,index}.ts` — the Secret Manager wrapper.
+  `services/ingest/{health,index}.ts` plus `http/{errors,sleep,retry}.ts`, `meta/{buc,errors,client}.ts`,
+  `shopify/{cost,errors,client}.ts`, each with a co-located `*.test.ts`. `scripts/verify-a4-clients.ts` is
+  this step's live-verification script (new `npm run verify-a4-clients`), separate from A0's
+  `scripts/verify-credentials.ts`, which is untouched. No new dependencies — `@google-cloud/secret-manager`
+  was already a direct dependency from A0; everything else (retry, BUC/cost parsing, HMAC for
+  `appsecret_proof`) is hand-rolled on `fetch`/`node:crypto`, both native to Node 22+. `package-lock.json`
+  is unchanged.
+- **Secrets wrapper** (`shared/secrets/client.ts`): `getSecret(name, opts?)` resolves a secret's latest
+  version by the exact SETUP.md §5 names (`shared/secrets/names.ts`'s `SECRET_NAMES` — import this, never a
+  string literal), trims it, throws loudly if missing/empty, and caches successful reads in memory per
+  `${projectId}/${name}` (never on disk) so a long-running Cloud Run process or a sync task making many
+  calls doesn't re-hit Secret Manager per request. Unit-tested against a hand-injected fake client
+  (`SecretManagerClientLike`, a narrow structural interface a real `SecretManagerServiceClient` satisfies
+  automatically — same pattern A2 used for `versionGuard.ts`'s Firestore seam), so no live credentials or
+  ADC are needed for `npm run test`.
+- **Config reuse, not duplication.** `scripts/config.ts` (A0/A1's existing home for `GCP_PROJECT_ID`,
+  `META_API_VERSION`, `META_AD_ACCOUNT_ID`, `SHOPIFY_SHOP_DOMAIN`, `SHOPIFY_API_VERSION`) is imported
+  directly by relative path from `services/ingest/meta/client.ts` and `services/ingest/shopify/client.ts`
+  (`../../../scripts/config.ts`) — the same convention A2's `shared/firestore/client.ts` already
+  established for `GCP_PROJECT_ID`. Neither `scripts/config.ts` nor `scripts/verify-credentials.ts` was
+  modified.
+- **The BUC header parser and backoff decision are pure, standalone functions** (`services/ingest/meta/
+  buc.ts`), exactly as the step spec asked — not folded into the request path. `parseBucHeader(headerValue)`
+  parses `X-Business-Use-Case-Usage` (JSON keyed by ad-account/business ID → array of `{call_count,
+  total_cputime, total_time, estimated_time_to_regain_access}` entries — real Meta shape, not guessed),
+  taking the max usage percentage across every field and every entry/key, and never throwing — a malformed
+  header logs a warning and returns `null` rather than breaking the request it arrived on.
+  `decideBucBackoff(usage, opts?)` is the pre-emptive decision: `null` (no data yet) → no throttle; ≥90%
+  (configurable) → wait `cooldownMs`; ≥95% → `cooldownMs*2`; ≥100% → `cooldownMs*4`; and if Meta reports
+  `estimated_time_to_regain_access > 0` (already throttling — reactive at that point, but the most reliable
+  number available), wait that many minutes, capped at 15. `MetaClient` calls `decideBucBackoff` with the
+  *previous* response's usage **before** sending the next request — that's what makes it pre-emptive rather
+  than reactive to a 613/17/32/4 rate-limit error. Tested with 27 cases across `buc.test.ts` +
+  `client.test.ts` against synthetic header strings: missing/empty header, malformed JSON, non-object JSON,
+  single/multiple entries, single/multiple top-level keys, max-across-fields, threshold boundaries (89%
+  doesn't throttle, 90% does, 95%/100% wait longer), custom threshold, `estimated_time_to_regain_access`
+  with and without its 15-minute cap, and (in `client.test.ts`) that a real second `get()` call actually
+  sleeps when the first response reported high usage, and does not sleep on the very first call.
+- **Shopify's leaky-bucket cost throttle mirrors the same shape** (`services/ingest/shopify/cost.ts`):
+  `parseShopifyCost(extensions)` reads `extensions.cost.throttleStatus` (`maximumAvailable`,
+  `currentlyAvailable`, `restoreRate`), returning `null` (never throwing) if any required field is
+  missing/non-numeric or `restoreRate <= 0`. `decideShopifyThrottle(cost, { nextRequestEstimatedCost?,
+  safetyMarginPoints? })` waits `ceil((needed - available) / restoreRate * 1000)` ms when the bucket doesn't
+  have enough for the next query's estimated cost — **the caller supplies the cost estimate** per query
+  (`ShopifyClient.query(query, variables, { estimatedCost })`), defaulting to a conservative 50 points,
+  since only Phase B knows what a given query actually costs; A4 has no resource-specific knowledge to
+  estimate it. 15 tests cover parsing (missing extensions, missing cost, incomplete/zero-rate throttleStatus,
+  defaulted `actualQueryCost`) and the wait decision (enough points → no wait, insufficient → wait sized to
+  restore rate, safety margin, empty bucket).
+- **Retry (`services/ingest/http/retry.ts`)** is one generic `withRetry(fn, opts)`, shared by both clients,
+  full-jitter exponential backoff (`computeBackoffDelayMs`, unit-tested for its bounds independent of the
+  async loop) capped at `maxDelayMs` (default 30s, 5 attempts default). The retryable/terminal split is
+  `ApiError.retryable` (`services/ingest/http/errors.ts`) — one error class parametrized by `kind`
+  (`unauthorized | rate_limited | server_error | client_error | network`) and `retryable`, rather than a
+  class hierarchy, since `retryable` is the only thing the retry loop actually branches on. A non-`ApiError`
+  (e.g. a raw network `TypeError` from `fetch`) defaults to retryable. 9 tests cover: first-try success (no
+  sleep), retry-then-succeed with correct attempt/delay bookkeeping via `onRetry`, immediate bail on a
+  terminal `ApiError` (`unauthorized` and `client_error` both), default-retryable treatment of a
+  non-`ApiError`, exhausting `maxAttempts` and re-throwing the last error, and a custom `isRetryable`
+  override.
+- **Error classification is platform-specific** (`meta/errors.ts`, `shopify/errors.ts`), both producing
+  `ApiError`. Meta: code 190 (OAuthException) → `unauthorized`/terminal; codes 4/17/32/613 (Meta's
+  documented rate-limit-error-code family: app-level, user-level, page-level, custom/ads limits) →
+  `rate_limited`/retryable; HTTP 401/403 → `unauthorized` fallback; HTTP 429 → `rate_limited` fallback; 5xx →
+  `server_error`/retryable; anything else → `client_error`/terminal (fail fast rather than retry a request
+  that will never succeed). These code lists are deliberately not exhaustive — a comment in `meta/errors.ts`
+  says so — extend them if Phase B observes a code that should be classified differently, erring terminal for
+  anything unrecognized. Shopify: GraphQL `extensions.code` of `THROTTLED` → `rate_limited`/retryable;
+  `ACCESS_DENIED`/`UNAUTHENTICATED` → `unauthorized`/terminal; HTTP 401/429/5xx as fallbacks matching Meta's
+  pattern; an unrecognized GraphQL error (e.g. a field/validation error) → `client_error`/terminal. 19 tests
+  total across both files.
+- **`MetaClient`/`ShopifyClient` are transport-only** — `get(path, params)` / `query(gql, variables, opts)`
+  return the parsed response body verbatim with no normalization, matching the step's explicit scope
+  boundary. Both expose `createMetaClient(overrides?)` / `createShopifyClient(overrides?)` async factories
+  that resolve credentials from Secret Manager by the fixed A0 names and build a ready client — this is what
+  Phase B should call (`const client = await createMetaClient(); const res = await client.get("/act_.../
+  campaigns", { fields: "..." });`), with every option (including `fetchImpl`/`sleepImpl` for tests)
+  individually overridable. `MetaClient` additionally computes `appsecret_proof`
+  (`HMAC-SHA256(accessToken, key=appSecret)`, hex) and attaches it whenever an app secret is present — Meta's
+  "Require App Secret" hardening — since `createMetaClient()` always resolves `meta-app-secret`; **confirmed
+  live that adding this did not break authentication** (see verification below). 18 (Meta) + 8 (Shopify)
+  client-level tests cover: request shape (token attached, `appsecret_proof` computed correctly, GraphQL
+  POST body shape), BUC/cost state being stored and consulted pre-emptively across two sequential calls,
+  retry-then-succeed on a rate-limited/THROTTLED response, no-retry on an unauthorized/access-denied
+  response, and `checkAuth()`'s three-way behavior (see next point).
+- **`checkAuth()` — the §9.6 health check primitive.** Both clients expose `checkAuth(): Promise<{
+  authorized: boolean; detail: string }>`, making one minimal live call — Meta: `GET /{adAccountId}?
+  fields=id` (the same trivial "prove the token works" call A0's `verify-credentials.ts` established, not a
+  Phase B "fetch entities" call — nothing is normalized or stored); Shopify: `{ shop { name } }` — and
+  classifying the **credential** as authorized or not. It deliberately does **not** attempt the full
+  `healthy`/`no_new_data`/`unauthorized` tri-state: `no_new_data` needs a row count only a real sync task
+  has, which is out of A4's scope by the step's own "no specific resource" boundary. What A4 hands Phase B
+  instead is `services/ingest/health.ts`'s pure `classifySyncStatus({ authorized, newRowCount? })` — reusing
+  `SyncStatus` from `@shared/schema/sync.ts` (A2) rather than inventing a parallel type — which B1/B3/B5
+  should call after a sync attempt, combining `checkAuth()`'s (or a thrown `ApiError.kind === "unauthorized"`
+  during the sync itself) authorization signal with the row count the sync task already knows:
+  `!authorized → "unauthorized"`; `authorized && newRowCount === 0 → "no_new_data"`; otherwise `"healthy"`.
+  4 tests cover all three branches plus the "row count not yet known" default. Per the step spec: A0 used a
+  Meta **system user token** (does not expire), so §9.6's scheduled token-refresh job was correctly treated
+  as out of scope and not built — but the health check itself was still built, since a *revoked* system-user
+  token is exactly the silent-zero-row failure mode §9.6 warns about.
+- **Live verification — exactly what ran and what it proved.** ADC was available in this environment
+  (`gcloud auth application-default login`, per SETUP.md §5's operator grant), so `npm run
+  verify-a4-clients` was actually run against real Secret Manager + live Meta/Shopify APIs, not merely
+  written:
+  ```
+  [PASS] MetaClient.checkAuth() — GET ad account (fields=id)
+         account id: act_456833154967349
+  [PASS] ShopifyClient.checkAuth() — { shop { name } }
+         shop name: "Sparkle and Glow"
+  ```
+  This exercises the real code path Phase B will use: `createMetaClient()`/`createShopifyClient()` →
+  `shared/secrets/client.ts` → Secret Manager → the actual `MetaClient`/`ShopifyClient` classes, including
+  `appsecret_proof` computation on the Meta side. Both calls are strictly read-only (a GET and a
+  name-only GraphQL query); no mutating call was made against either platform, and no Firestore write
+  occurred anywhere in this step's code (A4 has no Firestore dependency at all — `services/ingest/health.ts`
+  imports only the `SyncStatus` *type* from `@shared/schema/sync.ts`, no runtime Firestore access). BUC/cost
+  throttle *behavior under real sustained load* was **not** and could not be verified live — a single
+  `fields=id` call and a single `{ shop { name } }` query are far too cheap to move either platform's usage
+  meter into throttling range in one run; that behavior is proved instead by the 27 + 15 synthetic-header/
+  synthetic-extensions unit tests described above, which is what the step's own "Done when" line asks for
+  ("throttle logic has unit tests against synthetic headers", not a live throttle reproduction).
+  Anthropic/Claude was not touched — out of scope for A4 (D3's job).
+- **What Phase B needs from here:** import `createMetaClient`/`createShopifyClient` (or the individual
+  classes for DI) from `services/ingest/meta/client.ts` / `services/ingest/shopify/client.ts` (or the
+  `services/ingest/index.ts` barrel). `MetaClient.get()` and `ShopifyClient.query()` are the only two
+  request primitives — B2/B3 build actual Meta resource fetches (campaigns, insights, async report
+  job polling) on top of `get()`; B5 builds Shopify order/line/refund queries on top of `query()`, supplying
+  a real `estimatedCost` per query shape once it knows one. B1's task wrapper is the natural place to call
+  `classifySyncStatus` and write the result into `syncState.status`.
+- **⚠️ Orchestrator note (added at A4 review — B1 must act on this).** BUC throttle state (`lastUsage`) is
+  **per client instance, held in memory**, and `createMetaClient()` returns a fresh instance every call with
+  `lastUsage: null`. `decideBucBackoff(null)` returns "no usage data yet" and does not throttle, so
+  **pre-emption only works across calls that share one client instance.** A task that constructs a new client
+  per request throttles never; a backfill loop that makes one client and pages with it throttles correctly.
+  B1's task wrapper must therefore **create the client once per task and pass it down**, not per request.
+  Note this is still per-process: two concurrent Cloud Run/Functions instances keep separate counters and
+  can jointly overshoot Meta's budget. Acceptable at this account's size (§2.1) and not worth distributed
+  state yet — but if B3's backfill ever runs sharded in parallel, revisit it there rather than discovering
+  it as a stalled account.
 
 ---
 
