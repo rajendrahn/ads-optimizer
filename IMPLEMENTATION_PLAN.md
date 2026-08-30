@@ -1002,7 +1002,15 @@ state; the archiver round-trips a payload.
 
 ### B2 — Meta entity sync and config snapshots
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+267/267 unit tests — up from B1's 230, this step's own 37 new: 13 budget-ownership, 15
+normalization, 8 fetch/pagination, 1 combined-fetch). `npm run test:integration` passes
+116/116 against a real Firestore emulator (110 from A2+A3+B1, plus this step's 6 new emulator
+tests: 2 for `metaSyncEntitiesHandler`, 4 for `metaSnapshotConfigHandler`). Live, read-only
+Meta API calls were made against the real ad account during planning and verification (no
+write/mutating call of any kind); see Notes for what the real account structure turned out to
+be — materially bigger than §7.1's "under 100 ads" assumption. No live/production Firestore
+was touched; no cloud resource was created, modified or deployed.
 **Depends on:** B1, A3
 **Design refs:** §7.1, §9.1, §9.2
 
@@ -1026,6 +1034,173 @@ produces no duplicates.
 **Notes for the planning agent.** Budget ownership determines the decision unit in D1. If it is ambiguous
 for a given campaign structure, store the ambiguity explicitly rather than guessing — D1 needs to know when
 it does not know.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/ingest/meta/entities/{budgetOwnership,normalize,fetch,fetchAll,
+  entitySync,configSnapshot,index}.ts`, each with a co-located `*.test.ts`; `entitySync.ts` and
+  `configSnapshot.ts` additionally have `*.emulator.test.ts`, and both share
+  `testFixtures.ts` (not itself a test file) for a small synthetic-but-realistic account
+  fixture. `services/ingest/sync/registry.ts`'s `createDefaultRegistry()` now also registers
+  `metaSyncEntitiesRegistration` and `metaSnapshotConfigRegistration` — this is B1's own
+  documented extension point ("B2–B8 registering their real task handlers means extending
+  `createDefaultRegistry()`"), so **`functions/src/index.ts` was not touched**, exactly as
+  B1 intended. `registry.test.ts`'s "registers exactly SYNC_NOOP" assertion was updated to
+  expect all three task types now registered there.
+
+- **The real account is dramatically bigger than §7.1's "under 100 ads" / "steady-state
+  volume ... is small" assumption.** Confirmed live, read-only, by paging every campaign/ad
+  set/ad edge to exhaustion: **410 campaigns, 534 ad sets, 1,139 ads (all-time, all
+  statuses)** — not a handful of active campaigns but years of accumulated history (oldest
+  seen: 2023). An `effective_status=["ACTIVE"]`-filtered query alone hit the 200-row page cap
+  for campaigns, ad sets AND ads, meaning the *active* footprint is also large, not just the
+  historical tail (exact active-only totals weren't fully paged — not needed for this step,
+  but worth knowing before C2/C3 assume "a few dozen active ads" for statistical power). This
+  materially affected two implementation decisions, both noted below: creative-fetch page
+  size, and using Firestore's `BulkWriter` instead of one-write-at-a-time. **Whoever plans B3
+  (insights) and C2/C3 (features/statistics) should re-read §2.1's account-size assumptions
+  against this before relying on them** — B3 in particular will be paging far more than a
+  trivial amount of daily insight rows.
+
+- **Budget ownership (§4.1/§7.1) — validated against real data, not just designed against the
+  spec.** `services/ingest/meta/entities/budgetOwnership.ts` implements the rule: a campaign
+  with its own `daily_budget`/`lifetime_budget` owns it (CBO/Advantage+ campaign budget); a
+  campaign with neither defers to its ad sets — if exactly the child ad sets carry a budget,
+  ad-set level owns it; if there is a *conflict* (both levels report one) or *neither* does
+  (no ad sets at all, or ad sets that also report none), the result is
+  `{ownerLevel:"UNKNOWN", dailyBudgetMinorUnits:null, lifetimeBudgetMinorUnits:null,
+  currency}` — `shared/schema/common.ts`'s `budgetOwnership` zod schema already had this
+  exact `UNKNOWN` branch from A2, unused until now. **Live result on the real account: 369
+  campaigns own budget outright, 37 have a single ad set that owns it, 4 are genuinely
+  ambiguous (`UNKNOWN`)** — old PAUSED campaigns (e.g. `"Sales"`, an "Advantage+ shopping
+  campaign 06/24/2023") whose ad sets are permanently gone (Meta's API refuses to even query
+  "deleted objects" for them) and which report no budget of their own. Zero conflicts (both
+  levels reporting a budget) were observed live, but the code still handles that case as
+  `UNKNOWN` rather than assuming it can't happen. **This means D1's "budget decisions resolve
+  at the budget owner" (§4.1) will, for a small number of old/paused campaigns, need to
+  handle `ownerLevel: "UNKNOWN"` explicitly** — those 4 have no defined decision unit for a
+  budget recommendation, and D1 should treat that as "cannot make a budget-level
+  recommendation here", not silently default to campaign or ad-set.
+
+- **Meta returns `daily_budget`/`lifetime_budget` already in minor units, not a decimal
+  string** — confirmed live (a real campaign's `daily_budget: "80000"` is ₹800.00/day on this
+  INR account, not ₹80,000.00). `budgetOwnership.ts` parses it as a plain integer, deliberately
+  **not** through `shared/canon/money.ts`'s `parseDecimalToMinorUnits` — that helper is for
+  genuinely decimal money strings (e.g. B3's insights spend), a different representation.
+  Using it here would have silently 100x'd every budget. Flagging this explicitly since it's
+  exactly the kind of assumption that looks reasonable and is wrong.
+
+- **A3 dependency, and what it is NOT used for.** `entitySync.ts`/`configSnapshot.ts` both
+  call `loadReportingCanon()` for exactly one thing: `canon.reportingTimezone`, to compute
+  "today" (`toReportingDay(new Date(), canon.reportingTimezone)`) as the §23 archive path's
+  `day` segment and as `accountId` source (`canon.accountId`) — using the UTC calendar date
+  instead would occasionally misfile an archive payload by a day near IST midnight. It is
+  **not** used for currency (the Meta ad account's own `currency` field — fetched live, once
+  per run, via `fetchAccountCurrency`, `GET /{accountId}?fields=currency` — is the correct
+  source of truth for what currency *its* budget numbers are in; it happens to equal canon's
+  `reportingCurrency`, both `"INR"`, but isn't assumed to). **Consequence: this step's tasks
+  cannot run against a real (non-emulator) Firestore until an operator creates
+  `settings/{accountId}`** — per A3's own precedent note, nobody has written that document
+  yet. This is expected sequencing per §5, not a bug; flagging it again here since B2 is the
+  first step to actually make that dependency load-bearing in a real task handler.
+
+- **Ad-set `attribution` field deliberately left `null`.** `shared/schema/meta.ts`'s
+  `metaAdsetSchema.attribution` (added by A2) expects an `attributionProvenance` — both an
+  `attributionWindow` *and* a `purchaseActionType`. Meta's per-ad-set `attribution_spec`
+  (confirmed live: `[{event_type:"CLICK_THROUGH",window_days:7},
+  {event_type:"VIEW_THROUGH",window_days:1}]` on every ad set sampled, matching the account's
+  configured `"7d_click_1d_view"`) supplies only the window half — there is no per-ad-set
+  purchase-action-type in Meta's model at all. Rather than silently pairing a real per-ad-set
+  window with a borrowed account-wide `purchaseActionType` (which would look like a genuine
+  per-ad-set setting but partly isn't), this field is left `null` in B2. **B3 is where
+  `attributionProvenance` is actually load-bearing** (`metaInsightsDailySchema.attribution` is
+  non-nullable, populated from the insights query's own explicit window/action-type
+  parameters) — this is a deliberate scope boundary, not an oversight.
+
+- **`META_SYNC_ENTITIES` and `META_SNAPSHOT_CONFIG` each make their own independent live Meta
+  fetch** (both call the shared `fetchAllMetaEntities` helper in `fetchAll.ts`), rather than
+  snapshot reading what entity-sync just wrote. This costs one extra full account read per
+  §25's "config sync + snapshot" cycle, but keeps the two Cloud Tasks task types genuinely
+  independently retriable per §10.2 — a retried/redelivered `META_SNAPSHOT_CONFIG` never
+  depends on `META_SYNC_ENTITIES` having run first, or at all, in the same cycle. At this
+  account's real read volume (410+534+1139+~800 creatives, paged) this is a deliberate,
+  documented trade, not an oversight — worth revisiting only if Meta's BUC usage is ever
+  observed running hot from this specific duplication.
+
+- **Creative fetch uses a smaller page size (25) than the other three edges (100–200) —
+  found live, not guessed.** `GET /{accountId}/adcreatives` with `object_story_spec`/
+  `asset_feed_spec` requested returns an HTTP 500 ("Please reduce the amount of data you're
+  asking for") at `limit=100` on this account; it succeeds at `limit=25`. Documented in
+  `fetch.ts`'s module comment so nobody "optimizes" this back up to match the other edges.
+
+- **Composite creative detection (§7.3), validated against real examples.** `asset_feed_spec`
+  presence is the COMPOSITE signal (57/160 real creatives sampled carried it, each with
+  `optimization_type:"DEGREES_OF_FREEDOM"` and multiple body-text variants). Member asset
+  hashes are collected from `asset_feed_spec.images[].hash`/`.videos[].video_id` **and** from
+  `object_story_spec.link_data.child_attachments[].image_hash`/`.video_id` — the latter
+  because a real composite creative on this account was carousel-shaped (Advantage+ catalog
+  ad with multiple `child_attachments`, each its own `image_hash`) rather than the
+  `asset_feed_spec.images[]` shape alone. `deliveredMixObservable: false` is set for every
+  COMPOSITE creative per §7.3, unconditionally — this account's dynamic creatives all use
+  Meta's own optimization to pick the delivered combination, so there's no case where a
+  composite's mix is actually observable to mark otherwise.
+
+- **Ad `destinationUrl`, and why it's derived from the creative fetch rather than the ad
+  fetch.** `GET /{accountId}/ads` with `creative{link_url,object_story_spec}` sub-fields
+  requested hits the same "reduce the amount of data" error at this account's ad volume
+  (1,139+ ads). Instead, `normalizeAd` looks up `destinationUrl` from a
+  `creativeId -> linkUrl` map built from the same run's (separately, lightly-paged) creative
+  fetch — one ad-set of Meta calls instead of a much heavier per-ad one. This is B2's capture
+  only; **B7's UTM audit is still the step that validates the URL actually yields a
+  resolvable ad ID** (§6.1) — B2 makes no claim about that.
+
+- **`metaEntitySnapshots`' three fields with no honest per-entity-type value are left `null`
+  rather than fabricated.** Meta has no campaign-level `targeting` (targeting lives on the ad
+  set) and no campaign- or ad-set-level `creativeAssignment` (creatives attach only to ads) —
+  so `CAMPAIGN` snapshots get `targeting:null, creativeAssignment:null`, `ADSET` snapshots get
+  `creativeAssignment:null` (an ad set can contain many ads, each with its own creative; no
+  aggregate is invented), and `AD` snapshots get `budget:null, targeting:null,
+  bidStrategy:null` (ads never own budget or carry independent targeting/bid strategy in
+  Meta's model — `shared/schema/meta.ts`'s `metaAdSchema` already has no budget field at all,
+  confirming this reading). Only `AD.creativeAssignment` (`[]` or `[creativeId]`) and
+  `AD.status`/`CAMPAIGN.*`/`ADSET.*` (as applicable per the above) are ever populated.
+
+- **Writes use Firestore's `BulkWriter`, not the A2 repository's one-write-at-a-time
+  `.set()`.** Chosen once the real account scale above was known (~2,600+ documents across
+  campaigns+ad sets+ads+creatives per full sync) — still schema-validated on the way in via
+  each collection's existing typed, converter-wrapped `collectionRef` (A2's `repository.ts`),
+  so `BulkWriter` is purely a batching mechanism here, not a validation bypass. Every write
+  goes to a document keyed directly by Meta's own ID (`metaCampaigns/{campaignId}`, etc.) —
+  wholesale-replace on every run, deliberately **not** version-guarded, matching
+  `shared/schema/meta.ts`'s existing module comment ("Meta is the single source of truth for
+  current config state ... not version-guarded like Shopify/insights"). `metaEntitySnapshots`
+  writes go through the same `collectionRef`+`BulkWriter` pattern, keyed via A2's
+  `metaEntitySnapshotKey(entityType, entityId, syncRunId)` — never hand-built.
+
+- **`META_SYNC_ENTITIES`/`META_SNAPSHOT_CONFIG` register a `syncStateTarget`
+  (`{source:"meta", resource:"entities"}` / `{source:"meta", resource:"config_snapshot"}`) but
+  their handlers never return `newWatermarkDate`.** Unlike insights/orders, a full entity sync
+  has no natural "furthest date of data collected" — every run re-fetches *current* state, not
+  an incremental window — so `syncState.lastDataDate` stays permanently `null` for both
+  resources while `lastSuccessfulSyncAt`/`status`/`lastRunId` still update correctly on every
+  success (a real, useful health signal per §9.6). This is a deliberate reading of B1's
+  `TaskHandlerResult.newWatermarkDate` being optional, not a gap.
+
+- **Meta API version note (not this step's to fix, flagging for A0/A4's owner).** `scripts/
+  config.ts` pins `META_API_VERSION = "v21.0"`. Every request in this step still succeeds
+  against that version, but Meta's own `paging.next` URLs in the responses come back pointing
+  at `v26.0` — i.e. Meta is silently serving v21.0 through whatever the current minimum
+  supported version now is. Not blocking, but v21.0 is likely at or past deprecation; whoever
+  next touches `scripts/config.ts` should confirm and bump it.
+
+- **Ambiguity explicitly surfaced and left unresolved (not this step's call): a stray file at
+  the repo root.** `Export_2026-08-30_113502.xlsx` (untracked, not gitignored) appeared in the
+  repository root during this session — almost certainly the Matrixify Shopify order-history
+  export SETUP.md §6/B5 describe, which its own instructions say belongs in Cloud Storage,
+  "not the repo — it contains customer PII". This step did not create it and did not touch,
+  move, or delete it (out of scope, and deleting someone else's in-progress file without
+  being asked is not this step's call) — flagging it so whoever owns B5/SETUP.md's PII
+  handling notices before it's accidentally committed.
 
 ---
 
@@ -1597,7 +1772,39 @@ trustworthy.
 
 | # | Question | Blocks | Resolve by |
 |---|---|---|---|
-| 1 | Do the live UTM tags carry `{{ad.id}}` or an ad **name**? | B7, and a re-tagging pass before backfill if it is names | Inspect one live ad's destination URL — do this at the start of B7, or earlier |
+| 1 | ~~Do the live UTM tags carry `{{ad.id}}` or an ad **name**?~~ | B7 | **RESOLVED — see below. Answer: overwhelmingly names, and mostly no tag at all.** |
+
+**Resolved (Open Question #1), measured — not sampled — from the Matrixify seed export during B2/B5
+orchestration.** Across all 10,001 orders in the export (2025-01-15 → 2025-12-13):
+
+| Signal | Orders | Share |
+|---|---|---|
+| any `Browser: Landing Page` | 335 | 3.3% |
+| any `utm_source` | 56 | 0.6% |
+| landing page carries only `fbclid` | 97 | 1.0% |
+| **`utm_content` is a numeric Meta ad ID** | **2** | **0.02%** |
+| `utm_content` is a human-readable name | 48 | 0.5% |
+
+The tags that exist are names (`RM_Instagram`, `New Sales Ad Set`, `RM_CBO_Remarketing_Campaign`,
+`Navratri sale 15% OFF| AD`), not `{{ad.id}}`. `Browser: Ad URL` is empty on every row. Most Meta-driven
+orders carry only `fbclid`, which is opaque and **cannot** be resolved to an ad without the Conversions API.
+`utm_source` is also inconsistently spelled across `meta` / `roi_meta` / `facebook` / `RM_META`.
+
+**Consequences, decided by the user — B7 must implement all three:**
+1. **A UTM→ad-ID join alone would resolve 2 orders in 10,001.** B7 keys on `{{ad.id}}` for future orders and
+   must not present historical Shopify-attributed ROAS as if it were meaningful.
+2. **Build the name-matching fallback** (user's explicit decision) for the ~48 name-tagged orders, matching
+   `utm_content`/`utm_campaign` against Meta entity names from B2. ⚠️ **Ad names are neither unique nor
+   stable over time**, so a name match can attribute revenue to the wrong ad — every name-resolved order must
+   be stored with its resolution method recorded and a lower confidence than an ID match, never silently
+   merged with ID-resolved ones. Normalize the `utm_source` spellings when deciding what is Meta traffic.
+3. Unresolvable orders are **excluded** from Shopify-attributed metrics, never reported as zero revenue
+   (already the B7 spec). Expect `attributionCoverageRatio` near zero on historical data; C2/C3/D1 must lean
+   on Meta-attributed figures for this period, and §6.2 forbids merging the two regardless.
+
+**Still outstanding for the user (not blocking any step):** re-tag the live Meta account with
+`utm_content={{ad.id}}` / `utm_campaign={{campaign.id}}` at the account-level URL-parameter setting.
+Until that happens, coverage stays near zero for newly arriving orders too.
 
 **Resolved.** The Anthropic org's data retention setting permits Claude Fable 5. A live one-token call
 (`model: claude-fable-5`, `max_tokens: 1`) during A0 returned normally (`stop_reason: "max_tokens"`) rather

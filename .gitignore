@@ -1,7 +1,14 @@
 node_modules/
-*.csv
 .env
 .env.*
+
+# Data exports — these carry customer data and must never enter source control.
+# Matrixify exports arrive as .xlsx as well as .csv (see SETUP.md §3); the PII bucket
+# gs://sng-meta-ads-optimizer-pii-imports is the only sanctioned home for them.
+*.csv
+*.xlsx
+*.xls
+Export_*
 
 # Build output / tooling caches
 functions/lib/

@@ -13,6 +13,10 @@
 
 import type { TaskHandler } from "./taskWrapper.ts";
 import { SYNC_NOOP } from "./taskTypes.ts";
+import {
+  metaSnapshotConfigRegistration,
+  metaSyncEntitiesRegistration,
+} from "../meta/entities/index.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -57,9 +61,14 @@ export function createTaskRegistry(): TaskRegistry {
 }
 
 /**
- * The registry as B1 leaves it: only `SYNC_NOOP` registered. B2–B8 build their own registry
- * (or extend this one via `.register()`) with the real §10.2 task types as each lands —
- * nothing here hardcodes that this is the final registry.
+ * The registry as B1 left it (only `SYNC_NOOP`), now also carrying B2's two real §10.2 task
+ * types — this is the documented extension point B1's own notes point to: "B2–B8 registering
+ * their real task handlers means extending `createDefaultRegistry()`." Importing
+ * `services/ingest/meta/entities/*` here (a business-logic module reaching into the
+ * framework's own default registry) is exactly that extension, not a layering violation —
+ * `functions/src/index.ts` calls this indirectly via runtime.ts and needs no changes to pick
+ * up whatever is registered here. B3–B8 should do the same as they land, rather than
+ * building a second, parallel default registry.
  */
 export function createDefaultRegistry(): TaskRegistry {
   const registry = createTaskRegistry();
@@ -82,5 +91,7 @@ export function createDefaultRegistry(): TaskRegistry {
       };
     },
   });
+  registry.register(metaSyncEntitiesRegistration);
+  registry.register(metaSnapshotConfigRegistration);
   return registry;
 }

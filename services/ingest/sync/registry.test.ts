@@ -36,9 +36,9 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers exactly SYNC_NOOP", () => {
+  it("registers SYNC_NOOP plus B2's two real task types", () => {
     const registry = createDefaultRegistry();
-    expect(registry.list()).toEqual([SYNC_NOOP]);
+    expect(registry.list()).toEqual([SYNC_NOOP, "META_SYNC_ENTITIES", "META_SNAPSHOT_CONFIG"]);
   });
 
   it("SYNC_NOOP reports newRowCount:1 by default (healthy)", async () => {
