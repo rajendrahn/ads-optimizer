@@ -10,6 +10,11 @@ node_modules/
 *.xls
 Export_*
 
+# Scratch files from exploratory/agent runs. These routinely hold live API responses
+# (which have included real order and customer data), so they must never be committed.
+_tmp_*
+*.scratch.*
+
 # Build output / tooling caches
 functions/lib/
 dist/
