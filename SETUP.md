@@ -141,8 +141,41 @@ runtime gets credentials from the metadata server. This wiring happens in A4/B1,
 ## 3. Shopify — ✅ Done
 
 - [x] Create a **custom app** in store admin (not a public app)
-- [x] Admin API scopes: `read_orders`, `read_products`, `read_customers`
-- [x] ~~Request `read_all_orders`~~ — **not requested, resolved differently.** See note below.
+- [x] Admin API scopes — ⚠️ **the live grant differs from what was recorded here.** See "Actual granted
+      scopes" immediately below; this line's original claim (`read_orders`, `read_products`,
+      `read_customers`) was incomplete.
+- [x] ~~Request `read_all_orders`~~ — **it turns out to be granted already.** See below; this changes the
+      historical-backfill story recorded further down.
+
+### ⚠️ Actual granted scopes (verified live, 2026-08-31)
+
+Read directly from `GET /admin/oauth/access_scopes.json`. **15 scopes are granted, not 3:**
+
+```
+read_all_orders          read_customers      read_discounts
+read_draft_orders        read_fulfillments   read_inventory
+read_locations           read_merchant_managed_fulfillment_orders
+read_orders              read_products
+write_draft_orders   write_fulfillments   write_inventory
+write_merchant_managed_fulfillment_orders   write_products
+```
+
+**Two deviations from the design's stated posture, both known and accepted by the user:**
+
+1. **Five `write_*` scopes are granted.** §0.2 and the A0 spec call for least privilege, with the system
+   read-only until Phase F — the same reasoning that keeps `ads_management` off the Meta token. This token
+   can modify products, inventory, fulfillments and draft orders on the live store. **The user chose to
+   leave the scopes in place and document the deviation rather than regenerate the token.**
+   Mitigation, and the standing rule: **no code in this repo may make a mutating Shopify call before
+   Phase F.** Nothing does today — B5, B6 and B7 are read-only by construction, and B6's webhook
+   subscriptions are defined but deliberately not registered. Treat any new mutating Shopify call as a
+   design change requiring explicit approval, not a routine edit. Revisit at Phase F, when the write path
+   is reviewed anyway.
+2. **`read_all_orders` IS granted and works** — verified by reaching a real January 2025 order, far outside
+   the 60-day window. The "Resolution: historical backfill without `read_all_orders`" section below is
+   therefore based on a false premise: the Matrixify CSV route was never strictly necessary. The seeded CSV
+   data remains valid and is kept, but the Dec 2025 → Jul 2026 gap is being closed via the API rather than
+   by further exports (user decision).
 - [x] Confirm protected customer data access status — **confirmed live during B5**: a read-only
       GraphQL query for `order.customer.id` against the real store succeeds (no `ACCESS_DENIED`),
       so this was auto-approved (or already granted) rather than pending review. Not otherwise
@@ -164,7 +197,9 @@ runtime gets credentials from the metadata server. This wiring happens in A4/B1,
 |---|---|
 | Shop domain | `shopsparkleandglow.myshopify.com` (storefront: `sparkleandglow.co.in`) |
 | Admin API version | `2025-01` |
-| `read_all_orders` status | **Not requested — not needed.** See resolution note below |
+| `read_all_orders` status | ⚠️ **Granted and working** (verified live 2026-08-31, reached a Jan 2025 order). The "not requested" claim below is wrong — see "Actual granted scopes" above |
+| Shop plan | `Shopify` — **not** Shopify Plus (`shopifyPlus: false`), verified live |
+| Attribution caveat | `Order.landingSite`/`.referringSite` do not exist in the 2025-01 GraphQL schema, and `customerJourneySummary` returns `momentsCount: 0` for orders placed through the **"Sparkle and Glow - Magic checkout"** app — Shopify records no session for them. This is a checkout-integration limitation, **not** a Plus or scope limitation (both were ruled out live). Consequence: re-tagging Meta ads will **not** restore per-ad Shopify attribution. See B7's notes |
 | Verification call | `POST /admin/api/2025-01/graphql.json` with `{ shop { name } }` — returned `"Sparkle and Glow"` successfully |
 
 ### Resolution: historical backfill without `read_all_orders`

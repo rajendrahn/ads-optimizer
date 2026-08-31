@@ -12,6 +12,7 @@
 
 import { onRequest } from "firebase-functions/v2/https";
 import { handleSyncTaskDispatch, type TaskDispatchRequestBody } from "./generated/syncBundle";
+import { handleShopifyWebhookDispatch } from "./generated/shopifyWebhookBundle";
 
 export const syncTaskDispatch = onRequest(async (req, res) => {
   const body = req.body as Partial<TaskDispatchRequestBody> | undefined;
@@ -19,6 +20,27 @@ export const syncTaskDispatch = onRequest(async (req, res) => {
     taskType: body?.taskType ?? "",
     payload: body?.payload,
     taskId: body?.taskId,
+  });
+  res.status(result.status).json(result.body);
+});
+
+// B6 — the Shopify webhook HTTPS endpoint (§9.5, §25). Deliberately thin, same shape as
+// syncTaskDispatch above: all real logic (HMAC verification, Cloud Tasks enqueue) lives in
+// services/ingest/shopify/webhooks/receiver.ts, bundled the same way B1's sync framework is —
+// see functions/src/generated/shopifyWebhookBundle.d.ts. `req.rawBody` is the Firebase
+// Functions framework's own Buffer of the exact, unparsed request body, which is what HMAC
+// verification must run against (`req.body` is already-parsed JSON and would not byte-for-byte
+// match what Shopify signed). This function does no Firestore/Shopify work itself — it only
+// verifies and enqueues, then returns — matching B6's "fast acknowledge, then process
+// asynchronously via Cloud Tasks" deliverable.
+export const shopifyWebhookReceive = onRequest(async (req, res) => {
+  const result = await handleShopifyWebhookDispatch({
+    rawBody: req.rawBody ?? Buffer.from(""),
+    headers: {
+      hmac: req.get("X-Shopify-Hmac-Sha256"),
+      topic: req.get("X-Shopify-Topic"),
+      webhookId: req.get("X-Shopify-Webhook-Id"),
+    },
   });
   res.status(result.status).json(result.body);
 });

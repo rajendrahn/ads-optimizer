@@ -25,6 +25,16 @@ import {
   matrixifyImportRegistration,
   shopifySyncOrdersRegistration,
 } from "../shopify/orders/index.ts";
+import { metaSyncCreativeIdentityRegistration } from "../meta/creative/index.ts";
+import { shopifyProcessWebhookRegistration } from "../shopify/webhooks/index.ts";
+import {
+  auditAdUrlTagsRegistration,
+  shopifyResolveAttributionRegistration,
+} from "../shopify/attribution/index.ts";
+import {
+  normalizeMetaInsightsDailyRegistration,
+  normalizeShopifyDailyRegistration,
+} from "../../analytics/daily/index.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -110,5 +120,21 @@ export function createDefaultRegistry(): TaskRegistry {
   // `syncState/shopify_orders` (see ordersSync.ts's module comment for why).
   registry.register(matrixifyImportRegistration);
   registry.register(shopifySyncOrdersRegistration);
+  // B8's creative identity grouping (§7.3, §11.1) — Firestore-only, reads B2's `metaCreatives`.
+  registry.register(metaSyncCreativeIdentityRegistration);
+  // B6's Shopify webhook processor — receiver.ts (a separate, un-deployed HTTPS endpoint, not
+  // this dispatch target) verifies the HMAC and enqueues this task type via Cloud Tasks.
+  registry.register(shopifyProcessWebhookRegistration);
+  // B7's attribution join (§6) — AUDIT_AD_URL_TAGS parses B2's already-ingested
+  // metaAds.destinationUrl (no live Meta call); SHOPIFY_RESOLVE_ATTRIBUTION is B7's own
+  // addition (not in §10.2's original list — see resolveAttribution.ts's module comment) that
+  // resolves shopifyOrders.landingSite against metaAds/metaCampaigns.
+  registry.register(auditAdUrlTagsRegistration);
+  registry.register(shopifyResolveAttributionRegistration);
+  // C1's daily normalization (§5) — re-expresses already-synced metaInsightsDaily/shopifyOrders/
+  // shopifyRefunds rows onto the canon reporting day and currency. Firestore-only, no live Meta/
+  // Shopify call; see services/analytics/daily's own module comments.
+  registry.register(normalizeMetaInsightsDailyRegistration);
+  registry.register(normalizeShopifyDailyRegistration);
   return registry;
 }

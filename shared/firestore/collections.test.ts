@@ -4,14 +4,16 @@ import {
   metaChangeEventKey,
   metaEntitySnapshotKey,
   metaInsightsDailyKey,
+  metaInsightsDailyNormalizedKey,
   recommendationOutcomeKey,
   shopifyOrderLineKey,
   shopifyRefundKey,
+  shopifyRefundNormalizedKey,
   syncStateKey,
 } from "./collections.ts";
 
 describe("COLLECTIONS", () => {
-  it("lists every collection in §8 plus B3's metaInsightsReportJobs, and the name equals the key", () => {
+  it("lists every collection in §8 plus B3's metaInsightsReportJobs, B7's adUrlTagAudits and C1's normalized/coverage collections, and the name equals the key", () => {
     const names = [
       "metaCampaigns",
       "metaAdsets",
@@ -23,9 +25,18 @@ describe("COLLECTIONS", () => {
       // Not one of §8's named collections — B3's own async-report-job bookkeeping, see
       // shared/schema/meta.ts's module comment on metaInsightsReportJobSchema.
       "metaInsightsReportJobs",
+      // Not one of §8's named collections either — B7's AUDIT_AD_URL_TAGS output, see
+      // shared/schema/meta.ts's module comment on adUrlTagAuditSchema.
+      "adUrlTagAudits",
+      // C1's own — see shared/schema/analytics.ts's module comment.
+      "metaInsightsDailyNormalized",
       "shopifyOrders",
       "shopifyOrderLines",
       "shopifyRefunds",
+      // C1's own — see shared/schema/analytics.ts's module comment.
+      "shopifyOrdersNormalized",
+      "shopifyRefundsNormalized",
+      "shopifyDailyCoverage",
       "creativeAssets",
       "creativeFamilies",
       "adFeatures",
@@ -88,6 +99,19 @@ describe("deterministic key helpers (§9.5)", () => {
       "5123456789012_13123456789012",
     );
     expect(shopifyRefundKey("5123456789012", "999888777")).toBe("5123456789012_999888777");
+  });
+
+  it("metaInsightsDailyNormalizedKey mirrors metaInsightsDailyKey's shape, keyed on the reporting day", () => {
+    expect(metaInsightsDailyNormalizedKey("120210000000003", "2026-08-29")).toBe(
+      "120210000000003_2026-08-29",
+    );
+    expect(() => metaInsightsDailyNormalizedKey("", "2026-08-29")).toThrow();
+  });
+
+  it("shopifyRefundNormalizedKey mirrors shopifyRefundKey", () => {
+    expect(shopifyRefundNormalizedKey("5123456789012", "999888777")).toBe(
+      "5123456789012_999888777",
+    );
   });
 
   it("recommendationOutcomeKey is 1:1 with the recommendation it evaluates", () => {

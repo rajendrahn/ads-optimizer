@@ -229,3 +229,41 @@ export const metaInsightsReportJobSchema = z.object({
   updatedAt: firestoreTimestamp,
 });
 export type MetaInsightsReportJob = z.infer<typeof metaInsightsReportJobSchema>;
+
+// ---------------------------------------------------------------------------------------
+// adUrlTagAudits/{adId} — B7's AUDIT_AD_URL_TAGS task (§6.3: "A scheduled job parses the
+// destination URL of every live ad. Any ad whose URL does not yield a resolvable ad ID is
+// excluded from Shopify-attributed metrics and surfaced in the UI — never silently reported as
+// zero revenue."). Not one of §8's named collections — same category as
+// metaInsightsReportJobs/syncRuns: our own derived audit state, not business data, so it's not
+// a namespacing violation of §8's "one brand, one ad account, do not namespace speculatively."
+//
+// Deliberately NOT the metaAds document itself: metaAds is wholesale-replaced by B2 on every
+// full sync and is not owned by this step, so writing the audit result there would either
+// require coupling this task to B2's write path or risk being silently wiped by the next B2
+// run. This collection is instead wholesale-overwritten by AUDIT_AD_URL_TAGS itself, keyed
+// directly by adId (current state only — no history kept; if a trend over time is ever needed,
+// key by (adId, auditRunId) instead, mirroring metaEntitySnapshots).
+// ---------------------------------------------------------------------------------------
+
+export const adUrlTagKindSchema = z.enum([
+  "ID_MACRO", // utm_content={{ad.id}} or utm_campaign={{campaign.id}} — resolvable
+  "NAME_MACRO", // {{ad.name}}/{{campaign.name}} — resolvable only via the weaker NAME_MATCH path
+  "STATIC_TEXT", // a literal string present, neither macro — Open Question #1's dominant case
+  "MISSING", // a destination URL exists but carries no utm_content/utm_campaign at all
+  "NO_URL", // the ad has no destination URL captured at all
+]);
+export type AdUrlTagKind = z.infer<typeof adUrlTagKindSchema>;
+
+export const adUrlTagAuditSchema = z.object({
+  adId: z.string().min(1),
+  auditedAt: firestoreTimestamp,
+  destinationUrl: z.string().nullable(),
+  utmContentRaw: z.string().nullable(),
+  utmCampaignRaw: z.string().nullable(),
+  tagKind: adUrlTagKindSchema,
+  // true only for ID_MACRO — the one tag shape guaranteed to produce a resolvable numeric ID
+  // on every real click, per §6.1's audit requirement.
+  resolvable: z.boolean(),
+});
+export type AdUrlTagAudit = z.infer<typeof adUrlTagAuditSchema>;

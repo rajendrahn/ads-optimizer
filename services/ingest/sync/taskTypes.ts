@@ -32,6 +32,33 @@ export const SYNC_TASK_TYPES = [
   // one-time-only operation §10.2/B5's original "Out of scope" line assumed before the real
   // export turned out to be a partial (~10k of ~22.6k orders) snapshot.
   "SHOPIFY_IMPORT_ORDERS_CSV",
+  // B8's addition — not in §10.2's original list, and deliberately distinct from
+  // PROCESS_CREATIVE (which names Phase F's expensive download/OCR/embedding pipeline, §11.2).
+  // This is §11.1's cheap identity grouping: Firestore-only (reads B2's `metaCreatives`, no
+  // live Meta call, no archiving), so it earned its own task type rather than overloading
+  // PROCESS_CREATIVE with a much lighter-weight operation Phase F would otherwise have to
+  // special-case around.
+  "META_SYNC_CREATIVE_IDENTITY",
+  // B6's addition — not in §10.2's original list. Shopify webhook deliveries (order
+  // create/update/cancel, refund create) are processed by this task type after receiver.ts
+  // verifies the HMAC and enqueues them; it is intentionally distinct from SHOPIFY_SYNC_ORDERS
+  // (that task owns the hourly/on-demand incremental *sync* and `syncState/shopify_orders`'s
+  // watermark — §25 lists "Shopify webhooks" and "Shopify reconciliation" as two separate
+  // schedule rows). See services/ingest/shopify/webhooks/processTask.ts's module comment.
+  "SHOPIFY_PROCESS_WEBHOOK",
+  // B7's addition — not in §10.2's original list, which named AUDIT_AD_URL_TAGS (registered
+  // as-is, below) but no task for the order-side half of the join. See
+  // services/ingest/shopify/attribution/resolveAttribution.ts's module comment for why this is
+  // its own task type rather than folded into B5's SHOPIFY_SYNC_ORDERS/SHOPIFY_IMPORT_ORDERS_CSV
+  // handlers.
+  "SHOPIFY_RESOLVE_ATTRIBUTION",
+  // C1's additions — not in §10.2's original list. Re-express already-synced Meta/Shopify data
+  // onto the canon reporting day/currency (§5); see services/analytics/daily/
+  // normalizeMetaDailyTask.ts and normalizeShopifyDailyTask.ts's own module comments for why
+  // this is a Firestore-to-Firestore re-derivation task, not a live-API sync, and why Meta and
+  // Shopify each get their own independently-retriable task type rather than one combined task.
+  "NORMALIZE_META_INSIGHTS_DAILY",
+  "NORMALIZE_SHOPIFY_DAILY",
 ] as const;
 export type KnownTaskType = (typeof SYNC_TASK_TYPES)[number];
 

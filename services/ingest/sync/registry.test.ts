@@ -36,7 +36,7 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers SYNC_NOOP plus B2's, B3's and B5's real task types", () => {
+  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's and C1's real task types", () => {
     const registry = createDefaultRegistry();
     expect(registry.list()).toEqual([
       SYNC_NOOP,
@@ -46,6 +46,12 @@ describe("createDefaultRegistry", () => {
       "META_POLL_ASYNC_REPORT",
       "SHOPIFY_IMPORT_ORDERS_CSV",
       "SHOPIFY_SYNC_ORDERS",
+      "META_SYNC_CREATIVE_IDENTITY",
+      "SHOPIFY_PROCESS_WEBHOOK",
+      "AUDIT_AD_URL_TAGS",
+      "SHOPIFY_RESOLVE_ATTRIBUTION",
+      "NORMALIZE_META_INSIGHTS_DAILY",
+      "NORMALIZE_SHOPIFY_DAILY",
     ]);
   });
 

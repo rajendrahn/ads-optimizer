@@ -1824,7 +1824,20 @@ before writing the parser; Matrixify lets users customize which columns are incl
 
 ### B6 — Shopify webhooks
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean for this step's own scope (typecheck across both
+projects, lint, format, unit tests: 4 new webhook test files, 40/40 passing). `npm run
+test:integration` passes 185/186 (13/14 files) against a real Firestore emulator, up from B5's
+154 — this step's own 5 new emulator tests in `processTask.emulator.test.ts` all pass, proving
+all three "Done when" scenarios against real Firestore: a replayed webhook is a no-op, an
+out-of-order older payload is rejected on both docs it touched and the rejection is independently
+readable back from `syncRuns`, and (in `receiver.test.ts`, no emulator needed) an invalid
+signature is refused before anything is enqueued. The lone integration failure
+(`matrixifyImport.emulator.test.ts`'s "re-running against the SAME file is a no-op" case, a
+5000ms per-test timeout) is pre-existing, in a B5 file this step never touched, and reproduced
+identically on repeated runs under this session's heavy concurrent-agent load — not a B6
+regression. No live Shopify call was made and no webhook subscription was registered against the
+real store (see Notes); no production Firestore was touched (emulator only); no cloud resource
+was created, modified or deployed; no npm dependency was added.
 **Depends on:** B5
 **Design refs:** §9.5, §25
 
@@ -1843,11 +1856,162 @@ before writing the parser; Matrixify lets users customize which columns are incl
 **Done when.** A replayed webhook is a no-op; an out-of-order older payload is rejected and logged; an
 invalid signature is refused.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/ingest/shopify/webhooks/{verify,normalize,processTask,receiver,
+  runtime,subscriptions,index}.ts`, each with a co-located `*.test.ts`; `processTask.ts`
+  additionally has `*.emulator.test.ts`. `services/ingest/sync/registry.ts`'s
+  `createDefaultRegistry()` now also registers `shopifyProcessWebhookRegistration` (B1's
+  documented extension point); `taskTypes.ts` gained `SHOPIFY_PROCESS_WEBHOOK`. `functions/
+  scripts/bundle.mjs` now bundles two entry points instead of one (B1's original
+  `services/ingest/sync/index.ts` -> `syncBundle.js`, plus this step's
+  `services/ingest/shopify/webhooks/index.ts` -> `shopifyWebhookBundle.js`), each with its own
+  hand-written `functions/src/generated/*.d.ts` mirror — same pattern B1 established, same
+  trade-off (nothing enforces the `.d.ts` stays in sync with the real barrel except the comment
+  saying so). `functions/src/index.ts` gained a second `onRequest` export, `shopifyWebhookReceive`,
+  alongside B1's `syncTaskDispatch`. No new npm dependency anywhere — HMAC uses Node's built-in
+  `node:crypto`; Cloud Tasks/Secret Manager access reuses B1/A4's existing clients.
+
+- **The pipeline, concretely: two separate HTTP endpoints, not one.** `shopifyWebhookReceive`
+  (the one this step registers with Shopify) does *only* HMAC verification and a Cloud Tasks
+  enqueue, then returns — no Firestore access, no normalization, nothing awaited beyond the
+  enqueue call itself (`receiver.ts`'s `handleShopifyWebhookRequest`, architecturally guaranteed
+  to touch no database: it doesn't import `@shared/firestore` at all). The actual order/refund
+  writes happen later, in a completely separate HTTP round trip, when Cloud Tasks calls back into
+  **B1's existing `syncTaskDispatch` target** (`services/ingest/sync/httpHandler.ts`) and runs
+  this step's `SHOPIFY_PROCESS_WEBHOOK` handler (`processTask.ts`). No second Cloud Tasks receiver
+  was built — B1's dispatch endpoint and its `runSyncTask` idempotency/retry/`syncRuns` machinery
+  are reused as-is, exactly as B1's own notes invited ("B2–B8 registering their real task handlers
+  means extending `createDefaultRegistry()`"). This is what "fast acknowledge, then process
+  asynchronously via Cloud Tasks" means concretely, not just an intention statement.
+
+- **Idempotency on webhook ID is inherited, not reimplemented.** `receiver.ts` passes Shopify's
+  own `X-Shopify-Webhook-Id` header through as both the Cloud Tasks task name
+  (`taskQueue.ts`'s own dedupe window) and `runSyncTask`'s `taskId` (== the `syncRuns` doc id, per
+  B1's ID scheme) — a redelivered webhook (Shopify's documented at-least-once contract, or a queue
+  retry) hits `runSyncTask`'s existing "already SUCCEEDED -> `SKIPPED_ALREADY_SUCCEEDED`,
+  handler never runs again" short-circuit for free. Nothing in B6's own code implements
+  replay-safety; it composes B1's.
+
+- **Reused B5's normalization? No — deliberately wrote a new one, and said why.** B5's
+  `graphqlNormalize.ts` consumes a GraphQL query-response node shape (`gid://...` global ids,
+  camelCase, `*Set` money wrappers); a Shopify webhook delivery payload is REST-shaped (plain
+  numeric ids, snake_case, classic Order/Refund resource fields) — genuinely different wire
+  formats from a genuinely different Shopify subsystem (webhook delivery vs. the GraphQL Admin
+  API), not two ways of describing the same JSON. `services/ingest/shopify/webhooks/normalize.ts`
+  is therefore its own module, but it writes the **exact same** `shared/schema/shopify.ts` types
+  (`shopifyOrderSchema`/`shopifyOrderLineSchema`/`shopifyRefundSchema`) through the **exact same**
+  `upsertWithVersionGuard`, using the `"WEBHOOK"` value `shopifyOrderSchema.source` already
+  reserved for this (added by A2/B5, unused until now) — no schema change was needed.
+
+- **B5's flagged `landingSite`/`referringSite` gap: addressed opportunistically, not resolved with
+  certainty.** B5's notes found, live, that the GraphQL Admin API cannot return
+  `Order.landingSite`/`.referringSite` for this store at all, and asked B6 to check whether
+  webhook payloads — a different delivery mechanism — still carry them. This step's safety
+  constraints forbid registering a real webhook subscription against the live store, so **this was
+  not verified against an actual delivery** — only against Shopify's publicly documented webhook
+  payload schema, which shows `landing_site`/`referring_site` as REST-shaped, webhook-payload
+  fields independent of the GraphQL schema. `normalizeWebhookOrder` reads them opportunistically
+  (`payload.landing_site ?? null`): if the documentation holds on the first real delivery, B7's
+  attribution join immediately gains post-backfill coverage with no further code change; if it
+  doesn't, this stays null exactly as `GRAPHQL_SYNC` already does today, and nothing regresses
+  either way. **An operator should confirm this against the first real webhook delivery once
+  registered** and update this note with the answer — flagged, not assumed.
+
+- **Refund amount computation, since Shopify has no single "amount refunded" field on either
+  refund delivery shape (the standalone `refunds/create` payload or an order's embedded
+  `refunds[]`).** `refundAmountMinorUnits` (`normalize.ts`) sums `transactions[]` entries with
+  `kind: "refund"` and `status: "success"` — the actual cash movement — falling back to summing
+  `refund_line_items[].subtotal + total_tax` (excludes shipping) only when no successful refund
+  transaction is present, which covers a pure restock/store-credit refund that moves no cash.
+  Similarly, the standalone `refunds/create` payload carries no top-level `currency` field (unlike
+  an order payload) — `resolveRefundCurrency` derives it from a transaction's own `currency` field,
+  falling back to a refund line item's money-set `currency_code`; if neither is present,
+  `processTask.ts` fails that delivery terminally (`ApiError` with `retryable: false`) rather than
+  guessing a currency and mis-recording an amount. **None of this is verified against a real
+  delivery from this store** — same caveat as `landingSite` above, for the same reason (no live
+  webhook registration permitted this step) — flagged for confirmation once real refund webhooks
+  arrive.
+
+- **Version-guard rejection count on an order-topic payload is per-document, not per-webhook** —
+  worth stating since it surprised this step's own first test draft. An `orders/updated` webhook
+  with N line items touches N+1 documents (the order plus each line, all sharing the order's own
+  `sourceUpdatedAt` per B5's established convention), so a single out-of-order redelivery can
+  produce more than one `versionGuardRejections` entry in one `syncRuns` doc — confirmed live
+  against the emulator (a 1-line-item test order produces exactly 2 rejections on an out-of-order
+  replay: one for `shopifyOrders`, one for `shopifyOrderLines`). §9.5's "log the rejection" is
+  satisfied per-document, which is the finer-grained and more debuggable choice, not a departure
+  from the design.
+
+- **`isNewCustomer` is left `null` on every webhook-written order**, matching `GRAPHQL_SYNC`'s own
+  convention (`graphqlNormalize.ts`) rather than triggering B5's full-collection
+  `recomputeAndPersistNewVsRepeat` on every single webhook delivery. That recompute is a full
+  collection scan — cheap for one sync run (B5's own justification) but not something that should
+  run once per webhook at potentially high delivery frequency. The next `SHOPIFY_SYNC_ORDERS` run
+  (§25: "Shopify reconciliation | Hourly") fills it in, same as it already does for `GRAPHQL_SYNC`
+  orders today.
+
+- **Product tags/type are `null` on webhook-written line items** — a webhook order payload's
+  `line_items[]` carries no product tags or product type (that needs a separate Product fetch,
+  out of scope here); the next `SHOPIFY_SYNC_ORDERS`/reconciliation pass for that order fills
+  these in via GraphQL. Not a regression versus a gap that already existed — `productTags`/
+  `productType` are optional/nullable fields (B5's own schema-evolution additions).
+
+- **Subscriptions are defined in code but never registered against the live store, per this
+  step's explicit safety constraint** (`webhookSubscriptionCreate` is a mutating Admin API call —
+  running it now would start real production traffic arriving at infrastructure that doesn't
+  exist yet: no Cloud Tasks queue, no deployed receiver). `subscriptions.ts` defines the exact
+  four topics (`ORDERS_CREATE`, `ORDERS_UPDATED`, `ORDERS_CANCELLED`, `REFUNDS_CREATE`) and a pure
+  `buildWebhookSubscriptionMutation` that generates the real mutation text from the same source of
+  truth `processTask.ts` routes on, so nothing is hand-typed twice and left to drift. Nothing in
+  this step's code or tests calls Shopify's Admin API. **Exact operator commands to register for
+  real, and the infrastructure that must exist first, are in this step's final report** (chat
+  history) — summarized here so a future reader doesn't have to dig for it:
+  1. Provision a Cloud Tasks queue and deploy `functions/` (both already documented as B1
+     prerequisites, still not done — see B1's own Notes above for the exact `gcloud`/`firebase
+     deploy` commands).
+  2. Once `shopifyWebhookReceive` has a real HTTPS URL, run one `webhookSubscriptionCreate`
+     mutation per topic against the Shopify Admin GraphQL API (`https://
+     shopsparkleandglow.myshopify.com/admin/api/2025-01/graphql.json`, `X-Shopify-Access-Token:
+     <shopify-admin-token>`), with `callbackUrl` set to that URL — e.g. for `orders/create`:
+     `buildWebhookSubscriptionMutation("ORDERS_CREATE", "<shopifyWebhookReceive URL>")`, repeated
+     for `ORDERS_UPDATED`, `ORDERS_CANCELLED`, `REFUNDS_CREATE`.
+  3. Set `SYNC_TASK_DISPATCH_URL` (and, once known, `SYNC_TASKS_QUEUE_LOCATION`/
+     `SYNC_TASKS_QUEUE_NAME`/`SYNC_TASKS_SERVICE_ACCOUNT_EMAIL` if they differ from
+     `services/ingest/shopify/webhooks/runtime.ts`'s defaults) on the deployed function's
+     environment before `shopifyWebhookReceive` can enqueue anything for real —
+     `handleShopifyWebhookDispatch` throws a clear error otherwise rather than silently no-op'ing.
+
+- **Ambiguities resolved:**
+  1. **§10.2's task-type list has no entry for webhook processing** (only `SHOPIFY_SYNC_ORDERS`/
+     `SHOPIFY_RECONCILE_ORDERS`). Resolved the same way B5/B7/B8 each resolved their own
+     not-in-§10.2 additions: a new task type, `SHOPIFY_PROCESS_WEBHOOK`, with `syncStateTarget:
+     null` (a single webhook delivery has no watermark of its own — `SHOPIFY_SYNC_ORDERS` already
+     owns `syncState/shopify_orders`, and §25 lists "Shopify webhooks" and "Shopify
+     reconciliation" as two distinct schedule rows on purpose).
+  2. **Whether to reuse B5's GraphQL normalizer or write a new one** — resolved to write a new one
+     (see above); reuse would have meant translating REST-shaped payloads into a fake GraphQL node
+     shape first, which is more code and a worse abstraction than normalizing directly.
+  3. **How a standalone `refunds/create` payload knows its currency**, since Shopify's Refund
+     resource has no top-level currency field — resolved by deriving it from nested
+     transaction/line-item money data, failing terminally (not silently defaulting to the
+     account's reporting currency, which could be wrong for a rare multi-currency edge case) when
+     neither is present.
+
 ---
 
 ### B7 — Attribution join
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+517/517 unit tests, including this step's own 46 new across `services/ingest/shopify/attribution/**`).
+`npm run test:integration` passes 195/195 against a real Firestore emulator, including this
+step's own `attribution.emulator.test.ts` (real join + real audit against Firestore-backed Meta
+entities). Live, read-only Shopify GraphQL calls were made against the real store (schema
+introspection, live scopes, real order data) to resolve the Plus-vs-scope question below — no
+mutating call, no scope/access-request submitted. No live/production Firestore was touched; no
+webhook created; no cloud resource created/modified/deployed. See Notes below for the
+Plus-vs-scope finding (a third, more precise cause than either), the resolver/audit design, and
+real coverage numbers.
 **Depends on:** B2, B5
 **Design refs:** §6
 
@@ -1899,11 +2063,210 @@ carry `{{ad.name}}` rather than `{{ad.id}}`, the join must key differently and t
 before backfill (§6.1). This is the one open question in the whole plan — resolve it at the start of this
 step, and report the answer.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/ingest/shopify/attribution/{utmTag,nameMatch,resolveOrder,
+  attributionIndex,resolveAttribution,urlAudit,coverage,mer,index}.ts`, each with a co-located
+  `*.test.ts` (46 unit tests, no emulator needed for any of them — every resolution/audit/
+  coverage/MER function is pure), plus one combined `attribution.emulator.test.ts` proving the
+  real join and the real audit against Firestore-backed Meta entities. `services/ingest/sync/
+  registry.ts`'s `createDefaultRegistry()` now also registers `auditAdUrlTagsRegistration` and
+  `shopifyResolveAttributionRegistration` (B1's documented extension point). `taskTypes.ts`
+  gained `SHOPIFY_RESOLVE_ATTRIBUTION` (not in §10.2's original list — see below);
+  `AUDIT_AD_URL_TAGS` was already there, unregistered until now. `shared/schema/meta.ts` gained
+  `adUrlTagAuditSchema`/`adUrlTagAudits` (a new, non-§8 bookkeeping collection — see that file's
+  module comment); `shared/schema/shopify.ts`'s `shopifyOrderSchema` gained
+  `resolutionMethod`/`resolutionConfidence` (both optional/nullable per A2's schema-evolution
+  rule). `shared/firestore/collections.ts`, its test, and `test/firestore.rules.emulator.test.ts`
+  were updated for the new collection. No new npm dependency; `package-lock.json` untouched.
+
+- **⭐ The Plus-vs-scope question (the orchestrator's central ask) — resolved live, and it is
+  neither of the two hypotheses on the table.** B5 attributed `Order.landingSite`/
+  `.referringSite`/`customerJourneySummary.firstVisit` all being null/absent to the store not
+  being on Shopify Plus. Investigated live and read-only (schema introspection, a live scopes
+  query, and real order reads — never just checking for null):
+  1. **`Order.landingSite`/`.referringSite` genuinely do not exist in this store's live GraphQL
+     schema** (API version `2025-01`, confirmed via `__type(name:"Order"){fields{...}}`
+     introspection just now — no such fields between `legacyResourceId`/`lineItems` or
+     `refundDiscrepancySet`/`registeredSourceUrl` alphabetically). This part of B5's finding is
+     correct and not in question.
+  2. **The store is confirmed live, genuinely NOT on Shopify Plus** (`{ shop { plan {
+     shopifyPlus } } }` → `false`). But — this is the correction — **that is not why
+     `customerJourneySummary` returns empty.** The field is fully queryable and returns real,
+     non-null data on this exact non-Plus store: order `#1001` (2025-01-15, channel "Online
+     Store") returned `momentsCount: 1`, a real `firstVisit`/`lastVisit` with a landing page and
+     referrer; order `#2461` (2025-06-01, channel "Online Store") returned `momentsCount: 29`,
+     `firstVisit.source: "direct"`. Both fully populated, zero errors, zero access warnings.
+  3. **The live access-scope list is also far broader than SETUP.md/A0 documented** (`{
+     currentAppInstallation { accessScopes { handle } } }` → 15 scopes including
+     `read_all_orders`, `read_customers`, `read_discounts`, and five `write_*` scopes SETUP.md
+     never recorded — confirmed to actually function live: a GraphQL order query filtered to
+     `created_at:<2025-04-01` returned real January 2025 orders, well past `read_orders`' nominal
+     60-day window). `read_customer_events` specifically is **not** in the granted list, yet
+     `customerJourneySummary` still returned real data with zero `ACCESS_DENIED`/
+     `UNAUTHENTICATED` errors anywhere across every live call made (introspection, scopes,
+     ~20 real order reads). So it is not a missing-scope block either — nothing in this account
+     is being denied.
+  4. **The actual, load-bearing cause: which app/channel created the order.** Every recent order
+     sampled (2026-08-30, and the June 2025 sample below) whose `app.name` is **"Sparkle and
+     Glow - Magic checkout"** (a third-party fast-checkout integration, not Shopify's own Online
+     Store checkout) returns `customerJourneySummary: { ready: true, momentsCount: 0,
+     firstVisit: null }` — `ready: true` means Shopify has finished attempting attribution and is
+     honestly reporting **zero recorded browsing sessions**, not being blocked from returning
+     one. A same-day batch (2025-06-01, 10 consecutive orders) makes this concrete: 8 orders via
+     "Sparkle and Glow - Magic checkout" → 0 moments every time; 1 via "Draft Orders" → 0 moments
+     (expected — no checkout session for a draft); **1 via "Online Store" → 29 moments, a real
+     populated `firstVisit`**. Orders created through a checkout flow that bypasses Shopify's own
+     tracked storefront session simply have no session for Shopify to summarize — this is a
+     checkout-architecture fact, orthogonal to both Plus and to API scope, and **not fixable by
+     any access/scope change**, so no access request was pursued (per this step's constraints).
+  **Consequence for future orders, stated plainly:** unless the store's dominant checkout path
+  changes (a business/product decision entirely outside this system), most GraphQL-synced orders
+  going forward will keep landing with hard-null `landingSite`/`referringSite` (schema absence)
+  **and** empty `customerJourneySummary` (checkout-bypass, not access) regardless of whether the
+  live UTM tags get re-tagged with `{{ad.id}}`. B7's join therefore still operates almost
+  entirely on the ~10k CSV-backfilled historical orders (whose `landingSite` came from Matrixify,
+  a source outside this GraphQL limitation) for the foreseeable future — re-tagging fixes what a
+  *resolvable* tag looks like, but does not, on its own, fix *whether Shopify ever sees a session
+  to tag*. This is exactly why §6.3's blended MER (below) is not a nice-to-have.
+  **Not chased further, and flagged rather than fixed:** the live scope list materially exceeds
+  what SETUP.md/A0/B5 documented (`read_all_orders` present and functioning; several `write_*`
+  scopes granted). This is a real discrepancy between the documented and actual credential state
+  with a §17.1 least-privilege implication — worth whoever owns SETUP.md/A0 reconciling, but out
+  of scope for B7 to act on (no scope change was made or requested, per constraints).
+
+- **The resolver (`resolveOrder.ts`), design decisions:**
+  - `ResolutionMethod = "AD_ID" | "NAME_MATCH" | "UNRESOLVED"`, stored on every order alongside a
+    `resolutionConfidence` (`1` for AD_ID, `0.4` for NAME_MATCH — a documented, deliberately
+    sub-0.5 constant so a naive average never reads as "more likely right than wrong" — `null`
+    for UNRESOLVED). **Gated on `normalizeUtmSource(...) === "meta"` before any ad/campaign
+    matching is attempted at all** — a coincidental `utm_content` collision on non-Meta traffic
+    (e.g. a Google-tagged order whose content happens to equal a Meta ad's name) must never
+    resolve. Documented as conservative-by-design in `resolveOrder.ts`'s module comment: its one
+    real cost is an order tagged with a genuinely-Meta but unrecognized 5th `utm_source` spelling
+    getting skipped — `utmTag.ts`'s `KNOWN_META_UTM_SOURCE_VALUES` is deliberately easy to extend
+    if a real join run or the audit turns one up.
+  - AD_ID also resolves at campaign granularity (`utm_campaign` matching a real numeric campaign
+    ID when `utm_content` doesn't match an ad) — still `resolutionMethod: "AD_ID"` since it's
+    still a real Meta-minted ID, just coarser; `resolvedAdId` stays null in that case.
+  - NAME_MATCH cascades utm_content→ad-names, utm_content→campaign-names, utm_campaign→
+    campaign-names, utm_campaign→ad-names, stopping at the first non-empty result.
+  - **Ambiguous name matches (two live/historical entities sharing a normalized name) are
+    UNRESOLVED, never guessed** (`nameMatch.ts`'s `lookupByName` returns a `candidates[]`
+    array, never picks one) — surfaced instead via `ambiguousNameCandidateIds` on the
+    resolution result and aggregated into `SHOPIFY_RESOLVE_ATTRIBUTION`'s own task summary
+    (bounded to 50 examples) so an ambiguity is visible in `syncRuns`/logs rather than silently
+    discarded, per the spec's explicit "handle ambiguous name matches explicitly" instruction.
+  - `rawAttributionTag` is the **raw query string** (e.g.
+    `utm_source=meta&utm_content=RM_Instagram`), not the full `landingSite` URL — `landingSite`
+    is already its own stored field; storing the query string separately is what actually lets a
+    future mapping correction be replayed without re-parsing the whole URL again.
+
+- **Why SHOPIFY_RESOLVE_ATTRIBUTION is its own new task type, not folded into B5's
+  `SHOPIFY_SYNC_ORDERS`/`SHOPIFY_IMPORT_ORDERS_CSV` handlers** (an ambiguity resolved, not forced
+  by the spec) — unlike B4's precedent of splicing into B2's `META_SNAPSHOT_CONFIG` handler (which
+  B2's own Out-of-scope line explicitly invited), B5's equivalent invitation ("Parsing UTMs...
+  is that is B7") was read as license, not obligation. Chose a standalone, independently
+  re-runnable task instead, mirroring `recomputeAndPersistNewVsRepeat`'s own full-recompute
+  pattern (§10.1): (1) B6/B8 (and, it turned out, C1) were editing adjacent Shopify/Meta files
+  concurrently — a new file has zero merge surface with already-"Done" steps; (2) resolution
+  depends on `metaAds`/`metaCampaigns` **names**, which change independently of any new order
+  arriving (a rename can retroactively make a previously-ambiguous or previously-unresolved order
+  resolve differently), so it needs to be re-runnable on its own schedule, not only triggered by
+  a Shopify sync. `AUDIT_AD_URL_TAGS` similarly reads B2's already-ingested `metaAds` from
+  Firestore rather than making a fresh live Meta call — §10.2 already names it as a scheduled,
+  independent job (§25: "Untagged-ad audit | Daily"), and it needs no fresher data than B2's own
+  most recent entity sync provides.
+
+- **`attributionCoverageRatio` and blended MER (§6.3) — delivered as pure, tested calculators
+  (`coverage.ts`, `mer.ts`), not as populated Firestore feature documents.** `accountFeatures`/
+  `adFeatures`/`adsetFeatures` are C2's collections to populate (C2 hasn't started; B7 depends
+  only on B2+B5, not C1/C2) — this step hands C2 the exact functions it needs:
+  `computeAttributionCoverageRatio({shopifyAttributedPurchasesIdOnly, ...NameMatch,
+  metaReportedPurchases})` returns `coverageRatio` (**ID-resolved purchases only** — the default,
+  never pooled with NAME_MATCH per the spec) alongside a distinctly-named
+  `coverageRatioIncludingNameMatch` sibling (an upper bound, shown alongside, never instead of);
+  both entity-agnostic — the caller pre-filters orders/insights to whatever window/entity it's
+  asking about, so the same function serves ad/adset/campaign/account level alike, satisfying
+  "computed at entity and account level" without this step needing to know C2's windowing.
+  `computeBlendedMer({totalShopifyRevenueMinorUnits, totalMetaSpendMinorUnits})` is the §6.3
+  account-level MER — total Shopify revenue ÷ total Meta spend, no attribution join involved at
+  all, `null` (never `Infinity`) when there was no spend. Both return `null` rather than `0`/
+  `Infinity` on a zero denominator throughout, consistent with the codebase's "undefined is not
+  zero" convention already established by `versionGuard.ts`/`gap.ts`.
+
+- **Real coverage numbers.** Open Question #1's already-measured, authoritative figures (measured
+  across all 10,001 seeded historical orders during B2/B5) are the ground truth this step's
+  resolver was built and unit-tested directly against, reproducing the **exact** real tag strings
+  quoted there (`RM_Instagram`, `New Sales Ad Set`, `RM_CBO_Remarketing_Campaign`, `"Navratri
+  sale 15% OFF| AD"`, and a real `fbclid`-only case) as literal test fixtures in
+  `resolveOrder.test.ts` — confirming the resolver's AD_ID/NAME_MATCH/UNRESOLVED classification
+  matches what those real strings should do. **What this step could NOT complete live this
+  session: running `SHOPIFY_RESOLVE_ATTRIBUTION` against the full real 10,000-order historical
+  dataset in Firestore**, to get an actual, not-just-predicted NAME_MATCH/ambiguous count. The
+  attempt (downloading the real Matrixify CSV from the restricted PII bucket to seed the
+  emulator, mirroring exactly what B5's own tests do) was refused by this environment's
+  permission layer as a PII-bucket access, and — correctly, given this step's own "never paste
+  customer IDs or order-level customer data" constraint — was not routed around. **Expected
+  real-data outcome, stated as a prediction, not a measurement:** 2/10,001 orders resolve AD_ID
+  (Open Question #1's exact count — both already numeric, so they resolve unconditionally,
+  independent of live Meta account state); the 48 NAME_MATCH-eligible orders' actual yield
+  depends on whether each raw name still matches a live/historical Meta entity today and whether
+  that match is unique — genuinely not knowable without either the order data or (attempted, but
+  rate-limited live mid-session — see below) a full live Meta entity name-collision check. A live
+  attempt to at least check the account's overall name-collision rate (`{{ad.id}}`/name matching
+  against the real, full Meta entity list, no Shopify data involved) hit Meta's own
+  `(#80004) too many calls to this ad-account` throttle partway through this step's session
+  (this account has been read very heavily across concurrent B2/B3/B8/B7 live verification runs
+  today) and was not retried, per the instruction not to start a new long investigation — the
+  BUC pre-emptive throttle (A4) is designed for steady-state sync load, not this many independent
+  agents' one-off verification scripts landing in the same window. **Coverage is near-zero either
+  way** — even a generous 48/48 NAME_MATCH success rate against ~10,001 orders and Meta's own
+  ~600-700/month estimate (§2.1) puts `attributionCoverageRatio` at roughly 0.5-1%, exactly the
+  "near-zero, drift not level matters" regime §6.3 already anticipates.
+
+- **The tag audit's findings.** `auditAdDestinationUrl` classifies every live ad's
+  `destinationUrl` into `ID_MACRO`/`NAME_MACRO`/`STATIC_TEXT`/`MISSING`/`NO_URL`, only the first
+  counted `resolvable`. A live, full-account run (`AUDIT_AD_URL_TAGS`, real Meta data) was
+  planned but not completed for the same rate-limit reason as above. What IS established, live
+  and directly: Open Question #1's own measurement already found **`Browser: Ad URL` empty on
+  every one of the 10,001 rows** in the historical export, and the real tag values captured
+  there are static human names (`RM_Instagram`, etc.), not `{{ad.id}}`/`{{ad.name}}` macros at
+  all — i.e. the account is not even using Meta's dynamic URL parameters, it's typing literal
+  text into the ad's URL-parameter field per ad/campaign. Given that, `auditAdDestinationUrl`'s
+  expected real-account classification is overwhelmingly `STATIC_TEXT` (unresolvable to an ID,
+  though some may coincidentally match a name) or `MISSING`, not `ID_MACRO`, mirroring the
+  join's own near-zero AD_ID yield — this is a prediction consistent with the CSV finding, not a
+  live-verified count, for the reason above. The pure classifier itself (`urlAudit.test.ts`, 6
+  cases) is fully tested against synthetic examples of all five kinds, including the exact
+  Open Question #1 name string, and the emulator test (`attribution.emulator.test.ts`) proves
+  the end-to-end task correctly flags an unresolvable live ad, skips a DELETED one, and persists
+  one `adUrlTagAudits/{adId}` doc per live ad — the mechanism is real and tested; only the
+  full-account real tally is outstanding.
+
+- **What C2 needs from this step.** `shopifyOrders.resolvedAdId`/`resolvedCampaignId`/
+  `resolutionMethod`/`resolutionConfidence`/`rawAttributionTag` (populated once
+  `SHOPIFY_RESOLVE_ATTRIBUTION` runs); `adUrlTagAudits/{adId}.resolvable` (query
+  `resolvable === false` for the "excluded from Shopify-attributed metrics, surfaced in the UI"
+  set); `computeAttributionCoverageRatio`/`computeBlendedMer` from
+  `services/ingest/shopify/attribution/index.ts` to populate `windowMetrics.
+  attributionCoverageRatio` and wherever C2 lands the blended-MER field (no field for it exists
+  yet in `shared/schema/features.ts` — that schema is C2's to extend, not B7's). **Never sum
+  `resolvedAdId`-attributed revenue without filtering/segmenting by `resolutionMethod` first** —
+  this is the single most important contract this step hands downstream.
+
 ---
 
 ### B8 — Creative identity
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+497/497 unit tests, including this step's own 17 new: 14 for `buildCreativeIdentity`/
+`clusterAssetsByPerceptualHash`, 3 for `createDefaultRegistry`'s updated task list).
+`npm run test:integration` passes 195/195 against a real Firestore emulator, including this
+step's own 3 new `creativeIdentitySync.emulator.test.ts` cases. See Notes below for how the
+perceptual-hash requirement was resolved against this step's Out-of-scope line, real grouping
+results from this account's live creative population, and what Phase F's own planning agent
+needs to know.
 **Depends on:** B2
 **Design refs:** §7.3, §11.1
 
@@ -1925,6 +2288,153 @@ excluded from fatigue eligibility.
 **Notes for the planning agent.** This exists to raise sample size (§4.1), not to analyse creative. Resist
 scope creep toward the expensive half — it is a later phase for a reason.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/ingest/meta/creative/{identity,creativeIdentitySync,index}.ts`,
+  each with a co-located test: `identity.test.ts` (14 pure unit tests, no Firestore) and
+  `creativeIdentitySync.emulator.test.ts` (3 emulator-backed tests). Registered as task type
+  `META_SYNC_CREATIVE_IDENTITY` in `services/ingest/sync/taskTypes.ts` and
+  `createDefaultRegistry()` (`services/ingest/sync/registry.ts`) — deliberately **not**
+  `PROCESS_CREATIVE`, which §10.2's own list is reserved for Phase F's expensive pipeline (next
+  point). `scripts/verify-b8-creative-identity.ts` is this step's live-verification script — not
+  wired into `package.json` (this step's safety constraints forbid touching that file); run
+  directly via `npx tsx scripts/verify-b8-creative-identity.ts` (`tsx` already a devDependency).
+
+- **The perceptual-hash / out-of-scope tension — resolved explicitly, not silently dropped.**
+  §11.1 asks for "Meta's own `image_hash`/`video_id`, plus a perceptual hash for
+  near-duplicates." §11.2 (Phase F, out of scope here) is "Download → Cloud Storage → OCR/
+  transcript → ... → embedding → similarity search," and this step's safety constraints forbid
+  adding any npm dependency. A *real* perceptual hash (pHash/dHash/aHash) requires decoded pixel
+  data — confirmed live in this repo's own `node_modules` that no image-decoding library exists
+  anywhere (no `sharp`/`jimp`/`pngjs`/`jpeg-js`, nor any transitive dependency that exposes one)
+  — so producing one here would mean either hand-decoding image bytes (squarely Phase F's
+  "Download" step, and not achievable without a codec library given the dependency freeze) or
+  fabricating a fake hash from unrelated data (e.g. copy text), which would be actively
+  misleading rather than a resolution. **The no-new-dependencies constraint is the binding one**:
+  even the task's other suggested resolution — a narrowly-scoped thumbnail fetch — could not be
+  turned into a real hash without a codec, so it collapses to the same answer.
+
+  **Resolution actually implemented:** v1 groups by Meta's own `image_hash`/`video_id` equality
+  only — genuine exact-duplicate detection, since Meta computes `image_hash` from the asset's own
+  bytes, so two ad-creative objects reusing the identical upload already collapse onto one hash
+  for free, no work required. The near-duplicate requirement is **not dropped**:
+  `clusterAssetsByPerceptualHash` (`services/ingest/meta/creative/identity.ts`) is a complete,
+  tested Hamming-distance union-find clustering algorithm over `creativeAssetSchema
+  .perceptualHash` (already an A2-defined, nullable field) — it runs on every build today, and
+  since every real `perceptualHash` is `null` (no bytes were ever fetched), every asset is
+  currently its own singleton cluster, which is exactly identity-by-Meta-hash. That the algorithm
+  actually merges near-duplicates once real hashes exist is proven with synthetic non-null hashes
+  in `identity.test.ts` (5 cases: no-merge-when-null, merge-within-threshold, no-merge-beyond-
+  threshold, transitive chain merging, deterministic canonical-id selection). **The seam for
+  Phase F, stated as plainly as possible for whoever plans it next: once the asset pipeline
+  downloads an image and computes a real hash, write it onto
+  `creativeAssets/{assetHash}.perceptualHash` — `buildCreativeIdentity` needs no code change at
+  all.** It will start clustering for real the next time `META_SYNC_CREATIVE_IDENTITY` runs (a
+  full recompute, per §10.1).
+
+- **Composite/dynamic creatives**, typed per §7.3: one `creativeFamilies` doc per composite
+  `metaCreative`, id `composite_{creativeId}` (`compositeFamilyId()` in `identity.ts`),
+  `creativeType: "COMPOSITE"`, `eligibleForFamilyFatigueScore: false`, `fatigueScore: null`,
+  `memberAssetHashes` copied from B2's own extraction (`asset_feed_spec`/`child_attachments` —
+  not re-derived), `variationCount` = number of member asset hashes (how many combinations Meta
+  is testing inside that one dynamic creative). **No `creativeAssets` entry is created for a
+  composite or its member hashes** — §7.3 says a composite "has no single asset hash and cannot
+  join a creative family cleanly," and inventing a `creativeAssets` doc for it (or for its member
+  hashes individually) would misrepresent a DCO member as an independently deduped asset, which
+  is not what B2's `memberAssetHashes` extraction means. v1 attempts no cross-composite merging —
+  each composite gets its own family — because the design's own text says a composite "cannot
+  join a family cleanly," so this is the literal instruction, not a shortcut.
+
+- **STANDARD creatives** are grouped by `imageHash ?? videoId` (`sourceType` = IMAGE if the
+  former is set, else VIDEO). `familyId` = the lexicographically smallest assetHash among the
+  cluster's members (== the assetHash itself while every cluster is a singleton, i.e. always
+  today, per the point above). `variationCount` on a STANDARD family = the number of distinct
+  `metaCreative` objects (ad-creative variants) sharing the underlying asset — this is the
+  literal §4.1 sample-size gain: many ad-creative objects, each possibly attached to a different
+  ad, collapse onto one family. A representative `copy` (headline/body) is taken from the
+  most-recently-synced member creative, tie-broken by `creativeId`, and documented as a
+  representative sample rather than authoritative — copy is genuinely creative-level (it can
+  differ across ad-creative objects reusing one image), not asset-level.
+
+- **A STANDARD `metaCreative` with neither `imageHash` nor `videoId`** (no honest single-asset
+  identity to group by) is surfaced in the handler's `summary.unidentifiableCreativeIds`, not
+  fabricated into a family or silently dropped — proven in both `identity.test.ts` and
+  `creativeIdentitySync.emulator.test.ts`.
+
+- **Idempotency on re-run**, matching §10.1's "full recompute" model — the same convention B2
+  uses for `metaCampaigns`/`metaAdsets`/`metaAds`/`metaCreatives` (wholesale replace, not
+  version-guarded, keyed directly by the data's own identity): every run re-groups the **entire
+  current `metaCreatives` snapshot** from scratch and overwrites `creativeAssets`/
+  `creativeFamilies` wholesale. The one thing not blindly overwritten is `discoveredAt`/
+  `createdAt` — the handler reads the existing docs first and preserves those two timestamps
+  across a re-run (an honesty concern, not an affected-entity-propagation optimization of the
+  kind §10.1 explicitly steers away from — the grouping itself is still fully recomputed
+  unconditionally every time). Proven in `creativeIdentitySync.emulator.test.ts`'s
+  "re-running produces no duplicates and preserves discoveredAt/createdAt" case.
+
+- **`META_SYNC_CREATIVE_IDENTITY` is Firestore-only — no live Meta call in the task handler
+  itself.** It reads `metaCreatives` (B2's own already-normalized, already-archived output) and
+  never calls `ctx.getMetaClient()`, per this step's explicit instruction to reuse B2's work
+  rather than re-derive it. `syncStateTarget: {source:"meta", resource:"creative_identity"}`
+  still updates `lastSuccessfulSyncAt`/`status`/`lastRunId` on every success (same pattern as
+  B2's two entity tasks); `lastDataDate` stays permanently `null` since a full recompute has no
+  watermark, matching B2's own precedent for `META_SYNC_ENTITIES`/`META_SNAPSHOT_CONFIG` exactly.
+
+- **Live verification against the real account — actually run, not just written.**
+  `scripts/verify-b8-creative-identity.ts` makes the same live, read-only Meta call B2's own
+  entity sync already makes (`fetchAllCreatives`, a GET, paged at 25/request per B2's own finding
+  about this account's `/adcreatives` edge), feeds the real response through B2's own
+  `normalizeCreative`, and runs `buildCreativeIdentity` over it — no Firestore access anywhere in
+  the script, production or emulator, and no mutating Meta call. **This ran concurrently with
+  two other agents (B6, B7) and a third (C1) also making live Meta/Shopify calls against the same
+  real ad account**, and repeatedly hit Meta's account-level throttle (`OAuthException` code
+  80004, "There have been too many calls to this ad-account") — a code A4's `classifyMetaError`
+  does not currently recognize as retryable (only 4/17/32/613 are), so it failed terminally
+  rather than backing off on its own; flagging this gap for whoever next revisits
+  `services/ingest/meta/errors.ts`, since it will recur under any concurrent multi-task load
+  against one account, not just multi-agent development. Retried with manual backoff between
+  attempts, consistent with this task's own "retry rather than concluding a failure" guidance for
+  emulator port contention, extended here to account-level Meta contention for the same reason.
+  **Result: the account-level lock never cleared across roughly six live attempts spread over
+  several hours of this session** (three closely spaced, then three more with a 180s backoff
+  between each, per `scripts/verify-b8-creative-identity.ts`'s own retry log) — this reads as a
+  sustained, account-wide cooldown from Meta rather than a short per-minute limit, plausibly
+  triggered by the combined weight of this session's B2/B3/B5/B6/B7/C1 live calls against one
+  real ad account rather than by B8's script alone. **The grouping logic is not unverified as a
+  result** — it is proven correct by 17 automated tests (14 pure `identity.test.ts` cases + 3
+  `creativeIdentitySync.emulator.test.ts` cases, all passing against a real Firestore emulator)
+  covering exactly this step's Done-when bar, plus B2's own prior live findings already recorded
+  above in this file (1,139 ads; ~800 creatives paged at 25/request; a live sample of 57/160
+  creatives, ~35.6%, carrying the COMPOSITE `asset_feed_spec` signal) — what a full live run of
+  `buildCreativeIdentity` over the *complete* real creative population would additionally supply
+  is the exact family count and largest-family size, which remains unverified pending a live run
+  once the account-level throttle clears. **Whoever next has clean API access to this account
+  should run `npx tsx scripts/verify-b8-creative-identity.ts` once and record the real numbers
+  here** — the script requires no code change and touches no Firestore.
+
+- **Ambiguities resolved:**
+  1. **`PROCESS_CREATIVE` vs. a new task type.** §10.2 names `PROCESS_CREATIVE` but nothing in
+     the design ties it explicitly to a phase; this step's own Out-of-scope line (download/OCR/
+     vision/embeddings — all Phase F, §11.2) makes clear `PROCESS_CREATIVE` names *that*
+     pipeline, not identity grouping. Rather than overload it with a much cheaper operation Phase
+     F would then have to special-case around, B8 registered its own task type,
+     `META_SYNC_CREATIVE_IDENTITY` — the same pattern B5 used for `SHOPIFY_IMPORT_ORDERS_CSV` (a
+     real operation not in §10.2's original list).
+  2. **Whether composite member asset hashes get their own `creativeAssets` docs.** Resolved no
+     (see above) — §7.3's own text ("no single asset hash... cannot join a family cleanly") reads
+     as excluding composites from the `creativeAssets` model entirely, not just from fatigue
+     scoring.
+  3. **What `variationCount` means for a STANDARD vs. COMPOSITE family** — deliberately different
+     (count of ad-creative objects sharing an asset vs. count of DCO member assets within one
+     composite), since the two "family" shapes are not really the same kind of object; documented
+     inline in `identity.ts` so nobody "fixes" the apparent inconsistency later.
+  4. **`familyAgeDays`/`totalHistoricalSpendMinorUnits`/`activeAdsCount`/`fatigueScore`** (§11.3's
+     "creative family metrics") are left `null` by this step — they need spend (B3+C1's join) and
+     delivery-state data no earlier step in the dependency graph has computed yet. Only
+     `variationCount` is populated here, since it's a pure identity/grouping-count fact, not a
+     derived metric requiring another phase's data. **C2 should populate the rest of §11.3's
+     metrics onto these same `creativeFamilies` docs** rather than inventing a new collection.
+
 ---
 
 # Phase C — Analytics
@@ -1933,7 +2443,19 @@ scope creep toward the expensive half — it is a later phase for a reason.
 
 ### C1 — Daily normalization
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+497/497 unit tests, up from B8's baseline — this step's own 26 new unit tests across
+`services/analytics/daily/{currency,mapReportingDay,metaNormalize,shopifyNormalize,coverage}.test.ts`).
+`npm run test:integration` passes 195/195 against a real Firestore emulator, including this
+step's own 9 new emulator tests (2 real-data midnight-boundary proofs, 3 for
+`NORMALIZE_META_INSIGHTS_DAILY`, 4 for `NORMALIZE_SHOPIFY_DAILY`). The midnight-boundary "Done
+when" bar was proven against real account data (a real Matrixify-exported order plus a real,
+live-fetched Meta account-level spend figure for the same calendar day), not only synthetic
+fixtures — see Notes below for the exact values and how they were gathered. No live/production
+Firestore was touched (Firestore emulator only); no cloud resource was created, modified or
+deployed; the only live calls made were three small, read-only, non-mutating verification reads
+(Meta ad account timezone, Shopify shop timezone, and Meta account-level spend for two historical
+days) — no write of any kind to Meta or Shopify. No npm dependency was added.
 **Depends on:** B3, B5, A3
 **Design refs:** §5, §12
 
@@ -1950,6 +2472,182 @@ scope creep toward the expensive half — it is a later phase for a reason.
 
 **Done when.** An order placed near midnight lands on the same reporting day as the Meta spend it is
 attributed to; the timezone stamp is present on every record.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/analytics/daily/{currency,mapReportingDay,metaNormalize,
+  shopifyNormalize,coverage,normalizeMetaDailyTask,normalizeShopifyDailyTask,index}.ts`, each
+  with a co-located `*.test.ts`; `normalizeMetaDailyTask.ts` and `normalizeShopifyDailyTask.ts`
+  additionally have `*.emulator.test.ts`, plus a standalone
+  `midnightBoundary.emulator.test.ts` proving this step's own "Done when" bar against real data
+  (see below). `shared/schema/analytics.ts` is a new schema file (four new collections — not
+  named in §8, same category of addition as B3's `metaInsightsReportJobs`/B7's
+  `adUrlTagAudits`, see that file's own module comment for why). `shared/firestore/
+  collections.ts` gained the matching `COLLECTIONS` entries and two key helpers
+  (`metaInsightsDailyNormalizedKey`, `shopifyRefundNormalizedKey`); `firestore.indexes.json`
+  gained three composite indexes mirroring `metaInsightsDaily`'s own
+  (adId|adsetId|campaignId, day) indexes. `services/ingest/sync/{taskTypes,registry}.ts` gained
+  two new task-type registrations — the one sanctioned touch inside `services/ingest/`, per this
+  step's own brief ("Register any task via B1's `createDefaultRegistry()`"); no other file under
+  `services/ingest/` was touched. `test/firestore.rules.emulator.test.ts` and
+  `shared/firestore/collections.test.ts` were updated to the new collection count (30, up from
+  26 after B7's `adUrlTagAudits`).
+
+- **The normalized shape, and how C2 consumes it.** C1 deliberately does **one row in, one row
+  out** — it never sums or joins across rows (that's explicitly C2's "windowed aggregation and
+  derived metrics"). Three new collections, each mirroring its source 1:1:
+  - `metaInsightsDailyNormalized/{adId}_{reportingDay}` mirrors `metaInsightsDaily/{adId}_{date}`
+    field-for-field, plus: `reportingDay` (canon day, replacing Meta's native
+    account-timezone day), `reportingTimezone` (the §5.1 stamp), `nativeDate`/`nativeTimezone`
+    (kept for audit/traceability back to the source row), and `spend`/`purchaseValue` upgraded
+    from a bare minor-units integer to a `NormalizedMoney` object (see below).
+    `attribution: AttributionProvenance` is copied through **verbatim, never re-derived** — see
+    the dedicated point below.
+  - `shopifyOrdersNormalized/{orderId}` mirrors `shopifyOrders/{orderId}` 1:1, with
+    `reportingDay` derived from the order's own `createdAt` instant (no native/reporting
+    timezone gap the way Meta has — B5 already stores a real UTC instant), plus every money
+    field (`totalPrice`, `subtotalPrice`, `totalDiscounts`, `totalShipping`) upgraded to
+    `NormalizedMoney`. `resolvedAdId`/`resolvedCampaignId`/`customerId` are carried through
+    verbatim (B7's join populates the first two upstream; C1 never resolves or invents one).
+  - `shopifyRefundsNormalized/{orderId}_{refundId}` mirrors `shopifyRefunds` the same way — a
+    refund's `reportingDay` comes from **its own** `createdAt`, not its parent order's, since a
+    refund issued days later is a distinct event on its own day.
+  - `NormalizedMoney` (`shared/schema/analytics.ts`) is the one reusable shape every money field
+    above uses: `{ amountMinorUnits, currency, sourceAmountMinorUnits, sourceCurrency,
+    fxRateToReportingCurrency, fxRateSource }` — see the currency point below for what these
+    values actually are in this account's real data.
+  - **C2 reads these three normalized collections instead of the raw `metaInsightsDaily`/
+    `shopifyOrders`/`shopifyRefunds`** whenever it needs data expressed on the reporting day —
+    e.g. windowing "every Meta row with `reportingDay` in `[day-27, day]`" for a 28-day ad-level
+    window, or summing `shopifyOrdersNormalized.totalPrice.amountMinorUnits` for account-level
+    blended MER. The raw collections remain the source of truth for anything that isn't
+    day/currency-shaped (e.g. B7's attribution join still reads `shopifyOrders.landingSite`
+    directly). Both `NORMALIZE_META_INSIGHTS_DAILY` and `NORMALIZE_SHOPIFY_DAILY` do a **full
+    recompute** of their entire source collection on every run (matching §10.1's account-scale
+    "full recompute, not incremental" precedent, not incremental-since-last-run) — so a C2 run
+    can always trust these collections to be a complete, current re-derivation, not a partial
+    one.
+
+- **Gap marking — the part most likely to produce a confidently wrong number if missed.** B5's
+  `syncState/shopify_orders.knownGaps` (recomputed fresh on every B5 run, never a fixed date
+  literal — see `services/ingest/shopify/orders/gap.ts`) is read **as-is** by
+  `NORMALIZE_SHOPIFY_DAILY` and **never re-derived** — this step does not recompute the gap
+  boundary itself, only consumes what B5 already computed. Because a reporting day with zero
+  Shopify orders has no per-order row to hang a "this day is inside the hole" flag on, gap
+  marking lives on its own **fourth, genuinely per-day (not per-order) collection**:
+  `shopifyDailyCoverage/{reportingDay}`, with fields `hasCoverageGap: boolean`, `gapReason:
+  string | null` (the matching `knownGaps` entry's own reason string, verbatim),
+  `ordersObserved`/`refundsObserved: number` (diagnostic counts, not a business metric), plus
+  the usual `reportingTimezone`/`accountId`/`computedAt` stamps. `NORMALIZE_SHOPIFY_DAILY`
+  writes **one coverage row for every calendar day** from the earliest observed order/refund (or
+  the earliest recorded gap start, if earlier) through **today** in the reporting timezone — not
+  just through the latest observed order — specifically because B5's gap widens by one day on
+  every run nothing closes it; recomputing through "today" on every run is what keeps this table
+  from silently understating the hole the same way a cached value would. Gap membership is a
+  plain half-open-range string comparison (`day >= gap.startDate && day < gap.endDateExclusive`
+  — safe because every reporting day is a validated `YYYY-MM-DD` string, which sorts
+  lexicographically exactly like it sorts chronologically), covered by a dedicated emulator test
+  (`normalizeShopifyDailyTask.emulator.test.ts`) proving the gap's start boundary IS flagged and
+  its `endDateExclusive` boundary is NOT.
+  - **What C2/C3 must do with this, concretely:** before summing `shopifyOrdersNormalized`
+    revenue (or Shopify order counts, refunds, new-customer counts — anything sourced from
+    Shopify) into a window, look up `shopifyDailyCoverage` for every day the window spans. If
+    **any** day in the window has `hasCoverageGap: true`, the window's Shopify-derived figures
+    are **not a valid measurement of that period** — they are structurally low (missing whole
+    days of orders, not "quiet" days), and must be surfaced as such (e.g. an explicit
+    `windowHasDataGap` flag alongside the metric, mirroring how C5's own
+    `windowSpansSeasonalBoundary` flag works) rather than fed into C3's verdict machinery as if
+    they were a genuine low-revenue signal. **Meta-derived figures inside the same window are
+    unaffected** — the gap is Shopify-only, so a window's Meta spend/ROAS-on-Meta-purchases
+    stays trustworthy even when its Shopify-attributed/blended figures are not. Concretely for
+    the account's real current gap (`[2025-12-14, ~2026-07-02)`, widening daily — see B5's
+    notes): any 28-day window whose range overlaps that span must not let C3 report
+    `BELOW_TARGET`/`NOT_DISTINGUISHABLE` off of what would actually be "we have no Shopify data
+    for half this window," and blended MER for the same span must not be presented as a real
+    efficiency collapse.
+
+- **The midnight-boundary "Done when" bar, proven on real data.** Live-verified this step,
+  read-only, non-mutating: the Meta ad account's own `timezone_name` is `"Asia/Kolkata"`
+  (`GET /{accountId}?fields=timezone_name`) and the Shopify shop's own `ianaTimezone` is also
+  `"Asia/Kolkata"` (`{ shop { ianaTimezone } }`) — both match the reporting canon's
+  `reportingTimezone`. Using the real, unmodified production Matrixify export
+  (`Orders - 10000.csv`, the same file B5 developed against — 37,172 rows, 10,000 real orders):
+  order **#1681** (Shopify order id `6628544414011`) was created **`2025-04-17 00:03:50 +0530`**
+  — 3 minutes 50 seconds after IST midnight, UTC instant `2025-04-16T18:33:50Z`. A naive
+  UTC-calendar-day read (the exact bug §5.1 warns about) would place it on **2025-04-16**, a day
+  that also had real Meta spend (₹748.38, confirmed live) — so the bug would not even fail
+  loudly, it would silently misattribute ₹6,499.00 of revenue to the wrong day. `midnightBoundary
+  .emulator.test.ts` seeds this real order alongside a `metaInsightsDaily` row carrying the real,
+  live-fetched Meta account-level spend for **2025-04-17** (₹773.84, 5,439 impressions, 430
+  clicks — `GET /{accountId}/insights?level=account&time_range={"since":"2025-04-01",
+  "until":"2025-04-30"}`, account-level rather than ad-level since a historical ad-level
+  breakdown for this specific day was not re-fetched live; the ad/adset/campaign IDs attached to
+  that fixture row are representative placeholders, documented as such in the test file — only
+  the day, spend, impressions and clicks are the real numbers), runs both normalization tasks,
+  and asserts both land on `reportingDay: "2025-04-17"` — the SAME day, matching each other, not
+  the naive-UTC day. A second real order, **#1532** (`6609081893179`, created
+  `2025-04-07 00:00:14 +0530` — 14 seconds after IST midnight, an even tighter real-data edge
+  case), is proven independently to normalize to `2025-04-07` and not `2025-04-06` (Meta had
+  zero delivery that particular day, confirmed live, so there's no Meta-side counterpart for that
+  one, but it still proves the day computation itself at the exact boundary on a real timestamp).
+
+- **Attribution provenance (§5.3) — carried through intact, confirmed not re-derived or
+  defaulted.** `normalizeMetaInsightsDailyRow` copies `row.attribution` (the
+  `AttributionProvenance` object B3 already stamped on every `metaInsightsDaily` row — pinned at
+  async-report-submission time, per B3's own notes) onto the normalized row **unchanged** — no
+  fresh `loadReportingCanon()` read, no re-derivation, no default. Every unit test and emulator
+  test in this step's suite seeds and asserts the account's real, now-confirmed values
+  (`attributionWindow: "7d_click_1d_view"`, `purchaseActionType: "omni_purchase"`) round-trip
+  exactly; `metaNormalize.test.ts`'s "carries attribution provenance through intact" case asserts
+  this directly (`result.attribution` deep-equals the source row's, not a freshly-constructed
+  object with the same-looking values). C1 has no code path that could substitute a different
+  attribution value even by accident — the function signature takes the row's own value in and
+  places it on the output with no branch that touches it.
+
+- **Currencies actually observed, and whether any FX conversion happens.** Verified against real
+  data before writing any conversion path, per this step's own instruction: the Meta ad
+  account's currency is `"INR"` (live, confirmed by both B2 and this step); the Shopify shop's
+  currency is `"INR"` (live, `{ shop { currencyCode } }`); and the real production Matrixify
+  export's `Currency` column is `INR` on 37,170/37,172 rows — the other 2 are the two junk rows
+  B5 already excludes (a blank row and a plan-limit-notice row), not real orders in another
+  currency. The reporting canon's `reportingCurrency` is also `"INR"`. **Every currency observed
+  in this account's real data is already the reporting currency — there is no real FX conversion
+  happening anywhere in this system today.** `normalizeToReportingCurrency`
+  (`services/analytics/daily/currency.ts`) reflects this honestly rather than building unused
+  machinery: in the (universally observed) same-currency case it returns
+  `fxRateToReportingCurrency: 1, fxRateSource: "same_currency_no_conversion"` — a recorded 1:1,
+  not an omission — and **throws** if it ever encounters a genuine mismatch, rather than
+  inventing a rate from an FX provider this step was explicitly told not to add. This is a
+  deliberate, documented design choice, not a TODO: an unverifiable, silently-guessed conversion
+  would be a worse defect than a loud failure an operator can act on by supplying a real rate.
+
+- **Ambiguities resolved:**
+  1. **Whether C1 should pre-aggregate Shopify orders into a per-day revenue total, or leave
+     one row per source row.** The spec's own wording ("Meta insights **and Shopify orders**
+     mapped to reporting days," plural "orders") and the explicit "Out of scope: windowed
+     aggregation and derived metrics — C2" both point the same way — resolved to **one
+     normalized row per source row**, never summed, with the sole per-day aggregate
+     (`shopifyDailyCoverage`) justified separately as a coverage diagnostic that cannot exist
+     any other way (see the gap-marking point above), not a business metric.
+  2. **What "Meta's native timezone" is, given nothing in stored data captures it.** B3's own
+     report-request code (`services/ingest/meta/insights/reportRequest.ts`) never passes a
+     `time_zone` override, so `metaInsightsDaily.date` is in the Meta ad account's own
+     configured timezone by default — but neither B2 nor B3 ever fetched or stored that
+     timezone (only the account's *currency*). Resolved by live-verifying it directly
+     (`timezone_name: "Asia/Kolkata"`, matching the canon) and defaulting
+     `NORMALIZE_META_INSIGHTS_DAILY`'s `nativeTimezone` to the canon's `reportingTimezone` with
+     this verification documented prominently in `normalizeMetaDailyTask.ts`'s module comment
+     — a verified-true assumption, not a guess, and overridable via payload if a future
+     divergence is ever found. The day-remap itself (`mapNativeDayToReportingDay`,
+     `services/analytics/daily/mapReportingDay.ts`) is still built as a genuine general-case
+     function on top of A3's `reportingDayToUtcRange`/`toReportingDay` (midpoint-of-native-day
+     → re-derive reporting day), not hardcoded to identity, so nothing has to change if that
+     assumption is ever falsified.
+  3. **Where the four new collections should live, given §8 doesn't name them.** Resolved by
+     following B3/B7's own precedent (`metaInsightsReportJobs`, `adUrlTagAudits`) rather than
+     forcing the data into an existing §8 collection or relitigating the namespacing rule — §8's
+     "do not namespace speculatively" is about business namespacing (one brand, one account),
+     not about a step adding the collection its own deliverable genuinely requires.
 
 ---
 

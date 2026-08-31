@@ -64,6 +64,18 @@ export const shopifyOrderSchema = z.object({
   rawAttributionTag: z.string().nullable(),
   resolvedAdId: z.string().nullable(), // populated by B7's join, not B5
   resolvedCampaignId: z.string().nullable(), // populated by B7's join, not B5
+  // B7 additions (§6.1's name-matching fallback, a user decision): how resolvedAdId/
+  // resolvedCampaignId above were actually obtained, and how much to trust them. Optional per
+  // A2's schema-evolution rule — B5 wrote orders before this field existed. `null`/absent means
+  // "not yet run through B7's resolver" (distinct from "UNRESOLVED", which means the resolver
+  // ran and found nothing) until SHOPIFY_RESOLVE_ATTRIBUTION's first pass reaches every order.
+  // ⚠️ Never pool NAME_MATCH orders with AD_ID ones — an ad name is neither unique nor stable,
+  // so a NAME_MATCH can attribute revenue to the WRONG ad. Any consumer summing
+  // resolvedAdId-attributed revenue must filter/segment by this field, never ignore it.
+  resolutionMethod: z.enum(["AD_ID", "NAME_MATCH", "UNRESOLVED"]).nullable().optional(),
+  // 1 for AD_ID, a fixed lower constant for NAME_MATCH (see
+  // services/ingest/shopify/attribution/resolveOrder.ts), null for UNRESOLVED/not-yet-run.
+  resolutionConfidence: z.number().min(0).max(1).nullable().optional(),
   source: shopifyOrderSourceSchema,
   syncedAt: firestoreTimestamp,
 });

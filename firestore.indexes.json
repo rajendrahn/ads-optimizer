@@ -64,6 +64,30 @@
         { "fieldPath": "phase", "order": "ASCENDING" },
         { "fieldPath": "updatedAt", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "metaInsightsDailyNormalized",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "adId", "order": "ASCENDING" },
+        { "fieldPath": "reportingDay", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "metaInsightsDailyNormalized",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "adsetId", "order": "ASCENDING" },
+        { "fieldPath": "reportingDay", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "metaInsightsDailyNormalized",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "campaignId", "order": "ASCENDING" },
+        { "fieldPath": "reportingDay", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []
