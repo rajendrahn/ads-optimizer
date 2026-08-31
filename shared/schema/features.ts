@@ -47,12 +47,34 @@ import { attributionProvenance, firestoreTimestamp, reportingDay } from "./commo
  * `value: null` (never `0`) for exactly that case; every other metric that legitimately had
  * no purchases in a window is a real, measured `0`.
  */
+/**
+ * Which of C3's three suppression rules forced a `NOT_DISTINGUISHABLE` verdict (see
+ * `services/analytics/statistics/windowStatistics.ts`'s own module comment for the rules
+ * themselves and the priority order — floor, then season, then, shopifyRoas only, the Shopify
+ * gap). Written by C3 at the exact point the suppression decision is made, so D1's
+ * `verdictExplain.ts` can render prose from this stored code instead of re-deriving the decision
+ * from the same inputs a second time (IMPLEMENTATION_PLAN.md D1's orchestrator note — duplicated
+ * decision logic kept in sync only by convention is exactly the class of bug this field closes
+ * off). `null` means the verdict is NOT_DISTINGUISHABLE for a genuine reason none of the three
+ * cover (the interval itself straddles the target), or the metric wasn't suppressed at all.
+ */
+export const verdictReasonCode = z.enum(["BELOW_FLOOR", "SEASONAL_BOUNDARY", "DATA_GAP"]);
+export type VerdictReasonCode = z.infer<typeof verdictReasonCode>;
+
 export const metricWithInterval = z.object({
   value: z.number().nullable(),
   intervalLow: z.number().nullable(),
   intervalHigh: z.number().nullable(),
   sampleSize: z.number().int().nonnegative(), // §12: every business metric carries sampleSize
   verdict: z.enum(["ABOVE_TARGET", "BELOW_TARGET", "NOT_DISTINGUISHABLE"]).nullable(),
+  // Optional, per A2's own version-guard warning (IMPLEMENTATION_PLAN.md A2's orchestrator
+  // note): adFeatures/adsetFeatures/accountFeatures/creativeFamilyFeatures already hold real
+  // documents, so a new REQUIRED field here would break every subsequent write to a document
+  // written before this field existed. Absent (`undefined`) on such a document — never defaulted
+  // to `null` at parse time — so a reader can tell "not suppressed"/"not applicable" (`null`)
+  // apart from "this document predates the field existing" (`undefined`, honestly rendered as
+  // such by `verdictExplain.ts` rather than guessed).
+  verdictReasonCode: verdictReasonCode.nullable().optional(),
 });
 export type MetricWithInterval = z.infer<typeof metricWithInterval>;
 

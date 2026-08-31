@@ -78,6 +78,12 @@ export const COLLECTIONS = {
   aiConversations: "aiConversations",
   accountMemory: "accountMemory",
   settings: "settings",
+
+  // D3.1's own — the versioned, operator-refreshed ad-optimization knowledge playbook (not one
+  // of §8's named collections; see shared/reasoner-adjacent shared/schema/ai.ts's sibling module
+  // services/reasoner/knowledge.ts for why this exists and how it's kept out of the live
+  // recommendation path). Keyed by its own `version` string — use directly, no helper needed.
+  adOptimizationKnowledge: "adOptimizationKnowledge",
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

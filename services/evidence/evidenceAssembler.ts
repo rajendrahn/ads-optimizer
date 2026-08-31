@@ -7,6 +7,7 @@
 import type {
   BudgetOwnership,
   EntityFeatures,
+  VerdictReasonCode,
   WindowLabel,
   WindowMetrics,
 } from "@shared/schema/index.ts";
@@ -48,6 +49,11 @@ interface RawMetricLike {
   intervalHigh: number | null;
   sampleSize: number;
   verdict: Verdict | null;
+  /** C3's own recorded reason a NOT_DISTINGUISHABLE verdict was forced (see
+   * `windowStatistics.ts`/`shared/schema/features.ts`). `undefined` on a document written before
+   * this field existed — passed straight through to `explainVerdict`, which renders that
+   * honestly rather than guessing. Never re-derived here. */
+  verdictReasonCode?: VerdictReasonCode | null;
 }
 
 function metricSnapshot(
@@ -55,8 +61,8 @@ function metricSnapshot(
   metric: RawMetricLike | undefined,
   target: number,
   minPurchaseFloor: number,
-  seasonality: { spansSeasonalBoundary: boolean; labels: readonly string[] } | undefined,
-  gap?: { windowHasDataGap: boolean; gapDays: readonly string[] },
+  seasonality: { labels: readonly string[] } | undefined,
+  gapDays?: readonly string[],
   /** Pass for a money metric so the explanation renders minor units as currency — see
    * `explainVerdict`'s `formatValue`. Omit for a ratio metric like ROAS. */
   formatValue?: (value: number) => string,
@@ -67,6 +73,7 @@ function metricSnapshot(
     intervalHigh: null,
     sampleSize: 0,
     verdict: null,
+    verdictReasonCode: null,
   };
   return {
     value: m.value,
@@ -82,10 +89,9 @@ function metricSnapshot(
       sampleSize: m.sampleSize,
       minPurchaseFloor,
       target,
-      spansSeasonalBoundary: seasonality?.spansSeasonalBoundary ?? false,
+      verdictReasonCode: m.verdictReasonCode,
       seasonalityLabels: seasonality?.labels ?? [],
-      windowHasDataGap: gap?.windowHasDataGap,
-      gapDays: gap?.gapDays,
+      gapDays,
       formatValue,
     }),
   };
@@ -132,7 +138,7 @@ function buildWindowEvidence(
       targets.targetRoas,
       floor,
       seasonality,
-      window.shopifyDataGap ?? undefined,
+      window.shopifyDataGap?.gapDays,
     ),
     shopifyRoasShrunk: window.shopifyRoasShrunk ?? null,
     shopifyDataGap: window.shopifyDataGap ?? null,

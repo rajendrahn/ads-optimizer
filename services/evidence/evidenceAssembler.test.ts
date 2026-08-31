@@ -203,11 +203,16 @@ describe("assembleScalingEvidence", () => {
     expect(Object.keys(evidence.evidence.windows).sort()).toEqual(["28d", "7d"]);
   });
 
-  it("explains a suppressed shopifyRoas verdict via its own data-gap reason", () => {
+  it("explains a suppressed shopifyRoas verdict via its own data-gap reason, read straight off the stored code", () => {
     const f = features({
       windows: {
         "28d": windowMetrics({
-          shopifyRoas: metric({ value: 0.4, sampleSize: 40, verdict: "NOT_DISTINGUISHABLE" }),
+          shopifyRoas: metric({
+            value: 0.4,
+            sampleSize: 40,
+            verdict: "NOT_DISTINGUISHABLE",
+            verdictReasonCode: "DATA_GAP",
+          }),
           shopifyDataGap: { windowHasDataGap: true, gapDays: ["2026-01-01"] },
         }),
       },
@@ -216,5 +221,42 @@ describe("assembleScalingEvidence", () => {
     const windowEvidence = evidence.evidence.windows["28d"];
     expect(windowEvidence).toBeDefined();
     expect(windowEvidence?.shopifyRoas.verdictReason).toMatch(/data gap/i);
+    expect(windowEvidence?.shopifyRoas.verdictReason).toContain("2026-01-01");
+  });
+
+  it("honestly reports an unrecorded reason for a metric with no verdictReasonCode (an older stored document)", () => {
+    const f = features({
+      windows: {
+        "28d": windowMetrics({
+          metaRoas: metric({ value: 5.0, sampleSize: 6, verdict: "NOT_DISTINGUISHABLE" }), // no verdictReasonCode
+        }),
+      },
+    });
+    const evidence = assembleScalingEvidence(baseInput({ features: f }));
+    const windowEvidence = evidence.evidence.windows["28d"];
+    expect(windowEvidence?.metaRoas.verdictReason).toMatch(/not recorded/i);
+  });
+
+  it("renders CPA's confident-verdict sentence in currency, not raw minor units — the money formatter this fix must not disturb", () => {
+    // 150_000 minor units target, [159_500, 194_863] minor-unit interval — a money metric where a
+    // naive .toFixed(2) default would print "150000" mid-sentence and contradict its own verdict
+    // (see explainVerdict's own `formatValue` doc comment). The CPA call site in
+    // evidenceAssembler.ts's buildWindowEvidence must keep passing formatMinorUnitsAsDecimal.
+    const f = features({
+      windows: {
+        "28d": windowMetrics({
+          cpa: metric({
+            value: 175_000,
+            intervalLow: 159_500,
+            intervalHigh: 194_863,
+            sampleSize: 128,
+            verdict: "ABOVE_TARGET",
+          }),
+        }),
+      },
+    });
+    const evidence = assembleScalingEvidence(baseInput({ features: f }));
+    const cpaReason = evidence.evidence.windows["28d"]?.cpaMinorUnits.verdictReason;
+    expect(cpaReason).toContain("the target of 1500.00 — interval [1595.00, 1948.63]");
   });
 });

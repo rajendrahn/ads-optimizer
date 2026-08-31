@@ -1,12 +1,24 @@
 // Reality #5: "a suppressed verdict's *reason* must be surfaced, not silently inherited." C3
-// already forces NOT_DISTINGUISHABLE for three distinct reasons (below the purchase floor, a
-// seasonal-boundary confound, or — for shopifyRoas only — a Shopify data-gap overlap), but the
-// stored verdict itself carries only the label, not which of the three applies. This module
-// reconstructs the reason from the same inputs C3's own windowStatistics.ts used, so D2 can
-// render "we cannot tell" and "we cannot tell BECAUSE half this window has no Shopify data" as
-// the different answers they are.
+// forces NOT_DISTINGUISHABLE for three distinct reasons (below the purchase floor, a
+// seasonal-boundary confound, or — for shopifyRoas only — a Shopify data-gap overlap).
+//
+// Which of the three applies is decided ONCE, by C3's own `windowStatistics.ts`, at the exact
+// point the suppression happens, and stored on the metric as `verdictReasonCode`
+// (`shared/schema/features.ts`). This module's job is ONLY to render that stored code into
+// prose — it does NOT re-derive the decision from sample sizes/booleans. It used to (see
+// IMPLEMENTATION_PLAN.md D1's orchestrator note): a second copy of C3's priority order, kept in
+// sync only by convention, one bug fix away from attaching a confidently wrong explanation to a
+// correct verdict. That copy is gone; `ExplainVerdictInput` no longer even accepts the raw
+// `spansSeasonalBoundary`/`windowHasDataGap` booleans a caller might otherwise be tempted to
+// recompute a decision from — only the labels/day-lists needed to render the ALREADY-DECIDED
+// reason into a sentence.
+//
+// `verdictReasonCode` can also be `undefined` — a document written before this field existed
+// (an older stored `EntityFeatures` doc; see the schema's own optional-field note, A2's
+// version-guard constraint). That is handled honestly below, not guessed at.
 
 import type { Verdict } from "@services/analytics/statistics/index.ts";
+import type { VerdictReasonCode } from "@shared/schema/index.ts";
 
 export interface ExplainVerdictInput {
   /** Human label for the metric, used only in the sentence — e.g. "Meta ROAS", "CPA (Meta)",
@@ -19,11 +31,18 @@ export interface ExplainVerdictInput {
   sampleSize: number;
   minPurchaseFloor: number;
   target: number;
-  spansSeasonalBoundary: boolean;
+  /** C3's own recorded reason a NOT_DISTINGUISHABLE verdict was forced — see the module comment.
+   * `null` means NOT_DISTINGUISHABLE for a genuine reason none of C3's three rules cover (the
+   * interval itself straddles the target) or the metric isn't NOT_DISTINGUISHABLE at all.
+   * `undefined` means an older stored document that predates this field — rendered as an honest
+   * "not recorded", never guessed. Ignored entirely when `verdict !== "NOT_DISTINGUISHABLE"`. */
+  verdictReasonCode?: VerdictReasonCode | null;
+  /** Only used to name the actual seasonal label(s) in the sentence when
+   * `verdictReasonCode === "SEASONAL_BOUNDARY"` — never used to decide whether that's the
+   * reason. */
   seasonalityLabels: readonly string[];
-  /** Only meaningful for shopifyRoas — C3 never gates metaRoas/cpa on the Shopify gap (reality
-   * #4/#5: the gap is Shopify-only). */
-  windowHasDataGap?: boolean;
+  /** Only used to name the actual gap day(s) in the sentence when
+   * `verdictReasonCode === "DATA_GAP"` — never used to decide whether that's the reason. */
   gapDays?: readonly string[];
   /** How to render `target` and the interval bounds as text. Defaults to a plain 2-decimal
    * number, which is right for a ratio metric like ROAS ("above the target of 3.00").
@@ -74,17 +93,27 @@ export function explainVerdict(input: ExplainVerdictInput): string {
     );
   }
 
-  // NOT_DISTINGUISHABLE — determine which of C3's three suppression reasons actually applies,
-  // checked in the same priority order windowStatistics.ts applies them (floor, then season,
-  // then — shopifyRoas only — the data gap).
-  if (input.sampleSize < input.minPurchaseFloor) {
+  // NOT_DISTINGUISHABLE — render the reason C3 already decided and stored, per-code. This is a
+  // RENDER switch, not a decision: it does not look at sampleSize/minPurchaseFloor/gap booleans
+  // to figure out which case applies — `verdictReasonCode` already says so.
+  if (input.verdictReasonCode === undefined) {
+    // An older stored document, written before C3 recorded this field — see the module comment.
+    // Honest about not knowing, never a guessed reason (which is exactly the failure mode the
+    // old re-derivation logic risked once C3's thresholds/ordering drifted from this module's).
+    return (
+      `${label} verdict is NOT_DISTINGUISHABLE — the specific reason was not recorded for this ` +
+      `window (it predates per-window suppression-reason tracking). Treat this as "we cannot ` +
+      `tell", without a stated cause; a fresh recompute will carry the reason going forward.`
+    );
+  }
+  if (input.verdictReasonCode === "BELOW_FLOOR") {
     return (
       `${label} verdict is NOT_DISTINGUISHABLE — only ${input.sampleSize} purchase` +
       `${input.sampleSize === 1 ? "" : "s"} in this window, below the ${input.minPurchaseFloor}-` +
       `purchase floor needed for a confident read at this window length.`
     );
   }
-  if (input.spansSeasonalBoundary) {
+  if (input.verdictReasonCode === "SEASONAL_BOUNDARY") {
     const labels =
       input.seasonalityLabels.length > 0 ? input.seasonalityLabels.join(", ") : "a labelled window";
     return (
@@ -93,7 +122,7 @@ export function explainVerdict(input: ExplainVerdictInput): string {
       `only a trend comparison.`
     );
   }
-  if (input.windowHasDataGap) {
+  if (input.verdictReasonCode === "DATA_GAP") {
     const days =
       input.gapDays && input.gapDays.length > 0
         ? input.gapDays.slice(0, 3).join(", ")
@@ -106,6 +135,8 @@ export function explainVerdict(input: ExplainVerdictInput): string {
       `real revenue collapse; never treat it as a genuine low-performance signal.`
     );
   }
+  // verdictReasonCode === null — a genuine "interval straddles target" read, none of C3's three
+  // suppression rules in play.
   return (
     `${label} verdict is NOT_DISTINGUISHABLE — the confidence interval ` +
     `${formatInterval(input.intervalLow, input.intervalHigh, fmt)} straddles the target of ${fmt(input.target)} ` +

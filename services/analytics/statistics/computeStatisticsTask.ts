@@ -61,7 +61,10 @@ function parsePayload(raw: unknown): ComputeStatisticsPayload {
 // bypasses the typed repository's full-document `set()` (deliberately — see module comment), so
 // this is the one place a malformed patch would otherwise go undetected. Built from the SAME
 // `metricWithInterval` schema C2's own windows use, `.omit()`-ing the two fields this task never
-// touches (`value`, `sampleSize` — both stay exactly as C2 wrote them).
+// touches (`value`, `sampleSize` — both stay exactly as C2 wrote them). `verdict` and the newer
+// `verdictReasonCode` (IMPLEMENTATION_PLAN.md D1's orchestrator-note fix: `windowStatistics.ts`
+// now records WHY a verdict was suppressed at the point of decision, not just the label) both
+// flow through automatically since neither is omitted.
 const metricStatOnlySchema = metricWithInterval.omit({ value: true, sampleSize: true });
 const windowStatisticsWriteSchema = z.object({
   purchases: z.object({
@@ -101,18 +104,21 @@ function toWritePatch(stats: WindowStatisticsPatch): z.infer<typeof windowStatis
       intervalLow: finiteOrNull(stats.metaRoas.intervalLow),
       intervalHigh: finiteOrNull(stats.metaRoas.intervalHigh),
       verdict: stats.metaRoas.verdict,
+      verdictReasonCode: stats.metaRoas.verdictReasonCode,
     },
     metaRoasShrunk: finiteOrNull(stats.metaRoasShrunk),
     shopifyRoas: {
       intervalLow: finiteOrNull(stats.shopifyRoas.intervalLow),
       intervalHigh: finiteOrNull(stats.shopifyRoas.intervalHigh),
       verdict: stats.shopifyRoas.verdict,
+      verdictReasonCode: stats.shopifyRoas.verdictReasonCode,
     },
     shopifyRoasShrunk: finiteOrNull(stats.shopifyRoasShrunk),
     cpa: {
       intervalLow: finiteOrNull(stats.cpa.intervalLow),
       intervalHigh: finiteOrNull(stats.cpa.intervalHigh),
       verdict: stats.cpa.verdict,
+      verdictReasonCode: stats.cpa.verdictReasonCode,
     },
   };
   return windowStatisticsWriteSchema.parse(patch);

@@ -11,7 +11,7 @@ function base(overrides: Partial<ExplainVerdictInput> = {}): ExplainVerdictInput
     sampleSize: 40,
     minPurchaseFloor: 30,
     target: 3.0,
-    spansSeasonalBoundary: false,
+    verdictReasonCode: null,
     seasonalityLabels: [],
     ...overrides,
   };
@@ -36,25 +36,31 @@ describe("explainVerdict", () => {
     expect(text).toMatch(/confidently below/i);
   });
 
-  it("attributes NOT_DISTINGUISHABLE to insufficient volume when below the floor", () => {
-    const text = explainVerdict(base({ sampleSize: 6, minPurchaseFloor: 30 }));
+  it("renders the stored BELOW_FLOOR reason code without recomputing it from sampleSize", () => {
+    const text = explainVerdict(
+      base({ sampleSize: 6, minPurchaseFloor: 30, verdictReasonCode: "BELOW_FLOOR" }),
+    );
     expect(text).toMatch(/insufficient volume|below the 30-purchase floor/i);
   });
 
-  it("attributes NOT_DISTINGUISHABLE to a seasonal boundary when the sample clears the floor", () => {
+  it("renders the stored SEASONAL_BOUNDARY reason code, naming the actual label", () => {
     const text = explainVerdict(
-      base({ sampleSize: 40, spansSeasonalBoundary: true, seasonalityLabels: ["diwali"] }),
+      base({
+        sampleSize: 40,
+        verdictReasonCode: "SEASONAL_BOUNDARY",
+        seasonalityLabels: ["diwali"],
+      }),
     );
     expect(text).toMatch(/seasonal boundary/i);
     expect(text).toContain("diwali");
   });
 
-  it("attributes NOT_DISTINGUISHABLE to a Shopify data gap when neither floor nor season applies", () => {
+  it("renders the stored DATA_GAP reason code, naming the actual gap days", () => {
     const text = explainVerdict(
       base({
         label: "Shopify ROAS",
         sampleSize: 40,
-        windowHasDataGap: true,
+        verdictReasonCode: "DATA_GAP",
         gapDays: ["2026-01-01", "2026-01-02"],
       }),
     );
@@ -62,8 +68,31 @@ describe("explainVerdict", () => {
     expect(text).toContain("2026-01-01");
   });
 
-  it("falls back to a genuine 'interval straddles target' explanation with none of the above", () => {
-    const text = explainVerdict(base({ sampleSize: 40 }));
+  it("falls back to a genuine 'interval straddles target' explanation when the reason code is null", () => {
+    const text = explainVerdict(base({ sampleSize: 40, verdictReasonCode: null }));
     expect(text).toMatch(/genuinely inconclusive/i);
+  });
+
+  it("trusts the stored reason code even when the raw sample size would suggest a different one — proves it renders rather than recomputes", () => {
+    // sampleSize is well below minPurchaseFloor, which the OLD re-derivation logic would have
+    // read as BELOW_FLOOR regardless of what actually happened. The stored code says otherwise
+    // (DATA_GAP), and that must win — this module has no business overruling C3's own decision.
+    const text = explainVerdict(
+      base({
+        label: "Shopify ROAS",
+        sampleSize: 2,
+        minPurchaseFloor: 30,
+        verdictReasonCode: "DATA_GAP",
+        gapDays: ["2026-01-05"],
+      }),
+    );
+    expect(text).toMatch(/data gap/i);
+    expect(text).not.toMatch(/purchase floor/i);
+  });
+
+  it("honestly reports an unrecorded reason for an older stored document (verdictReasonCode undefined), never guessing one", () => {
+    const text = explainVerdict(base({ sampleSize: 6, verdictReasonCode: undefined }));
+    expect(text).toMatch(/not recorded/i);
+    expect(text).not.toMatch(/purchase floor|seasonal boundary|data gap/i);
   });
 });

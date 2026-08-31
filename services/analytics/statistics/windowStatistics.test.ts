@@ -51,6 +51,9 @@ describe("computeWindowStatistics", () => {
     // The raw number is still there, visible, just not endorsed as a confident verdict.
     expect(stats.metaRoas.intervalLow).not.toBeNull();
     expect(stats.metaRoas.intervalHigh).not.toBeNull();
+    // The reason is recorded HERE, at the point of decision — this is what D1's verdictExplain
+    // renders, rather than re-deriving.
+    expect(stats.metaRoas.verdictReasonCode).toBe("BELOW_FLOOR");
   });
 
   it("clears the floor with real volume and a clearly-separated target -> ABOVE_TARGET", () => {
@@ -64,6 +67,9 @@ describe("computeWindowStatistics", () => {
     // CPA of 50,000 vs a 150,000 target, same high volume -> confidently BELOW_TARGET (literal
     // interval position — also the "good" outcome for CPA specifically).
     expect(stats.cpa.verdict).toBe("BELOW_TARGET");
+    // A confident verdict never carries a suppression reason code.
+    expect(stats.metaRoas.verdictReasonCode).toBeNull();
+    expect(stats.cpa.verdictReasonCode).toBeNull();
   });
 
   it("high volume, ROAS clearly below target -> BELOW_TARGET", () => {
@@ -96,6 +102,9 @@ describe("computeWindowStatistics", () => {
     expect(stats.shopifyRoas.verdict).toBe("NOT_DISTINGUISHABLE");
     // The number itself is still carried, never suppressed.
     expect(stats.shopifyRoas.intervalLow).not.toBeNull();
+    // High volume (200, above the 30 floor) and no seasonal boundary — the gap is the only
+    // possible reason, and it must be recorded as such, not left for a reader to guess.
+    expect(stats.shopifyRoas.verdictReasonCode).toBe("DATA_GAP");
   });
 
   it("gap suppression is Shopify-only — metaRoas/cpa in the same window are unaffected", () => {
@@ -110,6 +119,10 @@ describe("computeWindowStatistics", () => {
     expect(stats.metaRoas.verdict).toBe("ABOVE_TARGET");
     expect(stats.cpa.verdict).toBe("BELOW_TARGET");
     expect(stats.shopifyRoas.verdict).toBe("NOT_DISTINGUISHABLE");
+    // metaRoas/cpa are never gated by the Shopify gap, so neither ever gets DATA_GAP as a reason.
+    expect(stats.metaRoas.verdictReasonCode).toBeNull();
+    expect(stats.cpa.verdictReasonCode).toBeNull();
+    expect(stats.shopifyRoas.verdictReasonCode).toBe("DATA_GAP");
   });
 
   it("never emits a confident verdict when the window spans a seasonal boundary, for ANY metric", () => {
@@ -132,6 +145,11 @@ describe("computeWindowStatistics", () => {
     expect(stats.shopifyRoas.verdict).toBe("NOT_DISTINGUISHABLE");
     // Still carries the numbers — seasonality context sits beside the metric, never mutates it.
     expect(stats.metaRoas.intervalLow).not.toBeNull();
+    // High volume, well clear of the floor, no gap on this window — the seasonal boundary is
+    // the only applicable reason for every metric, including shopifyRoas.
+    expect(stats.metaRoas.verdictReasonCode).toBe("SEASONAL_BOUNDARY");
+    expect(stats.cpa.verdictReasonCode).toBe("SEASONAL_BOUNDARY");
+    expect(stats.shopifyRoas.verdictReasonCode).toBe("SEASONAL_BOUNDARY");
   });
 
   it("a null value (e.g. an audit-unresolvable ad) stays fully null, never coerced to NOT_DISTINGUISHABLE", () => {
@@ -141,6 +159,8 @@ describe("computeWindowStatistics", () => {
     expect(stats.shopifyRoas.intervalLow).toBeNull();
     expect(stats.shopifyRoas.intervalHigh).toBeNull();
     expect(stats.shopifyRoasShrunk).toBeNull();
+    // Unmeasured, not suppressed — no reason code either.
+    expect(stats.shopifyRoas.verdictReasonCode).toBeNull();
   });
 
   it("a real, exact zero-purchase observation is a confident NOT_DISTINGUISHABLE, not null", () => {
@@ -149,6 +169,41 @@ describe("computeWindowStatistics", () => {
     expect(stats.metaRoas.verdict).toBe("NOT_DISTINGUISHABLE");
     expect(stats.metaRoas.intervalLow).toBeNull();
     expect(stats.metaRoas.intervalHigh).toBeNull();
+    // n=0 is below any positive floor, so the reason code still follows the same priority order.
+    expect(stats.metaRoas.verdictReasonCode).toBe("BELOW_FLOOR");
+  });
+
+  it("priority order: below-floor wins over a seasonal boundary even when both apply", () => {
+    const w = window({
+      metaRoas: metric(5.0, 6), // below the 30-purchase floor
+      seasonality: {
+        labels: ["diwali"],
+        spansSeasonalBoundary: true,
+        demandIndex: null,
+        demandIndexSampleSize: 1,
+        summaryText: "window covers diwali; baseline does not",
+      },
+    });
+    const stats = computeWindowStatistics(w, ACCOUNT_MEANS, THRESHOLDS);
+    expect(stats.metaRoas.verdict).toBe("NOT_DISTINGUISHABLE");
+    expect(stats.metaRoas.verdictReasonCode).toBe("BELOW_FLOOR");
+  });
+
+  it("priority order: a seasonal boundary wins over a Shopify gap for shopifyRoas when both apply", () => {
+    const w = window({
+      shopifyRoas: metric(9.0, 200), // well above the floor
+      shopifyDataGap: { windowHasDataGap: true, gapDays: ["2026-01-05"] },
+      seasonality: {
+        labels: ["diwali"],
+        spansSeasonalBoundary: true,
+        demandIndex: null,
+        demandIndexSampleSize: 1,
+        summaryText: "window covers diwali; baseline does not",
+      },
+    });
+    const stats = computeWindowStatistics(w, ACCOUNT_MEANS, THRESHOLDS);
+    expect(stats.shopifyRoas.verdict).toBe("NOT_DISTINGUISHABLE");
+    expect(stats.shopifyRoas.verdictReasonCode).toBe("SEASONAL_BOUNDARY");
   });
 
   it("purchases carries an interval but never a verdict — there is no target for a raw count", () => {

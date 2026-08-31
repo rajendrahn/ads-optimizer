@@ -385,6 +385,10 @@ describe("COMPUTE_STATISTICS over real RECOMPUTE_FEATURES output (emulator)", ()
     expect(normalWindow.metaRoas.value).toBeCloseTo(4.0, 5);
     expect(normalWindow.purchases.sampleSize).toBe(20);
     expect(normalWindow.metaRoas.verdict).toBe("NOT_DISTINGUISHABLE");
+    // The reason travels through the real Firestore round-trip too, not just in-memory — this is
+    // what IMPLEMENTATION_PLAN.md D1's orchestrator-note fix relies on (D1's verdictExplain
+    // renders this stored code rather than re-deriving it from sampleSize/floor).
+    expect(normalWindow.metaRoas.verdictReasonCode).toBe("BELOW_FLOOR");
 
     // --- The lucky ad: raw ROAS 8.0 on n=5 -> also NOT_DISTINGUISHABLE (done-when #1). ---
     const luckyDoc = await db.collection(COLLECTIONS.adFeatures).doc("ad_lucky").get();
@@ -392,6 +396,7 @@ describe("COMPUTE_STATISTICS over real RECOMPUTE_FEATURES output (emulator)", ()
     expect(luckyWindow.metaRoas.value).toBeCloseTo(8.0, 5);
     expect(luckyWindow.purchases.sampleSize).toBe(5);
     expect(luckyWindow.metaRoas.verdict).toBe("NOT_DISTINGUISHABLE");
+    expect(luckyWindow.metaRoas.verdictReasonCode).toBe("BELOW_FLOOR");
 
     // --- Shrinkage (done-when #2): shrunk value sits strictly between the raw 8.0 and the real
     // account mean, matching the documented n/(n+floor) weighted-average formula exactly. ---
@@ -415,6 +420,8 @@ describe("COMPUTE_STATISTICS over real RECOMPUTE_FEATURES output (emulator)", ()
     );
     expect(adsetWindow.metaRoas.verdict).not.toBe(null);
     expect(["ABOVE_TARGET", "BELOW_TARGET"]).toContain(adsetWindow.metaRoas.verdict);
+    // A confident verdict never carries a suppression reason code.
+    expect(adsetWindow.metaRoas.verdictReasonCode).toBeNull();
   });
 
   it("never emits a confident shopifyRoas verdict on a window overlapping the real Shopify data gap", async () => {
@@ -474,6 +481,10 @@ describe("COMPUTE_STATISTICS over real RECOMPUTE_FEATURES output (emulator)", ()
     expect(window28d.cpa.verdict).toBe("NOT_DISTINGUISHABLE");
     // The number itself is still carried, never hidden.
     expect(window28d.metaRoas.intervalLow).not.toBeNull();
+    // High volume, well above the floor, no gap on this window — the seasonal boundary is the
+    // only applicable reason, recorded through the real Firestore round-trip.
+    expect(window28d.metaRoas.verdictReasonCode).toBe("SEASONAL_BOUNDARY");
+    expect(window28d.cpa.verdictReasonCode).toBe("SEASONAL_BOUNDARY");
   });
 
   it("is idempotent — re-running COMPUTE_STATISTICS without a new recompute reproduces the same figures", async () => {

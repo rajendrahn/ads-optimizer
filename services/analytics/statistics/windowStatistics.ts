@@ -29,7 +29,7 @@
 // codebase is "carry the number, flag it, never suppress it", and the gap/seasonality context
 // already sits right next to these fields in the same window object for exactly this reason.
 
-import type { WindowMetrics } from "@shared/schema/index.ts";
+import type { VerdictReasonCode, WindowMetrics } from "@shared/schema/index.ts";
 import { poissonCountInterval, scaleIntervalByCount } from "./interval.ts";
 import { computeVerdict, type Verdict } from "./verdict.ts";
 import { shrinkTowardAccountMean } from "./shrinkage.ts";
@@ -50,6 +50,12 @@ export interface MetricStatPatch {
   intervalLow: number | null;
   intervalHigh: number | null;
   verdict: Verdict | null;
+  /** WHY `verdict` is `NOT_DISTINGUISHABLE`, recorded HERE at the point of decision — see the
+   * module comment and `shared/schema/features.ts`'s `verdictReasonCode` doc comment. `null` for
+   * a confident verdict, an unmeasured value, or a NOT_DISTINGUISHABLE verdict none of the three
+   * rules forced (the interval genuinely straddles the target). Never `undefined` — this is a
+   * freshly computed in-memory patch, not a possibly-older stored document. */
+  verdictReasonCode: VerdictReasonCode | null;
 }
 
 export interface WindowStatisticsPatch {
@@ -62,16 +68,37 @@ export interface WindowStatisticsPatch {
 }
 
 function nullMetricPatch(): MetricStatPatch {
-  return { intervalLow: null, intervalHigh: null, verdict: null };
+  return { intervalLow: null, intervalHigh: null, verdict: null, verdictReasonCode: null };
 }
 
 /**
- * One metric's interval + verdict. `value === null` (C2's "not measured", e.g. an audit-
- * unresolvable ad, or zero Meta spend) always stays fully `null` — never coerced into a
- * NOT_DISTINGUISHABLE verdict, which would misrepresent "we didn't measure this" as "we measured
- * it and couldn't tell". `n === 0` is different: a real, exact zero-purchase observation, which
- * IS a confident (if uninformative) verdict — NOT_DISTINGUISHABLE, not null — but has no honest
- * ratio-based interval to report, so its bounds stay null while the verdict does not.
+ * Which suppression rule applies, in the fixed priority order the module comment documents
+ * (floor, then season, then — shopifyRoas only, via `windowHasDataGap` always being `false` for
+ * metaRoas/cpa callers — the Shopify gap). This is the ONE place that priority order is encoded;
+ * `verdictExplain.ts` used to replicate it independently from the same three booleans (the
+ * fragility IMPLEMENTATION_PLAN.md D1's orchestrator note flagged) — it now only renders the code
+ * this function returns.
+ */
+function reasonCodeFor(
+  belowFloor: boolean,
+  spansSeasonalBoundary: boolean,
+  windowHasDataGap: boolean,
+): VerdictReasonCode | null {
+  if (belowFloor) return "BELOW_FLOOR";
+  if (spansSeasonalBoundary) return "SEASONAL_BOUNDARY";
+  if (windowHasDataGap) return "DATA_GAP";
+  return null;
+}
+
+/**
+ * One metric's interval + verdict + (when suppressed) the reason recorded at the point of
+ * decision. `value === null` (C2's "not measured", e.g. an audit-unresolvable ad, or zero Meta
+ * spend) always stays fully `null` — never coerced into a NOT_DISTINGUISHABLE verdict, which
+ * would misrepresent "we didn't measure this" as "we measured it and couldn't tell". `n === 0` is
+ * different: a real, exact zero-purchase observation, which IS a confident (if uninformative)
+ * verdict — NOT_DISTINGUISHABLE, not null — but has no honest ratio-based interval to report, so
+ * its bounds stay null while the verdict does not; its reason code still follows the same
+ * priority order (typically `BELOW_FLOOR`, since `n === 0` is below any positive floor).
  */
 function evaluateMetric(
   value: number | null,
@@ -79,19 +106,35 @@ function evaluateMetric(
   target: number,
   direction: "increasingWithCount" | "decreasingWithCount",
   z: number,
-  suppressConfidentVerdict: boolean,
+  belowFloor: boolean,
+  spansSeasonalBoundary: boolean,
+  windowHasDataGap: boolean,
 ): MetricStatPatch {
   if (value === null) return nullMetricPatch();
   if (n === 0) {
-    return { intervalLow: null, intervalHigh: null, verdict: "NOT_DISTINGUISHABLE" };
+    return {
+      intervalLow: null,
+      intervalHigh: null,
+      verdict: "NOT_DISTINGUISHABLE",
+      verdictReasonCode: reasonCodeFor(belowFloor, spansSeasonalBoundary, windowHasDataGap),
+    };
   }
   const countInterval = poissonCountInterval(n, z);
   if (countInterval === null) return nullMetricPatch(); // defensive; unreachable for finite n > 0, z > 0
   const scaled = scaleIntervalByCount(value, n, countInterval, direction);
-  const verdict = suppressConfidentVerdict
+  const suppress = belowFloor || spansSeasonalBoundary || windowHasDataGap;
+  const verdict = suppress
     ? "NOT_DISTINGUISHABLE"
     : computeVerdict(scaled.low, scaled.high, target);
-  return { intervalLow: scaled.low, intervalHigh: scaled.high, verdict };
+  // Only a SUPPRESSED NOT_DISTINGUISHABLE carries a reason code — a NOT_DISTINGUISHABLE verdict
+  // `computeVerdict` reached on its own (the interval genuinely straddles the target, none of the
+  // three rules in play) is a real, different answer and gets `null`, rendered by
+  // `verdictExplain.ts` as "genuinely inconclusive", never a fabricated cause.
+  const verdictReasonCode =
+    verdict === "NOT_DISTINGUISHABLE"
+      ? reasonCodeFor(belowFloor, spansSeasonalBoundary, windowHasDataGap)
+      : null;
+  return { intervalLow: scaled.low, intervalHigh: scaled.high, verdict, verdictReasonCode };
 }
 
 export function computeWindowStatistics(
@@ -116,7 +159,9 @@ export function computeWindowStatistics(
     thresholds.targetRoas,
     "increasingWithCount",
     thresholds.intervalZScore,
-    metaBelowFloor || spansSeasonalBoundary,
+    metaBelowFloor,
+    spansSeasonalBoundary,
+    false, // the Shopify gap never gates a Meta-sourced metric — see module comment, rule 1
   );
   const metaRoasShrunk = shrinkTowardAccountMean(
     window.metaRoas?.value ?? null,
@@ -131,7 +176,9 @@ export function computeWindowStatistics(
     thresholds.targetCpaMinorUnits,
     "decreasingWithCount",
     thresholds.intervalZScore,
-    metaBelowFloor || spansSeasonalBoundary,
+    metaBelowFloor,
+    spansSeasonalBoundary,
+    false, // Meta-sourced, same as metaRoas
   );
 
   // shopifyRoas uses ITS OWN sample size (this entity's Shopify-attributed order count for this
@@ -149,7 +196,9 @@ export function computeWindowStatistics(
     thresholds.targetRoas,
     "increasingWithCount",
     thresholds.intervalZScore,
-    shopifyBelowFloor || spansSeasonalBoundary || windowHasDataGap,
+    shopifyBelowFloor,
+    spansSeasonalBoundary,
+    windowHasDataGap,
   );
   const shopifyRoasShrunk = shrinkTowardAccountMean(
     window.shopifyRoas?.value ?? null,

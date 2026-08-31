@@ -5,6 +5,7 @@
   "scripts": {
     "verify-credentials": "tsx scripts/verify-credentials.ts",
     "verify-a4-clients": "tsx scripts/verify-a4-clients.ts",
+    "verify-d3-reasoner": "firebase emulators:exec --only firestore \"tsx scripts/verify-d3-reasoner.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p functions/tsconfig.json",
     "lint": "eslint .",
     "format": "prettier --write .",
@@ -15,6 +16,7 @@
     "emulators": "firebase emulators:start --only firestore,auth,functions"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.122.0",
     "@google-cloud/secret-manager": "^5.6.0",
     "@google-cloud/storage": "^8.0.1",
     "@google-cloud/tasks": "^7.0.0",

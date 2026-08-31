@@ -56,6 +56,9 @@ describe("COLLECTIONS", () => {
       "aiConversations",
       "accountMemory",
       "settings",
+      // D3.1's own — the versioned, operator-refreshed ad-optimization knowledge playbook, see
+      // services/reasoner/knowledge.ts's module comment.
+      "adOptimizationKnowledge",
     ] as const;
     expect(Object.keys(COLLECTIONS).sort()).toEqual([...names].sort());
     for (const name of names) {
