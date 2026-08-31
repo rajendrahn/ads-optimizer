@@ -3649,7 +3649,18 @@ By the end of this phase the system answers one question well. That is the miles
 
 ### D1 — Scaling evidence engine
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+689/689 unit tests, up from C5's baseline — this step's own 49 new unit tests across
+`services/evidence/{budgetOwnerResolution,deliveryCheck,verdictExplain,eligibility,recentChanges,
+evidenceAssembler}.test.ts`). `npm run test:integration` passes 236/236 against a real Firestore
+emulator (up from 232 pre-D1 — this step's own 4 new emulator tests in
+`scalingEvidenceEngine.emulator.test.ts`, each running the REAL, unmodified `RECOMPUTE_FEATURES`
+→ `COMPUTE_STATISTICS` → `ENRICH_CHANGE_FEATURES` task chain over seeded raw rows, then this
+step's own `resolveScalingEvidence` on whatever that chain wrote — not hand-built `EntityFeatures`
+fixtures). No live/production Firestore was touched (emulator only); no live Meta/Shopify call was
+made; no cloud resource was created/modified/deployed; no npm dependency was added. See Notes
+below for the evidence object's shape, the three-way escalation/not-delivering/no-decision-unit
+split, and how a suppressed verdict's reason travels into the evidence.
 **Depends on:** C3, C4
 **Design refs:** §4, §14
 
@@ -3669,6 +3680,264 @@ By the end of this phase the system answers one question well. That is the miles
 
 **Done when.** The §14 evidence object is produced for a real ad set; a low-volume ad produces an escalated
 answer naming the ad set and the reason.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/evidence/{types,budgetOwnerResolution,deliveryCheck,
+  verdictExplain,eligibility,recentChanges,entityLookup,evidenceAssembler,scalingEvidenceEngine,
+  index}.ts`, each with a co-located `*.test.ts` except `entityLookup.ts` (thin Firestore glue,
+  exercised only through the emulator test) and `scalingEvidenceEngine.ts` (the orchestrator,
+  exercised only through `scalingEvidenceEngine.emulator.test.ts`). **No new task type was
+  registered** — D1 is a synchronous, on-demand query function (`resolveScalingEvidence({db,
+  namedEntity})`), not a Cloud Tasks job; it reads only already-computed collections and makes no
+  live call and no write of any kind. This is a deliberate reading of the step's own "Register any
+  task via `createDefaultRegistry()`" instruction: nothing here is a *task* in §10.2's sense (a
+  scheduled/queued unit of ingestion or recompute work) — it is the read-side D2/D3 will call
+  directly, the same way `computeVerdict`/`shrinkTowardAccountMean` (C3) are plain functions, not
+  tasks. Flagging this explicitly rather than silently diverging, per §0.2's own instruction.
+
+- **The public entry point and result shape.** `resolveScalingEvidence({db, namedEntity:
+  {type:"AD"|"ADSET"|"CAMPAIGN", id}}): Promise<ScalingEvidenceResult>`, where
+  `ScalingEvidenceResult` is a discriminated union on `outcome`:
+  - `{outcome:"NO_DECISION_UNIT", namedEntity, detail}` — reality #3, budget ownership is
+    genuinely `UNKNOWN` (or, D1's own extension of the same principle, a named CAMPAIGN defers to
+    *more than one* independently-owning ad set — see below).
+  - `{outcome:"NOT_DELIVERING", namedEntity, decisionUnit, decisionUnitName, escalatedFrom?,
+    primaryWindow, detail}` — reality #2, the resolved decision unit has zero Meta spend AND zero
+    impressions in the primary 28d window (or no feature doc at all yet).
+  - `{outcome:"EVIDENCE", evidence: ScalingEvidence}` — the §14 object, described below.
+  Three outcomes, not one always-populated shape with a lot of nulled-out fields — D2 branches on
+  `outcome` first, exactly the way the orchestrator's own three-way framing ("escalate / not
+  delivering / no identifiable decision unit") reads.
+
+- **§4.1 rule 1 — decision-unit resolution (`budgetOwnerResolution.ts`, pure, no Firestore).**
+  `resolveDecisionUnit({namedEntity, ad?, adset?, campaign?, childAdsetBudgets?,
+  adPrimaryWindowSampleSize?, adPrimaryWindowMinPurchaseFloor?})` is a pure dispatch on
+  `namedEntity.type`, built directly against B2's real, live-measured
+  `budgetOwnership.ts` semantics (campaign/ad-set `.budget` fields are `BudgetOwnership | null`,
+  never a bare boolean):
+  - **AD** — always escalates. Meta's model gives an ad no budget of its own (B2's live
+    0-of-1,139 finding), so an AD-named request necessarily resolves via its ad set/campaign, with
+    `escalatedFrom.reason` = `"SAMPLE_TOO_SMALL"` when the ad's own primary-window purchase count
+    (read from `adFeatures/{adId}`, if it exists) is below the window's floor, else
+    `"AD_NOT_BUDGET_OWNER"` (the ad simply has no budget of its own regardless of its own volume —
+    the structural case, and the honest fallback when the ad's own volume is unknown, e.g. a
+    brand-new ad with no feature doc yet).
+  - **ADSET** — resolves to itself if its own `.budget.ownerLevel === "ADSET"`; escalates to its
+    campaign (`reason: "ADSET_NOT_BUDGET_OWNER"`) if the campaign owns budget instead (CBO); is
+    `NO_DECISION_UNIT` if neither resolves (§4.1's own "budget ownership can legitimately be
+    UNKNOWN").
+  - **CAMPAIGN** — resolves to itself if it owns budget outright; if it defers (`.budget === null`),
+    **queries every child ad set's own `.budget`** (`loadChildAdsetBudgets`, a single-field
+    `campaignId ==` equality query, no composite index needed) rather than assuming B2's own
+    per-campaign "does ANY ad set own budget" check is enough: if exactly one child ad set owns
+    budget, that's the decision unit (`escalatedFrom.reason: "CAMPAIGN_NOT_BUDGET_OWNER"`); if
+    **more than one** independently owns budget (a real possibility under ABO that B2's
+    `determineCampaignBudgetGivenChildren` never had to distinguish, since it only checks "any",
+    not "exactly one"), this is treated as `NO_DECISION_UNIT` too — a D1-specific, explicitly
+    reasoned extension of §4.1's own "do not guess a level" principle: more than one owner is
+    exactly as unresolvable as none, and picking one arbitrarily would be a guess dressed up as an
+    answer. 15 unit tests (`budgetOwnerResolution.test.ts`) cover every branch, including this
+    multiple-owner extension.
+
+- **Reality #2 — "not delivering" is checked BEFORE any verdict is trusted, on the resolved
+  decision unit, not the named entity.** `deliveryCheck.ts`'s `isDelivering(window)` is
+  `spendMinorUnits > 0 || impressions > 0` (never inferred from purchase count — a delivering-but-
+  zero-purchase entity is a real, different, and legitimately BELOW_TARGET case, not "off").
+  `scalingEvidenceEngine.ts` calls this on the DECISION UNIT's own primary-window features
+  immediately after resolution and before any eligibility/verdict logic runs — an entity with no
+  feature doc at all (RECOMPUTE_FEATURES has never reached it) is treated identically to a
+  zero-delivery one, never assumed to be "probably fine". This directly implements the
+  orchestrator's C4-review finding ("segment on actual delivery first... an entity with no delivery
+  is 'not delivering', a different and more useful answer than an escalated verdict") — critically,
+  the check runs on the ad set/campaign the request actually resolved to, AFTER escalation, not on
+  the originally-named entity, so escalating a low-volume ad into a genuinely dead ad set still
+  correctly reports NOT_DELIVERING rather than fabricating a confident verdict from zero rows.
+
+- **The §14 evidence object's shape, and what D2 needs to know about it.**
+  `ScalingEvidence` (`types.ts`) is a superset of §14's literal worked-example JSON, not a
+  reinterpretation of it — every field the design's own example names is present at the exact
+  same path (`decisionUnit`, `escalatedFrom`, `eligibleToScale`, `suggestedChangePercent`,
+  `safeRangePercent`, `confidence`, `evidence.roas28d` `{value, interval, purchases, verdict}`,
+  `evidence.roas28dShrunk`, `evidence.cpa28d`, `evidence.targetRoas`, `evidence.verdict`) —
+  plus the elements §14's prose lists but its short JSON example doesn't spell out (per A2's own
+  "Ambiguity #2" note that the JSON is a worked example, not the full schema):
+  - `evidence.windows: Partial<Record<"7d"|"14d"|"28d"|"56d", WindowEvidence>>` — the "multi-window
+    performance with intervals" deliverable, one `WindowEvidence` per window C2/C3 actually
+    populated (never all four unconditionally — a window with no data simply isn't a key).
+  - `evidence.roas28d`/`cpa28d`/`verdict`/`targetRoas` — a small, mechanical flattening of
+    `evidence.windows["28d"]`, matching §14's own literal naming (D2 can read either the flat
+    convenience fields or drill into `evidence.windows["28d"]` for the same numbers plus interval/
+    verdict/seasonality/gap detail the flat fields omit).
+  - `evidence.shopify` — `attributionCoverageRatio` (+ the NAME_MATCH-inclusive sibling),
+    `blendedMerAccountOnly`, and a `note` field that is **always populated, verbatim, regardless of
+    the actual coverage number** — see the reality #4 point below; D2 should render this note
+    prominently whenever any Shopify-attributed figure appears near it.
+  - `evidence.funnel`, `evidence.deliveryStability`, `evidence.learningState`,
+    `evidence.creativeFatigue`, `evidence.recentChanges`, `evidence.seasonality` — the funnel
+    health, delivery stability, learning-phase state, creative fatigue and recent-changes
+    deliverables, each reading straight off C2/C3/C4's already-computed fields (no new statistics
+    are computed here — D1 assembles, C2/C3/C4 measure).
+  - `evidence.windows[label].metaRoas`/`.cpaMinorUnits`/`.shopifyRoas` are all `MetricSnapshot`
+    (`{value, interval, purchases, verdict, verdictReason}`) — **every metric everywhere in this
+    object carries its own `verdictReason` string**, not just the flattened `roas28d`. This is what
+    makes reality #5 concrete rather than a design intention: the reason a verdict is what it is
+    travels WITH the number, at every altitude, not only at the top level.
+  - `targets: {targetRoas, targetCpaMinorUnits, source: "settings"|"default"}` — reality #6, read
+    fresh from `resolveStatisticalThresholds(canon)` on every call (never hardcoded, never cached
+    beyond the canon's own process-lifetime cache), with `source` telling D2/D3 whether these came
+    from an operator-supplied `settings/{accountId}.statisticalThresholds` or the built-in
+    placeholder default — so a corrected target changes the answer (and is visibly labelled as
+    having done so) rather than silently invalidating it.
+
+- **Reality #4 — Shopify-attributed per-entity ROAS is never presented as if it were meaningful,
+  structurally, not just by convention.** `evidence.shopify.note` is a fixed string, written by
+  `evidenceAssembler.ts` unconditionally on every call: *"Shopify-attributed per-ad/ad-set ROAS is
+  not reliable at this account's near-zero attribution coverage (~0.02%, B7) — the store's Magic
+  checkout app bypasses Shopify's own session tracking; this is not fixable by re-tagging. Lean on
+  Meta-attributed metaRoas/cpa for this decision. blendedMerAccountOnly ... is the trustworthy
+  account-level efficiency figure when coverage is low, but it is only ever populated at ACCOUNT
+  level..."* — this is not a threshold check that could silently stop firing if coverage happened
+  to improve; it's a standing caveat that goes out with every response, matching B7's own live
+  finding that the checkout-bypass cause is structural, not a data-quality dip that might resolve
+  itself. `shopifyRoas`/`shopifyRoasShrunk` are still carried in full (never hidden — this
+  codebase's own "carry the number, flag it, never suppress it" discipline), just never presented
+  without this note sitting next to them. `eligibleToScale`'s own gates (below) use ONLY
+  Meta-attributed `metaRoas`/`cpa`, never `shopifyRoas`, for exactly this reason.
+
+- **Reality #5 — a suppressed verdict's reason, reconstructed and attached to every metric
+  (`verdictExplain.ts`, pure).** C3's `windowStatistics.ts` computes WHY a verdict was forced to
+  `NOT_DISTINGUISHABLE` (below the purchase floor; a seasonal-boundary confound; for `shopifyRoas`
+  only, a data-gap overlap) but doesn't store that reason on the document — only the verdict label
+  survives. `explainVerdict({label, value, verdict, intervalLow, intervalHigh, sampleSize,
+  minPurchaseFloor, target, spansSeasonalBoundary, seasonalityLabels, windowHasDataGap?,
+  gapDays?})` **reconstructs** it by re-checking the exact same inputs and the exact same priority
+  order C3's own `windowStatistics.ts` applies them (floor, then season, then — shopifyRoas only —
+  gap), returning one of six distinct sentence shapes: not-measured (§6.3's null-vs-zero case), a
+  confident ABOVE/BELOW_TARGET explanation with the real interval, or a NOT_DISTINGUISHABLE
+  explanation attributing it to insufficient volume / a seasonal boundary (naming the actual
+  label(s)) / a Shopify data gap (naming actual gap days) / a genuine "interval straddles target"
+  read with none of the above. `evidenceAssembler.ts` calls this for every `metaRoas`/`cpa`/
+  `shopifyRoas` in every populated window — never only the primary one. 7 unit tests
+  (`verdictExplain.test.ts`) cover all six shapes plus the priority ordering between them.
+
+- **Reality #6 — targets are never hardcoded, and it's visible which source produced them.**
+  `scalingEvidenceEngine.ts` calls `resolveStatisticalThresholds(canon)` (C3) fresh on every
+  invocation — never a module-level constant, never `3.0`/`150_000` typed directly into this
+  step's own code anywhere. `targetsSource` is computed once, honestly, from whether
+  `canon.statisticalThresholds !== undefined` (an operator has written real values) vs. the
+  built-in placeholder default C3 ships — carried through to `evidence.targets.source` so D2/D3
+  can render "judged against the account's own configured target" vs. "judged against a
+  placeholder — treat with appropriate skepticism" as genuinely different statements.
+
+- **Candidate safe action range and eligibility (`eligibility.ts`), and why it is safe —
+  a PROPOSAL, not an enforced guardrail (D5 enforces limits in code after the model returns; this
+  step's own Out-of-scope line).** `computeEligibilityAndRange({isDelivering, metaRoasVerdict,
+  cpaVerdict, inLearningPhase, recentMajorChanges, metaRoasSampleSize, minPurchaseFloor})` gates on
+  five independent, individually-reported reasons (`ineligibleReasons: IneligibilityReason[]` — a
+  gate failing doesn't hide the others):
+  1. `NOT_DELIVERING` — redundant with the engine's own earlier NOT_DELIVERING short-circuit in the
+     common case, but kept as its own gate here so `computeEligibilityAndRange` is independently
+     correct and testable without relying on that upstream guard.
+  2. `ROAS_NOT_ABOVE_TARGET` — `metaRoasVerdict !== "ABOVE_TARGET"`.
+  3. `CPA_ABOVE_TARGET` — `cpaVerdict === "ABOVE_TARGET"`, which for a COST metric is the BAD
+     direction. `computeVerdict`'s own module comment (C3) explicitly defers "is this good" to
+     D1/D2 — this is that judgement, made explicit rather than silently assumed: `"ABOVE_TARGET"`
+     on `cpa` means positioned above the target NUMBER (spending more per purchase than the
+     target), not "efficient".
+  4. `IN_LEARNING_PHASE` — only a confirmed `true` blocks; `null` (the decision unit is a CAMPAIGN,
+     where C4 deliberately leaves `learningPhase: {}`, or C4 hasn't enriched this doc yet) never
+     blocks, since "not applicable" and "confirmed still learning" are different signals.
+  5. `RECENT_MAJOR_CHANGE` — via `recentChanges.ts`'s `computeRecentMajorChanges`, ONE function
+     shared by both the eligibility gate and `evidence.recentChanges.recentMajorChanges` (so the
+     boolean the gate acted on and the boolean D2 renders can never silently disagree): true when
+     `budgetChangesLast7Days > 0`, `creativeChangesLast7Days > 0`,
+     `hoursSinceLastAudienceChange < 14×24` (matching §13's own `targetingChangesLast14Days`
+     window), or `hoursSinceLastStatusChange < 72` (D1's own conservative choice — §13 has no
+     `statusChangesLastNDays` counter to reuse, per C4's own notes).
+  **Why the range is safe, concretely:** `SAFE_RANGE_UPPER_PERCENT = MATERIAL_BUDGET_CHANGE_
+  THRESHOLD_PERCENT(20, C4's own constant) - 5 = 15`, `SAFE_RANGE_LOWER_PERCENT = 5` — reusing C4's
+  existing 20%-material-edit threshold rather than inventing a second, unrelated magic number,
+  with a 5-point margin so a suggestion at the very top of the range still cannot itself trigger
+  the learning-phase reset C4 models. `confidence` is a simple, explicitly-documented-as-a-
+  heuristic (never presented as a validated statistical figure) monotonic function of how far the
+  primary-window purchase count sits above its floor: `0.5` exactly at the floor (the same
+  boundary C3's own shrinkage pseudo-count treats as "shrink exactly halfway"), rising linearly to
+  `0.9` at 2× the floor and capped there. `suggestedChangePercent = round(5 + confidence × 10)` —
+  10–14% in practice, always strictly inside `[5, 15]`. When any gate fails, `confidence: 0`,
+  `suggestedChangePercent: null`, `safeRangePercent: null` — no plausible-looking range is ever
+  produced alongside a "no" answer.
+
+- **Creative fatigue (`entityLookup.ts`'s `loadCreativeFatigueForAd`) — scoped to the NAMED ad,
+  not the decision unit.** The decision unit is never AD-typed (ads don't own budget), so creative
+  fatigue — inherently a per-creative/per-family concept — is populated only when the request
+  named an AD directly: walks `ad.creativeId → metaCreatives/{id} → (COMPOSITE:
+  `compositeFamilyId`; STANDARD: `creativeAssets/{imageHash ?? videoId}.familyId`) →
+  `creativeFamilies/{familyId}`, mirroring `entityGraph.ts`'s own `familyByAd` derivation exactly
+  (not reimplemented differently) but as a single-ad lookup. When the request named an ADSET/
+  CAMPAIGN directly, `creativeFatigue.applicable: false` with an explicit note explaining why
+  ("ask about a specific ad to see its family's signal") — never a fabricated aggregate across the
+  ad set's many creatives. Since no step has populated `creativeFamilies.fatigueScore` yet (B8 left
+  it `null` by design, pending Phase F's asset pipeline — confirmed by grepping the whole
+  `services/` tree, still true as of this step), every real fatigue lookup today returns
+  `fatigueScore: null` with a note saying so plainly — an honest "not yet computed", not a
+  fabricated zero.
+
+- **Verified against a real ad set and ad ID drawn straight from §14's own worked example** — the
+  emulator test names its ad set `AS_17` and its low-volume ad `238591234` (the exact ids §14's
+  JSON example uses), seeding 9 pooled ads at 30 purchases/28d (270 total — comfortably above the
+  28d floor of 30, and, spread over a rolling 7-day learning-phase window, comfortably above the
+  §13.1 conversion threshold of 50/week) plus one low-volume ad at 6 purchases (matching §4.1's own
+  "Ad XYZ has 6 purchases in 28 days" phrasing exactly). All four required demonstrations pass
+  against the real emulator, running the real `RECOMPUTE_FEATURES` → `COMPUTE_STATISTICS` →
+  `ENRICH_CHANGE_FEATURES` chain first:
+  1. Naming `{type:"ADSET", id:"AS_17"}` directly returns `outcome:"EVIDENCE"` with
+     `decisionUnit:{type:"ADSET",id:"AS_17"}`, no `escalatedFrom`, `roas28d.purchases:270`,
+     `verdict:"ABOVE_TARGET"`, `eligibleToScale:true`, a non-null `suggestedChangePercent`/
+     `safeRangePercent` inside `[5,15]`, and the Shopify-coverage caveat present.
+  2. Naming `{type:"AD", id:"238591234"}` returns the SAME ad set's evidence
+     (`roas28d.purchases:276`, the pooled total) with
+     `escalatedFrom:{type:"AD",id:"238591234",reason:"SAMPLE_TOO_SMALL"}` and
+     `creativeFatigue.applicable:true` for that ad's own (separately seeded) family.
+  3. Naming an orphaned `CAMPAIGN` with `budget.ownerLevel:"UNKNOWN"` (B2's own real live shape —
+     an old PAUSED campaign with no ad sets and no budget signal) returns
+     `outcome:"NO_DECISION_UNIT"`.
+  4. Naming an `ADSET` that exists in Meta's config (`status:"ACTIVE"`, owns its own budget) but
+     has zero seeded `metaInsightsDailyNormalized` rows returns `outcome:"NOT_DELIVERING"`.
+
+- **Ambiguities resolved:**
+  1. **What "the real ad set" and "a low-volume ad" from the Done-when line should actually be.**
+     Resolved by reproducing §14's own worked example ids/numbers as the fixture (see above) rather
+     than inventing unrelated ones — makes the proof directly checkable against the design text
+     rather than requiring a reader to trust an unrelated example maps onto the same shape.
+  2. **Whether `eligibleToScale` should gate on `shopifyRoas` at all.** Resolved: no, never — only
+     `metaRoas`/`cpa` (both Meta-attributed) gate eligibility, per reality #4. `shopifyRoas` is
+     evidence, shown with its caveat, never a gate.
+  3. **Whether a CAMPAIGN-named request with multiple independently-owning ad sets should pick the
+     "biggest" or "most recent" one rather than refusing.** Resolved: refuse
+     (`NO_DECISION_UNIT`), per §4.1's own "do not guess a level" — a heuristic pick would look like
+     an answer but wouldn't actually identify who owns the budget being asked about. The
+     `NO_DECISION_UNIT.detail` string names the actual candidate ad set ids so a caller can re-ask
+     about one directly.
+  4. **Whether `confidence`/`suggestedChangePercent`/`safeRangePercent` should still be computed
+     (even if not surfaced) when `eligibleToScale` is false.** Resolved: no — all three are `null`/
+     `0` together with the failing reasons, never a plausible-looking number attached to a "don't
+     scale" answer, matching this codebase's own "never present a number that could be mistaken for
+     a real result" discipline (C2's null-vs-zero convention, extended here to eligibility).
+- **⚠️ Orchestrator note (added at D1 review — a known fragility, scheduled for fix before D3).**
+  `services/evidence/verdictExplain.ts` **re-derives** why C3 suppressed a verdict, by replicating C3's own
+  priority order (floor → seasonal boundary → Shopify gap) from the same inputs. C3 stores only the
+  `NOT_DISTINGUISHABLE` label, not which of the three caused it. The module comment states this plainly, so
+  it is a known duplication rather than an accident — but it is duplicated **decision** logic, and the two
+  copies are kept in sync only by convention. If C3's thresholds or ordering ever change, D1 will attach a
+  **confidently wrong explanation to a correct verdict**, which is worse than attaching none, and C3's tests
+  would not catch it because `verdictExplain` is tested in isolation against supplied inputs.
+  This is the same class of problem the plan insists on solving structurally elsewhere (E1's leakage guard,
+  C2's `GapAware` gap-safety). **The fix:** have C3 record the reason at the point of decision — a small
+  enum on the metric (`BELOW_FLOOR | SEASONAL_BOUNDARY | DATA_GAP | null`) written by
+  `windowStatistics.ts` — and have `verdictExplain` render that stored code into prose rather than
+  recomputing the decision. D1's public API does not change, so D2 is unaffected either way; this is
+  deliberately sequenced after D2 and before D3.
 
 ---
 
