@@ -37,6 +37,8 @@ import {
 } from "../../analytics/daily/index.ts";
 import { seedSeasonalCalendarRegistration } from "../../analytics/seasonality/index.ts";
 import { recomputeFeaturesRegistration } from "../../analytics/features/index.ts";
+import { enrichChangeFeaturesRegistration } from "../../analytics/changeFeatures/index.ts";
+import { computeStatisticsRegistration } from "../../analytics/statistics/index.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -145,5 +147,17 @@ export function createDefaultRegistry(): TaskRegistry {
   // over C1's normalized collections. §10.2's own name, already in taskTypes.ts's list.
   // Firestore-only; no live Meta/Shopify call, no watermark of its own.
   registry.register(recomputeFeaturesRegistration);
+  // C4's change-aware/learning-phase enrichment (§13, §13.1) — runs AFTER
+  // RECOMPUTE_FEATURES in the same sync cycle, merging `changeAware`/`learningPhase` onto the
+  // feature docs it already wrote (see enrichChangeFeaturesTask.ts's own module comment for why
+  // this is a targeted field merge, not a full-document rewrite). Firestore-only; no live Meta/
+  // Shopify call, no watermark of its own.
+  registry.register(enrichChangeFeaturesRegistration);
+  // C3's statistics layer (§15) — intervals, three-state verdicts and account-mean shrinkage,
+  // written onto the same feature docs RECOMPUTE_FEATURES already wrote. Runs AFTER
+  // RECOMPUTE_FEATURES (needs the account-level mean first); safe alongside C4's own concurrent
+  // pass — see computeStatisticsTask.ts's own module comment for why the two never collide.
+  // Firestore-only; no live Meta/Shopify call, no watermark of its own.
+  registry.register(computeStatisticsRegistration);
   return registry;
 }

@@ -5,14 +5,15 @@
 // replacing it, so A2's key convention and these four fields stay stable for whatever already
 // reads them."
 //
-// Statistical thresholds (§15.1) are NOT added here — A3's own Deliverables list ("Model
-// configuration per §19.2") does not claim them, and IMPLEMENTATION_PLAN.md gives §15.1 to C3
-// ("Minimum purchase floors per window, configurable") as an explicit deliverable. Extending
-// this schema again with `.extend(...)` when C3 needs it is exactly the mechanism A2 set up
-// for that; don't pre-empt C3's judgment call on the shape of those thresholds here.
+// Statistical thresholds (§15.1) — C3's own extension, added the same way modelConfig was:
+// `.extend(...)` on top of the existing schema, per A2's original instruction ("don't pre-empt
+// C3's judgment call on the shape of those thresholds here"). See statisticalThresholds.ts for
+// the shape, the defaults and why the field is optional (not required-with-no-default like
+// modelConfig) — that file's own module comment explains the blast-radius reason.
 
 import { z } from "zod";
 import { reportingCanonSettingsSchema } from "../schema/settings.ts";
+import { statisticalThresholdsSchema } from "./statisticalThresholds.ts";
 
 /**
  * §19.2's model-selection block, verbatim in field names and values. `effort` is left as a
@@ -41,5 +42,8 @@ export type ModelConfig = z.infer<typeof modelConfigSchema>;
  */
 export const canonSettingsSchema = reportingCanonSettingsSchema.extend({
   modelConfig: modelConfigSchema,
+  // §15.1 — optional (see statisticalThresholds.ts for why), resolved via
+  // `resolveStatisticalThresholds()`, never read directly.
+  statisticalThresholds: statisticalThresholdsSchema.optional(),
 });
 export type CanonSettings = z.infer<typeof canonSettingsSchema>;

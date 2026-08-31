@@ -3013,7 +3013,17 @@ reconcile against Meta Ads Manager for the same window and attribution setting.
 
 ### C3 — Statistics layer
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+640/640 unit tests, up from C4's baseline — this step's own 32 new tests across
+`services/analytics/statistics/{interval,verdict,shrinkage,windowStatistics}.test.ts`). `npm run
+test:integration` passes 232/232 against a real Firestore emulator (up from 228 pre-C3 — this
+step's own 4 new emulator tests in `computeStatisticsTask.emulator.test.ts`, each running the
+REAL, unmodified `RECOMPUTE_FEATURES` handler first over seeded raw Meta rows shaped like the
+account's real measured volume, then the real `COMPUTE_STATISTICS` handler on whatever it wrote —
+not hand-built `EntityFeatures` fixtures). No live/production Firestore was touched (emulator
+only); no live Meta/Shopify call was made; no cloud resource was created/modified/deployed; no npm
+dependency was added. See Notes below for the estimator, the settings extension, the collision-safe
+write design, and real-data verdict/shrinkage results.
 **Depends on:** C2
 **Design refs:** §2.1, §15
 
@@ -3044,11 +3054,195 @@ decisions as failures. Keep the estimator simple and explainable; a Gamma-Poisso
 that you can describe in the packet text beats something more sophisticated that the model cannot reason
 about.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/analytics/statistics/{interval,verdict,shrinkage,windowStatistics,
+  computeStatisticsTask,index}.ts`, each with a co-located `*.test.ts` (32 pure unit tests, no
+  emulator needed), plus `computeStatisticsTask.emulator.test.ts` (4 emulator-backed tests running
+  the real `RECOMPUTE_FEATURES` handler first, then the real `COMPUTE_STATISTICS` handler, on
+  seeded raw rows shaped like the account's real measured volume — not hand-built `EntityFeatures`
+  fixtures). `shared/canon/statisticalThresholds.ts` is a new file (schema, defaults, the
+  `resolveStatisticalThresholds` helper); `shared/canon/settings.ts`'s `canonSettingsSchema` gained
+  one more `.extend()` field (`statisticalThresholds`, optional — see its own note below).
+  `services/ingest/sync/{taskTypes,registry}.ts` gained one task-type entry
+  (`COMPUTE_STATISTICS`) and one registration — the same one-line extension pattern every step
+  since B2 has used. `services/analytics/index.ts` gained one barrel re-export
+  (`./statistics/index.ts`) alongside C4's own `./changeFeatures/index.ts`, with no name
+  collisions between the two.
+
+- **⭐ The estimator, in the two plain sentences D2 will render into packet text.** *"We treat the
+  number of purchases behind a ROAS/CPA figure as a Poisson-distributed count and build a
+  confidence interval on that count using the Anscombe (1948) square-root variance-stabilizing
+  transform — a closed-form approximation, no external stats library, just a square root and a
+  small correction. Because ROAS scales up (and CPA scales down) linearly with that same purchase
+  count for a fixed spend figure within one window, the purchase-count interval's relative width
+  carries straight over onto both."* Chosen over the more commonly-taught Wald interval
+  (`n ± z*sqrt(n)`) because Wald can go negative for a small count (a purchase count never can),
+  needing an ad-hoc clip; Anscombe's `sqrt(n + 3/8)` stays non-negative by construction and has
+  materially better coverage at the account's real sample sizes (§2.1: 4-8 purchases/ad/week).
+  Implemented in `services/analytics/statistics/interval.ts`
+  (`poissonCountInterval`/`scaleIntervalByCount`) — no npm dependency added, exactly per this
+  step's constraint; a Gamma-Poisson posterior or a bootstrap would have needed either a
+  Gamma-quantile function or repeated resampling, neither of which this codebase has or needed
+  elsewhere. **Shrinkage's own two-sentence explanation** (`shrinkage.ts`): *"An entity's shrunk
+  ROAS is a weighted average of its own observed ROAS and the account's ROAS in the same window,
+  where the weight given to the entity's own number grows with its purchase count relative to a
+  fixed pseudo-count; with few purchases the shrunk figure sits close to the account mean, and
+  with many purchases it sits close to the entity's own raw number."* This is the standard
+  empirical-Bayes/Gamma-Poisson shrinkage move (a weighted average is exactly the posterior mean
+  of a Gamma-Poisson model with a prior strength of `pseudoCount` purchases), stated as a weighted
+  average because that is what the packet text will actually say. The pseudo-count is deliberately
+  the SAME number as the window's minimum purchase floor — one number to configure, not two; an
+  entity sitting exactly at the floor is shrunk exactly halfway to the mean, which is the right
+  amount of trust to place in a number right at that boundary.
+
+- **The three-state verdict is literal, not direction-aware** (`verdict.ts`): `ABOVE_TARGET`/
+  `BELOW_TARGET` mean the confidence interval sits entirely above/below the target VALUE, full
+  stop — the same `computeVerdict(low, high, target)` serves both `metaRoas`/`shopifyRoas`
+  (target = `targetRoas`, higher is "good") and `cpa` (target = `targetCpaMinorUnits`, lower is
+  "good") with no direction flag baked into the verdict itself. The business "is this good"
+  judgement is left to whoever reads the verdict later (D1/D2) — documented explicitly in the
+  file's own header so a future reader doesn't "fix" CPA's verdict to mean "efficient" instead of
+  "positioned above the target number".
+
+- **The settings extension (§15.1) — why it is OPTIONAL, not required-with-no-default like A3's
+  `modelConfig`.** `TEST_CANON` (`services/ingest/meta/entities/testFixtures.ts`) is a shared
+  fixture typed `: CanonSettings`, imported by ~13 test files spanning B2 through C5. A required
+  new field with no default would have been a breaking schema change to every one of them — the
+  exact failure mode A2's own orchestrator note warned about for Firestore documents, here hitting
+  a shared TS fixture instead. Resolved by making `statisticalThresholds` `.optional()` on
+  `canonSettingsSchema`, with `resolveStatisticalThresholds(canon)` — the one sanctioned way to
+  read it — falling back to `DEFAULT_STATISTICAL_THRESHOLDS` when absent. This is a deliberate,
+  narrow departure from A3's own "throw on absence, never default" philosophy for the reporting
+  canon; justified because a statistical threshold is a tunable operating parameter with a
+  defensible default (a wrong default still produces an HONEST, if imperfectly calibrated,
+  verdict), unlike the four original §5 fields (genuinely irretrievable if wrong, "cannot be
+  retrofitted without a rebuild"). `TEST_CANON` itself was left untouched — every existing test
+  across every earlier phase keeps working unmodified, exercising the default-threshold code path.
+
+- **The minimum purchase floors chosen, and the justification** (`shared/canon/
+  statisticalThresholds.ts`'s `DEFAULT_MIN_PURCHASE_FLOORS`): `{"7d": 12, "14d": 20, "28d": 30,
+  "56d": 45}`. Grounded in two things, neither of them "tune until the verdict distribution looks
+  right" (the step's own explicit prohibition): (1) a Poisson count's relative standard error is
+  ~`1/sqrt(n)` — n=25 caps that at ~20%; 30 is a small margin above that for the primary 28d
+  decision window, since §2.1 itself documents the account's real distribution as over-dispersed
+  relative to pure Poisson noise (order-value variance, weekday/festive swings, campaign
+  heterogeneity); (2) 30 sits deliberately ABOVE §2.1's own measured ad-level volume (~16-32
+  purchases/28d, from "4-8 purchases per ad per week") and comfortably BELOW its measured ad-set
+  volume (~80-140/28d, from "20-35 purchases per ad set per week") — so most individual ads
+  correctly fail the floor (§4.1's escalation path exists exactly for this) while most ad sets
+  clear it. 14d/7d/56d scale down/up from that same anchor, not from a separately-derived
+  statistical minimum, because a shorter window has structurally less data available regardless of
+  what the statistics alone would ask for, and §4.2 already marks 7d "trend direction only, never
+  a threshold test". **Target ROAS defaults to 3.0** (§14's own worked example — no other value is
+  named anywhere in the design). **Target CPA defaults to ₹1,500.00** (150,000 paise) — no design
+  section names one at all; chosen as a round number below the account's own real measured 7-day
+  account-level CPA (₹1,761.63, from this system's own live Meta reconciliation check, C2's
+  notes), documented as a placeholder business input an operator should override, matching C2's
+  own "estimated contribution margin" precedent for an honestly-labelled simplification rather
+  than a validated figure presented as finished.
+
+- **⚠️ Architecture: C3 is genuinely its own pass, never touching `entityFeaturesBuilder.ts`, and
+  is collision-safe with C4's concurrent pass over the SAME documents — proven, not just
+  asserted.** `computeStatisticsHandler` (`computeStatisticsTask.ts`) reads `accountFeatures/
+  {accountId}` FIRST (RECOMPUTE_FEATURES's own account-level rollup — the only place the account
+  mean for each window can come from), then every AD/ADSET/CREATIVE_FAMILY doc, computes the
+  interval/verdict/shrinkage patch for each window in memory, and writes it back via
+  `db.collection(name).doc(id)` + `tx.set(ref, {windows: patchWindows}, {merge:true})` — a
+  RECURSIVE-MERGE partial write, never `upsertWithVersionGuard`/a full-document `set()`. Firestore
+  resolves `{merge:true}` on a nested object at the LEAF field-path level: writing
+  `windows["28d"].metaRoas.intervalLow` touches only that one field, leaving `changeAware`,
+  `learningPhase`, and every other field in the same window object (`spendMinorUnits`, `ctr`,
+  `seasonality`, `shopifyDataGap`, `metaRoas.value`/`.sampleSize`, ...) completely untouched no
+  matter which of C3/C4 runs first, last, or concurrently. **This is the identical pattern C4's
+  own `enrichChangeFeaturesTask.ts` independently arrived at for the same reason** (confirmed by
+  reading C4's already-landed code before writing this — its module comment explicitly names
+  "safe alongside C3's own concurrent enrichment of the same documents' `windows[label]`
+  interval/shrinkage/verdict fields"), which is exactly the outcome the orchestrator's "keep to
+  your own pass" steer was aiming for. A staleness guard (re-reading `accountDataVersion` inside
+  the same transaction as the write, skipping if a concurrent `RECOMPUTE_FEATURES` run has since
+  superseded it) is C3's own small addition on top of that shared pattern — belt-and-braces, not
+  load-bearing for the collision-safety itself.
+
+- **How gap-affected and season-straddling windows are prevented from ever producing a confident
+  verdict** (`windowStatistics.ts`'s `computeWindowStatistics`): two suppression flags, both
+  forcing `verdict: "NOT_DISTINGUISHABLE"` while leaving the interval/value fields fully populated
+  (never hidden — this codebase's own established "carry the number, flag it, never suppress it"
+  discipline, same as C2's `shopifyDataGap`/`seasonality` handling). (1) `shopifyDataGap.
+  windowHasDataGap` suppresses ONLY `shopifyRoas`'s verdict — `metaRoas`/`cpa` are Meta-sourced and
+  structurally unaffected by the Shopify-only hole, matching C2's own established discipline
+  exactly; never calls `unsafeIgnoreGap`. (2) `seasonality.spansSeasonalBoundary` suppresses EVERY
+  metric's verdict in that window (`metaRoas`, `shopifyRoas`, AND `cpa`) — broader than the gap
+  rule, because a festive-vs-off-season mix is a confound on the point estimate itself, not only
+  on a trend comparison against a baseline. Both proven end-to-end against REAL
+  `RECOMPUTE_FEATURES` output in the emulator test (a real coverage-gap row for the Shopify case; a
+  real injected fake `seasonalityProvider` — the same injection seam C2 built for exactly this —
+  for the seasonal case), not only at the pure-function level. Never built any de-seasonalisation
+  or gap-correction of the numbers themselves, per this step's own explicit "do not de-seasonalise"
+  and "carry the number" instructions.
+
+- **A documented nuance, surfaced rather than silently accepted: shrinkage's `n` can itself be an
+  artefact of a gap.** `shrinkTowardAccountMean` uses `shopifyRoas.sampleSize` as its weight input
+  even when `shopifyDataGap.windowHasDataGap` is true — during a gap, a low observed order count
+  may reflect missing data rather than genuinely low volume, which would over-shrink toward the
+  mean for the wrong reason. Chose to still compute and store `shopifyRoasShrunk` in that case
+  (never suppress the number) since `shopifyDataGap` sits right next to it in the same stored
+  window object for exactly this reason — a downstream reader (D1) is expected to read the flag
+  alongside the shrunk figure, not to have this layer silently withhold it. Flagged here, not
+  fixed, since correcting for it would mean estimating a "true" n under the gap, which is exactly
+  the kind of speculative correction §15.4/§15.5 already push to later work.
+
+- **Real-data verdict/shrinkage results (emulator, real `RECOMPUTE_FEATURES` -> real
+  `COMPUTE_STATISTICS`, seeded at §2.1-realistic per-ad volume, not hand-built fixtures).** 8
+  "normal" ads at 20 purchases/28d each (real ROAS 4.0, individually below the 30-purchase floor)
+  plus one "lucky" ad at 5 purchases with a raw ROAS of 8.0: every one of the 8 normal ads —
+  despite a real, non-noisy ROAS of 4.0 sitting comfortably above the 3.0 target — comes back
+  `NOT_DISTINGUISHABLE` (a naive point-estimate reading would have called all 9 of these ads
+  `ABOVE_TARGET`; only the pooled ad set, at 165 real purchases, gets a confident verdict). The
+  lucky ad's raw 8.0 is shrunk to the exact `n/(n+floor)`-weighted figure between it and the real
+  (pipeline-computed, not hardcoded) account mean of ~3.5-4.1 — moved more than 60% of the way from
+  raw toward the mean, asserted against the exact formula, not just "moved somewhat". This is the
+  concrete demonstration behind this step's own "expect NOT_DISTINGUISHABLE to be the common case"
+  framing: at the tested volumes, 9/10 individual entities (8 normal ads + 1 lucky ad) land
+  `NOT_DISTINGUISHABLE`, 1/10 (the pooled ad set) lands `ABOVE_TARGET`/`BELOW_TARGET` — the exact
+  ad-level-fails/ad-set-level-works split §2.1's own volume table predicts.
+
+- **Ambiguities resolved:**
+  1. **Where the "target" ROAS/CPA values in §14's evidence example (`targetRoas: 3.0`) come
+     from** — the design never defines a settings field for it. Resolved the same way §15.1's own
+     purchase floors are resolved: a new, configurable, optional-with-a-default field on
+     `settings/{accountId}.statisticalThresholds`, not a hardcoded constant buried in this step's
+     own code — an operator can override it once real business targets exist, without a schema
+     migration.
+  2. **Whether `purchases` (a `metricWithInterval` in the schema, alongside `metaRoas`/
+     `shopifyRoas`/`cpa`) should get a verdict.** Resolved: interval, yes (the Poisson count
+     interval this whole layer is built on); verdict, no — there is no "target purchase count"
+     concept anywhere in the design, and `metricWithInterval.verdict` is `.nullable()` precisely
+     to allow this without inventing a fake target.
+  3. **`n === 0` vs. `value === null`.** A real, exact zero-purchase window (spend > 0, genuinely
+     zero purchases) gets `verdict: "NOT_DISTINGUISHABLE"` with `null` interval bounds (a
+     confident, if uninformative, verdict — there is no honest ratio-based interval from zero
+     events). A `null` value (C2's own "not measured" signal — an audit-unresolvable ad, or zero
+     Meta spend) stays fully `null`, verdict included — coercing that to `NOT_DISTINGUISHABLE`
+     would misrepresent "we didn't measure this" as "we measured it and couldn't tell", the exact
+     null-vs-zero conflation C2's own B7-derived discipline exists to prevent.
+
 ---
 
 ### C4 — Change-aware and learning-phase features
 
-**Status:** Not started
+**Status:** Done — `npm run check` (typecheck across both projects, lint, format, unit tests)
+passes clean for every file this step touched or added, and full-repo `npm run check` passes
+608/608 unit tests with zero lint/format errors anywhere in the tree at the time this was
+verified. `npm run test:integration` (real Firestore emulator) passes 227/227 across all 22
+emulator test files account-wide, including this step's own 6 correctness tests
+(`enrichChangeFeaturesTask.emulator.test.ts`) and a 7th, separate realistic-scale/distribution
+test (`enrichChangeFeaturesTask.scale.emulator.test.ts`, 1 test, ~15–32s) seeded at the account's
+real measured entity counts (410 campaigns / 534 ad sets / 1,139 ads, B2/B3 live). No live/
+mutating Meta or Shopify call was made; no production Firestore was touched (emulator only); no
+cloud resource was created/modified/deployed; no npm dependency was added. See Notes below for the
+feature shape, the real distribution measured on this account, and exactly what is verified versus
+assumption in the learning-phase model.
 **Depends on:** C2, B4
 **Design refs:** §13
 
@@ -3070,6 +3264,179 @@ set below the conversion threshold reports `inLearningPhase: true`.
 **Notes for the planning agent.** §13.1 explains why this matters more here than at a larger account: at
 20–35 conversions per ad set per week against a ~50 threshold, several ad sets sit below it indefinitely,
 and that is frequently the true answer to "why did ROAS move?".
+
+**⚠️ Orchestrator note (added at C3/C4 review — read this before trusting C4's "534/534 in learning").**
+C4's scale test reported **100% of 534 ad sets in learning phase**. That figure is a property of how the
+test seeded data, not a measurement of the live account, and taken at face value it is misleading. The
+reconciliation:
+
+| Source | Figure | Provenance |
+|---|---|---|
+| C2 live Insights reconciliation | ~113 `omni_purchase` **account-wide per week** | real, live-fetched |
+| §2.1 / C3's floor anchoring | 20–35 purchases **per ad set** per week | design-document assumption, **not** measured |
+| B2 live entity fetch | 534 ad sets exist | real |
+| B3 live insights | only **~47 active ad-days per day** | real |
+
+Spreading 113 weekly purchases across all 534 ad sets (C4's seeding) gives ~0.2 each and trivially puts
+every one below any threshold — but **most of those 534 ad sets are not delivering at all.** An ad set with
+no delivery is *off*, not "stuck in learning", and reporting it as in-learning is technically true and
+analytically useless. Reconciled against the ~47 active ad-days/day figure, the live picture is roughly a
+handful of genuinely delivering ad sets each earning ~20–35 conversions/week — i.e. **exactly the §13.1
+scenario the design predicted, persistently below the ~50 threshold but not categorically worse than
+assumed.**
+
+**Consequences:**
+- **Do not treat `inLearningPhase` as discriminating across the whole fleet.** Segment by whether the entity
+  actually delivered in the window first; otherwise the feature is constant-true and explains nothing.
+- **D1's escalation still works, but verify the assumption rather than inheriting it.** Escalating a
+  starved ad to its ad set only helps if that ad set has real volume; for the handful of active ad sets it
+  does (C3 measured a pooled ad set at 165 purchases/28d earning a confident verdict where all 9 of its ads
+  were `NOT_DISTINGUISHABLE`), and for the inactive majority the correct answer is "not delivering", not an
+  escalated verdict.
+- **The genuine business finding survives the correction:** 534 ad sets against ~113 purchases/week is heavy
+  structural fragmentation, and consolidation would plausibly help delivery more than any budget edit this
+  system recommends. That is a Phase F decision type, not a v1 scaling recommendation.
+
+**Notes from implementation:**
+
+- **Layout as built — a separate enrichment pass, not a restructuring of C2's builder.**
+  `services/analytics/changeFeatures/{constants,changeAwareFeatures,learningPhase,
+  enrichChangeFeaturesTask,index}.ts`, each with a co-located `*.test.ts`
+  (`changeAwareFeatures.test.ts` 8 tests, `learningPhase.test.ts` 9 tests, both pure/no-emulator),
+  plus `enrichChangeFeaturesTask.emulator.test.ts` (6 correctness tests) and
+  `enrichChangeFeaturesTask.scale.emulator.test.ts` (1 realistic-scale/distribution test, its own
+  file per C2's own precedent for keeping a long-`beforeAll` timing test out of the fast
+  correctness suite). Per this step's own brief, `services/analytics/features/
+  entityFeaturesBuilder.ts` (C2's) is untouched — this reads C2's already-written `adFeatures`/
+  `adsetFeatures` docs and merges `changeAware`/`learningPhase` back in as a **separate task,
+  `ENRICH_CHANGE_FEATURES`, run after `RECOMPUTE_FEATURES`** in the same sync cycle (not folded
+  into it) — not one of §10.2's original task types, added to `services/ingest/sync/taskTypes.ts`
+  and registered in `services/ingest/sync/registry.ts` (both edited carefully: re-read
+  immediately before each edit, since a C3 agent was editing `registry.ts` concurrently for its
+  own `COMPUTE_STATISTICS` registration — no collision occurred; both registrations landed
+  cleanly, `registry.ts`'s own registration-order comments now describe both). Also touched:
+  `services/analytics/index.ts` (added the barrel re-export — no name collisions with C2's own
+  deliberately-unexported `features/index.ts`), and `services/ingest/sync/registry.test.ts` (the
+  shared hard-coded `registry.list()` assertion needed both this step's `ENRICH_CHANGE_FEATURES`
+  and C3's `COMPUTE_STATISTICS` added — fixed once, covering both, since leaving it broken would
+  have failed `npm run check` regardless of whose registration triggered it).
+
+- **The write is a targeted top-level-field merge, never a full-document overwrite — this is
+  what makes running alongside C3's concurrent interval/shrinkage/verdict writes on the same docs
+  safe.** `enrichChangeFeaturesTask.ts` does `db.collection(name).doc(id).set({changeAware,
+  learningPhase}, {merge: true})` on the **unconverted** collection ref (bypassing
+  `repository.set()`, which is a full-document overwrite requiring the whole
+  `entityFeaturesSchema` — `windows`/`trend`/etc. this task never reads). This replaces only the
+  two top-level keys C2 explicitly reserved for C4 (`shared/schema/features.ts`: "C2 writes
+  `changeAware: {}` / `learningPhase: {}`... both C4's job") and leaves every sibling field —
+  including whatever C3 concurrently writes into `windows[label].purchases.intervalLow` etc. —
+  completely untouched. Proven directly: `enrichChangeFeaturesTask.emulator.test.ts`'s "does not
+  touch windows/trend on the doc it merges into" test seeds a doc with populated `windows`/`trend`
+  fields, runs the task, and asserts those fields are byte-identical afterward while
+  `changeAware`/`learningPhase` are freshly populated. An entity with no pre-existing feature doc
+  (RECOMPUTE_FEATURES hasn't reached it yet) is skipped and counted (`skippedNoFeatureDoc` in the
+  task summary), never used to fabricate a partial, schema-invalid document — proven by a
+  dedicated test.
+
+- **§13's `hoursSince…`/`…ChangesLastNDays` family (`changeAwareFeatures.ts`) — pure, one entity's
+  events in, the sub-object out.** Field-presence convention: "this kind of change never
+  happened" is modelled by OMITTING the `hoursSinceLast*`/`lastBudgetChangePercent` field (the
+  schema types them as plain, non-nullable numbers inside a `.partial()` wrapper — there is no
+  honest finite number for "hours since an event that never occurred"), while the
+  `…ChangesLastNDays` counters are always populated, including a real, measured `0` — the same
+  null-vs-omitted-vs-zero discipline C2 uses throughout §12. `lastBudgetChangePercent` is likewise
+  omitted (not `0`/`null`) when the most recent BUDGET event itself carries a `null` percent
+  (B4's own "may be null even for a real BUDGET event" case). `TARGETING` maps to §13's
+  "audience" naming; `STATUS` gets only an hours-since field, matching §13's own field list (no
+  `statusChangesLastNDays` exists there).
+
+- **§13.1 learning-phase model (`learningPhase.ts`) — pure, day-string arithmetic only (no
+  timezone dependency inside the module itself).** `inLearningPhase`/`conversionsToExitLearning`
+  are computed from purchases summed over `[windowStartDay, asOfDay]`, where `windowStartDay` is
+  the LATER of (a) a plain trailing 7-day rolling window and (b) "since the last material budget
+  reset" (or, absent any reset ever, the entity's own creation day — so a brand-new ad set is
+  never scored against days before it existed). This models Meta's own documented "50
+  conversions within 7 days" mechanic as a genuinely rolling window that a material edit
+  restarts, rather than a lifetime cumulative count (a cumulative model would make old, long-lived
+  ad sets exit learning permanently the moment they cross 50 conversions ever, which contradicts
+  §13.1's own "sit below it indefinitely" framing at this account's real weekly volume — see the
+  distribution numbers below for why the rolling-window reading is the one consistent with real
+  data). `learningResetAt`/`learningResetCause` are populated ONLY from a BUDGET-field change
+  event whose `|budgetChangePercent| >= 20` (a named, overridable constant,
+  `MATERIAL_BUDGET_CHANGE_THRESHOLD_PERCENT` in `constants.ts`) — the most recent qualifying one
+  when several exist. `learningResetCause` is one of `MATERIAL_BUDGET_INCREASE:<percent>%` /
+  `MATERIAL_BUDGET_DECREASE:<percent>%`, matching this step's own deliverable list ("Detection of
+  learning resets triggered by material budget edits" — budget only; Meta's real product can also
+  reset learning on creative/targeting edits, deliberately out of scope here per that exact
+  wording). A null-percent BUDGET event (B4's UNKNOWN-ownership-transition case) can never be a
+  reset trigger, by construction — B4 never emits a BUDGET event across an UNKNOWN transition in
+  the first place, so this module's `budgetEvents` input never contains one for that case; nothing
+  needed to special-case it.
+
+- **VERIFIED vs. ASSUMPTION, stated plainly (Meta publishes no exact exit rule and no API field
+  this system reads that reports live learning-phase state):**
+  - **Assumption, not verified live:** the two constants in `constants.ts` —
+    `LEARNING_PHASE_CONVERSION_THRESHOLD = 50` and `LEARNING_PHASE_WINDOW_DAYS = 7` are the
+    design document's own figure verbatim (§13.1: "roughly 50 conversions per week"), itself
+    Meta's publicly stated rule of thumb, not re-confirmed against Meta's API this session (no
+    live/mutating call was made, per this step's own constraint, and Meta does not expose a
+    learning-phase-state field anywhere B2/B3 fetch from). `MATERIAL_BUDGET_CHANGE_THRESHOLD_
+    PERCENT = 20` is **not in the design document at all** — it is this implementation's own
+    choice, informed by Meta's commonly cited "significant edit" (~20%) guidance, and is the one
+    number in this step most likely to need correction from an authoritative source later; it is
+    a single named, exported constant specifically so that correction is a one-line change.
+  - **Verified, this session, against real account data:** the entity counts driving the
+    distribution below (410 campaigns / 534 ad sets / 1,139 ads) are B2's real live fetch;
+    ~47 active ads/day is B3's real live density measurement; the 113 real Meta-reported
+    (`omni_purchase`) purchases over the real 7-day window 2026-08-24..2026-08-30, account-wide,
+    is C2's own live, non-mutating Insights API reconciliation call (`IMPLEMENTATION_PLAN.md`
+    C2's notes) — not something this step re-fetched (no live call was made here), but a real,
+    already-verified number this step's own analysis leans on. The mechanism itself (a simulated
+    material budget edit producing a correctly-timed/-caused reset; a low-volume ad set reporting
+    `inLearningPhase: true`) is verified against a real Firestore emulator, both in small
+    hand-built fixtures and at the account's real entity scale.
+
+- **The real distribution on this account — the number that matters most here.** At the account's
+  real measured scale (410 campaigns / 534 ad sets / 1,139 ads, ~47 active ads/day), with a
+  purchase-per-active-ad rate carried over unchanged from C2's own scale-test generator (1 in 5
+  active ad-slots converts) — which produces an account-wide weekly total (**70** purchases over
+  the test's synthetic 7-day window) in the same order of magnitude as the account's own real,
+  live-measured figure (**113** `omni_purchase` over a real 7-day week, C2's live reconciliation)
+  — `enrichChangeFeaturesTask.scale.emulator.test.ts` measured: **534/534 ad sets (100%) reported
+  `inLearningPhase: true`; 0 reported `false`.** This is a stronger finding than §13.1's own
+  framing ("several ad sets sit below it indefinitely") — the honest reading of this account's
+  real numbers is that **essentially the entire account**, not merely a subset, structurally
+  cannot clear the ~50/week threshold: even in the extreme, unrealistic case where the account's
+  entire real weekly total (113) were concentrated onto a single ad set, that one ad set would
+  clear 50 only barely and only if nothing else received any volume at all; spread across 534 ad
+  sets as it actually is, no ad set is a plausible candidate to exit learning on a sustained basis.
+  Change events (a small, deliberately sparse seed matching §15.4's own documented real rate for
+  this account — "perhaps ten to twenty per year in total, across all shapes of change" — not
+  scaled to entity count): of 6 seeded, **BUDGET: 3 (2 material — one +30% increase, one −60%
+  decrease, each producing exactly one correctly-attributed reset; one sub-threshold +25% on an
+  older snapshot, producing none), TARGETING: 1, STATUS: 1, CREATIVE_ASSIGNMENT: 1**. Full task
+  run over all 2,083 entities (1,139 AD + 534 ADSET + 410 CAMPAIGN) completed in **14.5s**
+  (well inside any plausible sync interval), zero skips, zero errors.
+
+- **Ambiguities resolved:**
+  1. **Which entity levels get `learningPhase`.** Populated only for AD and ADSET — §13.1 talks
+     specifically about ad sets (and, by the same Meta mechanic, individual ads under ABO); a
+     CAMPAIGN is a rollup of many ad sets with no single learning-phase state of its own, so
+     CAMPAIGN-typed docs (stored in `adsetFeatures`, per C2's own five-vs-three resolution) get
+     `changeAware` populated (a campaign-level budget/status edit is real and reportable) but
+     `learningPhase: {}` left empty. ACCOUNT and CREATIVE_FAMILY get neither — `metaChangeEvents`
+     has no entityType for either (A2/B4's own schema), so there is nothing to enrich them with.
+  2. **Ordering dependency between `RECOMPUTE_FEATURES` and `ENRICH_CHANGE_FEATURES`, made
+     explicit rather than assumed.** This task requires an entity's feature doc to already exist
+     (it merges into it, never creates a fresh one) — `registry.ts`'s registration-order comments
+     and this file's own module comment both say so; an entity processed before its first
+     `RECOMPUTE_FEATURES` run is skipped and counted, not silently given a partial doc.
+  3. **B4's "entity disappears entirely" gap** — handled by construction, not a special case: this
+     task's entity list comes from `metaAdsets`/`metaAds`/`metaCampaigns` (whatever B2's last
+     fetch actually returned), so an entity absent from that fetch is simply never iterated at
+     all — its existing feature doc (if any) is left completely untouched, proven by a dedicated
+     emulator test that seeds a feature doc for an "as_ghost" ad set never present in `metaAdsets`
+     and asserts it comes back byte-identical after a run.
 
 ---
 

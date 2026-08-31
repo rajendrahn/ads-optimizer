@@ -65,6 +65,19 @@ export const SYNC_TASK_TYPES = [
   // repo — Firestore-only, no live Meta/Shopify call, same "internal, no watermark" shape as
   // C1's two normalize tasks above.
   "SEED_SEASONAL_CALENDAR",
+  // C4's addition — not in §10.2's original list. Populates §13/§13.1's `changeAware`/
+  // `learningPhase` sub-objects onto the entity-feature docs RECOMPUTE_FEATURES already wrote,
+  // by diffing/aggregating over B4's `metaChangeEvents` and C1's normalized Meta insights.
+  // Deliberately its own task type, run AFTER RECOMPUTE_FEATURES, rather than folded into it —
+  // see services/analytics/changeFeatures/enrichChangeFeaturesTask.ts's own module comment.
+  "ENRICH_CHANGE_FEATURES",
+  // C3's addition — not in §10.2's original list. §15's statistics layer: intervals, three-state
+  // verdicts and account-mean shrinkage on `metaRoas`/`shopifyRoas`/`cpa`, written onto the
+  // entity-feature docs RECOMPUTE_FEATURES already wrote. Deliberately its own task type, run
+  // AFTER RECOMPUTE_FEATURES (it needs the account-level mean before any individual entity can be
+  // shrunk), alongside — not instead of — C4's own concurrent enrichment pass over the same docs.
+  // See services/analytics/statistics/computeStatisticsTask.ts's own module comment.
+  "COMPUTE_STATISTICS",
 ] as const;
 export type KnownTaskType = (typeof SYNC_TASK_TYPES)[number];
 

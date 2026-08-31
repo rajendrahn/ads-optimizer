@@ -12,3 +12,13 @@
 
 export * from "./daily/index.ts";
 export * from "./seasonality/index.ts";
+// C4's change-aware and learning-phase features (§13, §13.1) — its own enrichment pass over
+// C2's already-written feature docs, not a restructuring of ./features/entityFeaturesBuilder.ts.
+// No name collisions with ./features's own barrel (which is not re-exported here — see this
+// file's own comment above), so this one is safe to add.
+export * from "./changeFeatures/index.ts";
+// C3's statistics layer (§15) — intervals, three-state verdicts and account-mean shrinkage, its
+// own enrichment pass over C2's already-written feature docs (same pattern as C4's above). No
+// name collisions with ./features's own barrel (not re-exported here — see this file's comment
+// above) or with ./changeFeatures.
+export * from "./statistics/index.ts";

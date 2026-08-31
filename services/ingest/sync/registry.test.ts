@@ -36,7 +36,7 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's and C2's real task types", () => {
+  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's, C2's, C4's and C3's real task types", () => {
     const registry = createDefaultRegistry();
     expect(registry.list()).toEqual([
       SYNC_NOOP,
@@ -56,6 +56,12 @@ describe("createDefaultRegistry", () => {
       "SEED_SEASONAL_CALENDAR",
       // C2's own — the feature engine's full recompute (§10.1, §10.2).
       "RECOMPUTE_FEATURES",
+      // C4's own — change-aware/learning-phase enrichment (§13, §13.1), run after
+      // RECOMPUTE_FEATURES.
+      "ENRICH_CHANGE_FEATURES",
+      // C3's own — the statistics layer (§15): intervals/verdicts/shrinkage, also run after
+      // RECOMPUTE_FEATURES, alongside C4's enrichment pass.
+      "COMPUTE_STATISTICS",
     ]);
   });
 
