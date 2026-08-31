@@ -39,6 +39,7 @@ import { seedSeasonalCalendarRegistration } from "../../analytics/seasonality/in
 import { recomputeFeaturesRegistration } from "../../analytics/features/index.ts";
 import { enrichChangeFeaturesRegistration } from "../../analytics/changeFeatures/index.ts";
 import { computeStatisticsRegistration } from "../../analytics/statistics/index.ts";
+import { markDecisionPacketsStaleRegistration } from "../../evidence/decisionPacketStore.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -159,5 +160,9 @@ export function createDefaultRegistry(): TaskRegistry {
   // pass — see computeStatisticsTask.ts's own module comment for why the two never collide.
   // Firestore-only; no live Meta/Shopify call, no watermark of its own.
   registry.register(computeStatisticsRegistration);
+  // D2's own addition (§10.1's "mark all decision packets stale" step) — Firestore-only, run
+  // AFTER RECOMPUTE_FEATURES; see decisionPacketStore.ts's own module comment for why packet
+  // generation itself is NOT a task type but this bulk staleness pass is.
+  registry.register(markDecisionPacketsStaleRegistration);
   return registry;
 }

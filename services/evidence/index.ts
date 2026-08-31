@@ -31,3 +31,23 @@ export {
   type ResolveScalingEvidenceOptions,
 } from "./scalingEvidenceEngine.ts";
 export * from "./types.ts";
+
+// D2 — decision packets (§10.1, §14, §24). See packetBuilder.ts/packetText.ts's own module
+// comments for the structured-object-plus-text-rendering split, and decisionPacketStore.ts's for
+// why packet generation is on-demand (not a task type) while the staleness pass is.
+export {
+  renderDecisionPacketText,
+  renderEvidencePacketText,
+  renderNotDeliveringPacketText,
+  renderNoDecisionUnitPacketText,
+} from "./packetText.ts";
+export { buildDecisionPacket, type BuildDecisionPacketInput } from "./packetBuilder.ts";
+export {
+  generateAndCacheDecisionPacket,
+  markStalePackets,
+  markDecisionPacketsStaleHandler,
+  markDecisionPacketsStaleRegistration,
+  type GenerateAndCacheDecisionPacketOptions,
+  type GenerateAndCacheDecisionPacketResult,
+  type MarkStalePacketsResult,
+} from "./decisionPacketStore.ts";

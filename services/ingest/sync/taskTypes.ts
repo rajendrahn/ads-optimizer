@@ -78,6 +78,13 @@ export const SYNC_TASK_TYPES = [
   // shrunk), alongside — not instead of — C4's own concurrent enrichment pass over the same docs.
   // See services/analytics/statistics/computeStatisticsTask.ts's own module comment.
   "COMPUTE_STATISTICS",
+  // D2's addition — not in §10.2's original list, and not part of C2/C3/C4's own recompute
+  // chain. §10.1's own flow diagram chains "mark all decision packets stale" directly after
+  // "bump accountDataVersion" — this is that step, run AFTER RECOMPUTE_FEATURES (it needs the
+  // account's new version to compare against), Firestore-only, no live Meta/Shopify call, no
+  // watermark of its own. See services/evidence/decisionPacketStore.ts's own module comment for
+  // why packet GENERATION (unlike this bulk staleness pass) is deliberately NOT a task type.
+  "MARK_DECISION_PACKETS_STALE",
 ] as const;
 export type KnownTaskType = (typeof SYNC_TASK_TYPES)[number];
 

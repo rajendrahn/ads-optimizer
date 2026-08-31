@@ -11,9 +11,33 @@ import { entityRef, firestoreTimestamp } from "./common.ts";
 // decisionPackets — §10.1, §14, §24 (D2)
 // ---------------------------------------------------------------------------------------
 
+// D2's own extension of A2's scaffold — three new/loosened fields, all optional/defaulted so
+// A2's original schema.test.ts fixture (no `outcome`/`namedEntity`, always a non-null
+// `decisionUnit`) still parses unchanged:
+//   - `outcome` — D1's ScalingEvidenceResult is a discriminated union on exactly this
+//     ("EVIDENCE" | "NOT_DELIVERING" | "NO_DECISION_UNIT"); the packet keeps that discriminant
+//     rather than flattening all three into one always-populated shape with nulled-out fields.
+//     Defaulted to "EVIDENCE" — every packet written before this field existed was one.
+//   - `namedEntity` — what was actually asked about, distinct from `decisionUnit` (what the
+//     evidence is actually FOR, which can differ after escalation, or not exist at all for
+//     NO_DECISION_UNIT). Always populated by D2's own builder; nullable/defaulted only so an
+//     older/hand-built doc without it still parses.
+//   - `decisionUnit` loosened to nullable — reality #3 (§4.1): budget ownership can genuinely be
+//     UNKNOWN, in which case there IS no decision unit to name. D2 writes `null` there and relies
+//     on `namedEntity` to say what was asked about, rather than fabricating a decision unit that
+//     was never resolved.
+export const decisionPacketOutcomeSchema = z.enum([
+  "EVIDENCE",
+  "NOT_DELIVERING",
+  "NO_DECISION_UNIT",
+]);
+export type DecisionPacketOutcome = z.infer<typeof decisionPacketOutcomeSchema>;
+
 export const decisionPacketSchema = z.object({
   packetId: z.string().min(1),
-  decisionUnit: entityRef,
+  outcome: decisionPacketOutcomeSchema.default("EVIDENCE"),
+  namedEntity: entityRef.nullable().default(null),
+  decisionUnit: entityRef.nullable(),
   escalatedFrom: z
     .object({
       type: z.enum(["AD", "ADSET", "CAMPAIGN"]),

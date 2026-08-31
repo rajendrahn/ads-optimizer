@@ -36,7 +36,7 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's, C2's, C4's and C3's real task types", () => {
+  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's, C2's, C4's, C3's and D2's real task types", () => {
     const registry = createDefaultRegistry();
     expect(registry.list()).toEqual([
       SYNC_NOOP,
@@ -62,6 +62,8 @@ describe("createDefaultRegistry", () => {
       // C3's own — the statistics layer (§15): intervals/verdicts/shrinkage, also run after
       // RECOMPUTE_FEATURES, alongside C4's enrichment pass.
       "COMPUTE_STATISTICS",
+      // D2's own — §10.1's "mark all decision packets stale" step, run after RECOMPUTE_FEATURES.
+      "MARK_DECISION_PACKETS_STALE",
     ]);
   });
 

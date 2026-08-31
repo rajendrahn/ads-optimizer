@@ -3943,7 +3943,18 @@ answer naming the ad set and the reason.
 
 ### D2 — Decision packets
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+715/715 unit tests, up from D1's 689 — this step's own 26 new unit tests across
+`services/evidence/{packetText,packetBuilder}.test.ts`, plus one pre-existing
+`services/ingest/sync/registry.test.ts` assertion updated for the new task type).
+`npm run test:integration` passes 241/241 against a real Firestore emulator (up from 236 pre-D2 —
+this step's own 5 new emulator tests in `services/evidence/decisionPacketStore.emulator.test.ts`,
+each running the REAL, unmodified `RECOMPUTE_FEATURES` → `COMPUTE_STATISTICS` →
+`ENRICH_CHANGE_FEATURES` chain, then D1's `resolveScalingEvidence`, then this step's own
+`generateAndCacheDecisionPacket`/`markStalePackets` on whatever those wrote). No live/production
+Firestore was touched (emulator only); no live Meta/Shopify call was made; no cloud resource was
+created/modified/deployed; no npm dependency was added. See Notes below for the packet's shape,
+the staleness mechanism, and the three rendered outcomes.
 **Depends on:** D1
 **Design refs:** §10.1, §14, §24
 
@@ -3961,6 +3972,169 @@ answer naming the ad set and the reason.
 
 **Done when.** A packet renders with sample sizes and intervals visible in the text; a version bump marks it
 stale.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/evidence/{packetText,packetBuilder,decisionPacketStore}.ts`, each
+  with a co-located `*.test.ts` except `decisionPacketStore.ts` (Firestore glue, exercised only
+  through `decisionPacketStore.emulator.test.ts`). `packetText.ts` and `packetBuilder.ts` are
+  pure — no Firestore — matching D1's own `evidenceAssembler.ts` convention. Also touched:
+  `shared/schema/decisions.ts` (extended `decisionPacketSchema`, additively — see below),
+  `shared/firestore/collections.ts` (added `decisionPacketKey`), `services/ingest/sync/
+  {taskTypes,registry}.ts` (registered one new task type — see below), and
+  `services/ingest/sync/registry.test.ts` (updated its exact-list assertion for that addition).
+
+- **The three-function pipeline, and which parts are pure vs. Firestore-backed.**
+  `renderDecisionPacketText` (packetText.ts, pure) dispatches on D1's own `ScalingEvidenceResult`
+  discriminant and produces the full prose. `buildDecisionPacket` (packetBuilder.ts, pure) wraps
+  that text plus the structured fields into a `DecisionPacket`. `generateAndCacheDecisionPacket`
+  (decisionPacketStore.ts, Firestore) is the one function D3's tools call: it runs D1's
+  `resolveScalingEvidence`, reads the account's *current* `accountDataVersion` from
+  `accountFeatures/{accountId}` (not `evidence.accountDataVersion` — see below), calls
+  `buildDecisionPacket`, and writes through `upsertWithVersionGuard` keyed by `createdAt`
+  (`decisionPacketSchema` has no `sourceUpdatedAt` field, so `getUpdatedAt: (doc) =>
+  doc.createdAt` is passed explicitly) — so a slow, stale regeneration can never clobber a
+  fresher packet that finished first.
+
+- **Why `currentAccountDataVersion` is read independently rather than trusted from
+  `evidence.accountDataVersion`.** D1's EVIDENCE outcome carries a copy of the version off the
+  entity-feature doc it read; NOT_DELIVERING and NO_DECISION_UNIT never read a feature doc at all,
+  so there is no such field to borrow for those two. All three outcomes needed one uniform way to
+  stamp "the version this packet was built against", so `decisionPacketStore.ts` always reads
+  `accountFeatures/{accountId}.accountDataVersion` directly (§10.1's own single monotonic
+  counter), independent of outcome. In practice this equals `evidence.accountDataVersion` for the
+  EVIDENCE case (both come from the same sync run) but the two are conceptually decoupled on
+  purpose.
+
+- **Packet identity: keyed by the NAMED entity, not the resolved decision unit
+  (`decisionPacketKey(type, id)` = `{TYPE}_{id}`, added to `shared/firestore/collections.ts`).** A
+  user asking about AD X and AD X2, both of which escalate to the same ad set, are two different
+  questions with two different escalation stories — each gets and updates its own cached packet
+  slot rather than colliding into one. A repeat request for the same named entity overwrites (and
+  un-stales) that same doc — matches §10.1's "cache it" framing, not an accumulating audit log.
+
+- **`decisionPacketSchema` (shared/schema/decisions.ts) extended additively — A2 had explicitly
+  left this open ("full typing is D1/D2's job").** Three changes, all backward-compatible with
+  A2's own `schema.test.ts` fixture (no `outcome`/`namedEntity` keys, always a non-null
+  `decisionUnit`), which still parses unchanged:
+  1. `outcome: decisionPacketOutcomeSchema.default("EVIDENCE")` — carries D1's own three-way
+     discriminant onto the stored doc, rather than flattening all three outcomes into one
+     always-populated shape with nulled-out fields.
+  2. `namedEntity: entityRef.nullable().default(null)` — what was actually asked about, always
+     populated by this step's own builder. Needed because D1's EVIDENCE-outcome branch of
+     `ScalingEvidenceResult` doesn't carry the originally-named entity at all (only
+     NOT_DELIVERING/NO_DECISION_UNIT do) — the caller supplies it explicitly to
+     `buildDecisionPacket`/`generateAndCacheDecisionPacket` instead.
+  3. `decisionUnit` loosened from `entityRef` to `entityRef.nullable()` — reality #3 (§4.1):
+     budget ownership can genuinely be `UNKNOWN`, in which case there IS no decision unit. A
+     NO_DECISION_UNIT packet writes `decisionUnit: null` rather than fabricating one (e.g. by
+     reusing `namedEntity`, which would misleadingly imply a decision unit had been resolved).
+
+- **The text rendering — what's in it, per the six required-in-text items, and where each comes
+  from (all in `packetText.ts`).**
+  1. *Every ROAS/CPA with sample size and interval* — `ratioMetricLine`/`moneyMetricLine`, applied
+     to every populated window (7d/14d/28d/56d that C2/C3 actually wrote), not only the primary
+     one. CPA is money-formatted through `@shared/canon`'s own `formatMinorUnitsAsDecimal`
+     (`§0.2`: never a bare minor-units integer presented as if it were decimal currency).
+  2. *Verdict AND reason* — `MetricSnapshot.verdictReason` (D1's `verdictExplain.ts`, already full
+     prose distinguishing "not enough volume" from "spans a seasonal boundary" from "overlaps the
+     Shopify data gap") is rendered verbatim after every metric line, not just the label.
+  3. *Escalation, prominently* — `renderEscalationBlock` is placed immediately after the header,
+     before any metric section; a unit test asserts its position is strictly before
+     `MULTI-WINDOW PERFORMANCE` in the string. States what was asked about, what answers instead,
+     and why, using a human-prose lookup table (`ESCALATION_REASON_PROSE`) for D1's four
+     `EscalationReason` codes.
+  4. *Attribution coverage* — `renderAttributionBlock` renders D1's own always-populated
+     `evidence.shopify.note` (the ~0.02%/Magic-checkout caveat) verbatim, plus both coverage
+     ratios and `blendedMerAccountOnly`, directly beside every Shopify ROAS figure — never a
+     Shopify-attributed per-ad ROAS shown without it (§6.2/§6.3).
+  5. *Seasonality* — C5's own `summaryText` rendered verbatim, per window and at the top level;
+     against this account's real n=1/n=0 history it renders as "insufficient for a demand index"
+     prose, not a fabricated number.
+  6. *Judged-against target* — `renderTargetsBlock` names `targetRoas`/`targetCpaMinorUnits` AND
+     `targets.source`, with an explicit "PLACEHOLDER defaults... treat with appropriate
+     skepticism" sentence when `source === "default"` vs. "the operator's own configured targets"
+     when `source === "settings"`.
+  Also rendered, beyond the required six: the §15.3 shrunk baseline stated distinctly from the raw
+  figure ("compare post-change performance against THIS, never the raw figure"), learning-phase
+  state, recent changes, creative fatigue, and the eligibility/suggested-range verdict with every
+  `ineligibleReasons` code explained in prose.
+
+- **All three `ScalingEvidenceResult` outcomes render as first-class packets, not error stubs** —
+  `renderEvidencePacketText`, `renderNotDeliveringPacketText`, `renderNoDecisionUnitPacketText`,
+  each also exercised end to end against the real emulator/pipeline (see the Report for the actual
+  rendered text). NOT_DELIVERING still renders an escalation block when the not-delivering unit
+  was itself escalated to (e.g. asking about a dead ad that escalates to a dead ad set). Both
+  non-EVIDENCE outcomes explicitly state that no ROAS/CPA/target/eligibility figures exist to
+  show, rather than rendering empty sections.
+
+- **Staleness mechanism (§10.1's "mark all decision packets stale" step).** `markStalePackets(db,
+  accountId)` reads the current `accountDataVersion`, queries `decisionPackets` where `isStale ==
+  false` (no composite index needed — the account's packet volume is well under the "few thousand
+  small reads and writes" scale §10.1 itself reasons about), and flips `isStale: true` in place on
+  every doc whose stamped `accountDataVersion` sits strictly behind the current one, leaving
+  already-stale docs and current ones untouched (idempotent by construction). Proven in the
+  emulator test: build a packet at version N, run a second full sync cycle (bumping the account to
+  N+1), confirm the cached packet is *not yet* auto-flipped (nothing has run the staleness pass),
+  run `markStalePackets`, confirm it flips to `isStale: true` while its `accountDataVersion`
+  stamp itself stays untouched (only the boolean moves), then confirm a fresh regeneration is
+  `isStale: false` again at the new version, and a second staleness pass is a no-op.
+
+- **`MARK_DECISION_PACKETS_STALE` is a registered Cloud Tasks task type; packet GENERATION is
+  not — a deliberate, explicitly-reasoned split, extending D1's own precedent rather than
+  contradicting it.** D1 argued its own `resolveScalingEvidence` isn't a task because it's an
+  on-demand, synchronous read with no live call and no watermark — this step's
+  `generateAndCacheDecisionPacket` is the same shape (on-demand, per-entity, called directly by
+  whoever asks a question) plus one small cached write, so it stays a plain function too, not
+  registered anywhere. The staleness pass is different: it is a bulk, Firestore-only,
+  no-live-call, no-watermark sweep that runs AFTER a sync completes — exactly C3's
+  `COMPUTE_STATISTICS` and C4's `ENRICH_CHANGE_FEATURES` shape, and §10.1's own flow diagram
+  literally chains "mark all decision packets stale" right after "bump accountDataVersion". It is
+  registered as `MARK_DECISION_PACKETS_STALE` in `services/ingest/sync/{taskTypes,registry}.ts`
+  (not in §10.2's original list, following B5/B6/B7/B8/C1/C3/C4/C5's own precedent of extending
+  it) and proven runnable as a real task via `runSyncTask` in the emulator suite. **Nothing yet
+  invokes it automatically after a real sync run** — there is no sync-orchestrator in this
+  codebase yet that chains task types together (D1's own emulator test, and this step's, both
+  invoke `RECOMPUTE_FEATURES` → `COMPUTE_STATISTICS` → `ENRICH_CHANGE_FEATURES` explicitly, in
+  order, rather than one auto-chaining into the next); wiring `MARK_DECISION_PACKETS_STALE` into
+  that chain is a D4 job-pipeline concern, flagged here per §0.2's own instruction rather than
+  silently left undone.
+
+- **A real bug caught only by the emulator, not by unit tests.** `ScalingEvidence.escalatedFrom`
+  is an *optional* TypeScript field (`undefined`, not `null`, when there was no escalation).
+  Storing D1's evidence object directly under the packet's `evidence: z.record(...)` field wrote
+  a literal `undefined` into a nested Firestore document field, which the Admin SDK rejects
+  outright ("Cannot use 'undefined' as a Firestore value") — invisible to `zod`'s own
+  `z.record(z.string(), z.unknown())` (which happily accepts `undefined` as a value) and to every
+  unit test (which never touches real Firestore). Fixed in `packetBuilder.ts`'s
+  `evidenceRecordFor` with a `JSON.parse(JSON.stringify(...))` round-trip (the simplest correct
+  sanitizer here — there is no other non-JSON-safe value left in D1's object, which already
+  converts every Date to an ISO string on the way in).
+
+- **A live number worth noting.** The emulator fixture (deliberately realistic, not tuned to
+  pass): 270 purchases/28d at a Meta ROAS of ~3.79x — comfortably `ABOVE_TARGET` against the 3.0
+  placeholder — but a measured CPA of **INR 1761.00**, `ABOVE_TARGET` (worse) against the ₹1,500
+  placeholder `targetCpaMinorUnits`. The rendered packet's own eligibility section reads "NOT
+  ELIGIBLE TO SCALE right now. Reasons: CPA_ABOVE_TARGET" — precisely the placeholder-target
+  problem the task brief called out (this account's real measured CPA already exceeds the
+  placeholder target), rendered honestly by the packet rather than smoothed over, and only visible
+  because §14/§24's own literal-verdict discipline (a ROAS verdict and a CPA verdict are
+  independent gates, not merged into one "good/bad" summary) was carried through from D1 into the
+  text.
+
+- **Ambiguities resolved:**
+  1. **What "the current accountDataVersion" means for NOT_DELIVERING/NO_DECISION_UNIT, which
+     never read a feature doc.** Resolved by reading `accountFeatures/{accountId}` directly in
+     `decisionPacketStore.ts`, uniformly across all three outcomes, rather than leaving those two
+     outcomes without a meaningful stamped version — see above.
+  2. **Whether packet generation should be a Cloud Tasks task type.** Resolved: no, for
+     generation; yes, for the staleness sweep — see above, reasoned by direct analogy to D1's own
+     task/non-task split rather than a fresh judgment call.
+  3. **What packet identity (`packetId`) should be keyed on** — the named entity vs. the resolved
+     decision unit. Resolved: the named entity, so escalation stories don't collide — see above.
+  4. **Whether `decisionUnit` should stay a required, non-null field on the schema.** Resolved: no
+     — loosened to nullable so NO_DECISION_UNIT can be represented honestly rather than borrowing
+     `namedEntity` into a field whose name implies resolution occurred.
 
 ---
 

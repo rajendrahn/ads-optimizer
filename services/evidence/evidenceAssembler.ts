@@ -14,6 +14,7 @@ import type { Verdict } from "@services/analytics/statistics/index.ts";
 import { isDelivering } from "./deliveryCheck.ts";
 import { computeRecentMajorChanges } from "./recentChanges.ts";
 import { explainVerdict } from "./verdictExplain.ts";
+import { formatMinorUnitsAsDecimal } from "@shared/canon/index.ts";
 import type {
   CreativeFatigueEvidence,
   EscalatedFrom,
@@ -56,6 +57,9 @@ function metricSnapshot(
   minPurchaseFloor: number,
   seasonality: { spansSeasonalBoundary: boolean; labels: readonly string[] } | undefined,
   gap?: { windowHasDataGap: boolean; gapDays: readonly string[] },
+  /** Pass for a money metric so the explanation renders minor units as currency — see
+   * `explainVerdict`'s `formatValue`. Omit for a ratio metric like ROAS. */
+  formatValue?: (value: number) => string,
 ): MetricSnapshot {
   const m = metric ?? {
     value: null,
@@ -82,6 +86,7 @@ function metricSnapshot(
       seasonalityLabels: seasonality?.labels ?? [],
       windowHasDataGap: gap?.windowHasDataGap,
       gapDays: gap?.gapDays,
+      formatValue,
     }),
   };
 }
@@ -91,6 +96,7 @@ function buildWindowEvidence(
   window: WindowMetrics,
   targets: TargetsEvidence,
   minPurchaseFloors: Readonly<Record<WindowLabel, number>>,
+  reportingCurrency: string,
 ): WindowEvidence {
   const floor = minPurchaseFloors[label];
   const seasonality = window.seasonality ?? {
@@ -111,6 +117,14 @@ function buildWindowEvidence(
       targets.targetCpaMinorUnits,
       floor,
       seasonality,
+      undefined,
+      // CPA is money in integer minor units — without this the sentence would read
+      // "INR 1761.00 is confidently above the target of 150000", which contradicts itself.
+      (value) =>
+        formatMinorUnitsAsDecimal({
+          amountMinorUnits: Math.round(value),
+          currency: reportingCurrency,
+        }),
     ),
     shopifyRoas: metricSnapshot(
       "Shopify ROAS",
@@ -177,6 +191,9 @@ export interface AssembleScalingEvidenceInput {
   creativeFamilyId: string | null;
   creativeFamily: CreativeFamily | null;
   creativeFatigueNotApplicableReason: string | null;
+  /** The canon reporting currency, used to render money metrics (CPA) as currency in the
+   * verdict explanation rather than raw minor units — see `explainVerdict`'s `formatValue`. */
+  reportingCurrency: string;
 }
 
 export function assembleScalingEvidence(input: AssembleScalingEvidenceInput): ScalingEvidence {
@@ -185,7 +202,14 @@ export function assembleScalingEvidence(input: AssembleScalingEvidenceInput): Sc
   const labels: WindowLabel[] = ["7d", "14d", "28d", "56d"];
   for (const label of labels) {
     const w = features.windows?.[label];
-    if (w) windows[label] = buildWindowEvidence(label, w, input.targets, input.minPurchaseFloors);
+    if (w)
+      windows[label] = buildWindowEvidence(
+        label,
+        w,
+        input.targets,
+        input.minPurchaseFloors,
+        input.reportingCurrency,
+      );
   }
 
   const primary = windows[PRIMARY_WINDOW];

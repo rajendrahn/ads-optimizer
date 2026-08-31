@@ -25,15 +25,34 @@ export interface ExplainVerdictInput {
    * #4/#5: the gap is Shopify-only). */
   windowHasDataGap?: boolean;
   gapDays?: readonly string[];
+  /** How to render `target` and the interval bounds as text. Defaults to a plain 2-decimal
+   * number, which is right for a ratio metric like ROAS ("above the target of 3.00").
+   *
+   * ⚠️ It is NOT right for a money metric. CPA travels in integer minor units (§0.2), so the
+   * default would render a ₹1,500 target as "150000" in the same sentence where the value is
+   * formatted as "INR 1761.00" — producing "INR 1761.00 is confidently above the target of
+   * 150000", which reads as though 1761 were BELOW the target and argues against its own
+   * verdict. This packet text is what the model reasons over (§15.2), so a caller passing a
+   * money metric MUST pass a matching minor-units formatter. Caught at D2 review by reading a
+   * real rendered packet; no unit test would have flagged it, since each half was individually
+   * correct. */
+  formatValue?: (value: number) => string;
 }
 
-function formatInterval(low: number | null, high: number | null): string {
+function formatInterval(
+  low: number | null,
+  high: number | null,
+  fmt: (value: number) => string,
+): string {
   if (low === null || high === null) return "no interval available";
-  return `[${low.toFixed(2)}, ${high.toFixed(2)}]`;
+  return `[${fmt(low)}, ${fmt(high)}]`;
 }
 
 export function explainVerdict(input: ExplainVerdictInput): string {
   const { label } = input;
+  // See `formatValue`'s doc comment — the default is correct for ratio metrics only, and a
+  // money metric must supply a minor-units formatter or the sentence contradicts its verdict.
+  const fmt = input.formatValue ?? ((value: number) => value.toFixed(2));
 
   if (input.value === null) {
     return (
@@ -50,8 +69,8 @@ export function explainVerdict(input: ExplainVerdictInput): string {
   if (input.verdict !== "NOT_DISTINGUISHABLE") {
     const direction = input.verdict === "ABOVE_TARGET" ? "above" : "below";
     return (
-      `${label} is confidently ${direction} the target of ${input.target} — interval ` +
-      `${formatInterval(input.intervalLow, input.intervalHigh)} from ${input.sampleSize} purchases.`
+      `${label} is confidently ${direction} the target of ${fmt(input.target)} — interval ` +
+      `${formatInterval(input.intervalLow, input.intervalHigh, fmt)} from ${input.sampleSize} purchases.`
     );
   }
 
@@ -89,7 +108,7 @@ export function explainVerdict(input: ExplainVerdictInput): string {
   }
   return (
     `${label} verdict is NOT_DISTINGUISHABLE — the confidence interval ` +
-    `${formatInterval(input.intervalLow, input.intervalHigh)} straddles the target of ${input.target} ` +
+    `${formatInterval(input.intervalLow, input.intervalHigh, fmt)} straddles the target of ${fmt(input.target)} ` +
     `even with ${input.sampleSize} purchases; genuinely inconclusive, not a data-quality issue.`
   );
 }

@@ -176,6 +176,7 @@ export async function resolveScalingEvidence(
     creativeFamilyId,
     creativeFamily,
     creativeFatigueNotApplicableReason,
+    reportingCurrency: canon.reportingCurrency,
   });
 
   return { outcome: "EVIDENCE", evidence };

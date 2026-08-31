@@ -229,11 +229,27 @@ export function syncStateKey(source: "meta" | "shopify", resource: string): stri
   return `${source}_${resource}`;
 }
 
-// decisionPackets/{id}, recommendations/{id}, backtestRuns/{id}, aiConversations/{id},
-// accountMemory/{id} — each generates its own ID at write time (a request UUID, etc.), not
-// derived from source data. Later steps that own those ID schemes should add a helper here
-// rather than hand-building one inline, to keep this file the single place document IDs are
-// decided.
+/**
+ * decisionPackets/{entityType}_{entityId} — D2's own scheme. One packet slot per NAMED entity
+ * (what was actually asked about, e.g. a specific low-volume AD) — not per resolved decision
+ * unit, since two different named entities that both escalate to the same ad set are two
+ * different questions with two different escalation stories, and each should cache/update its
+ * own packet independently rather than colliding into one. A repeat request for the same named
+ * entity overwrites (and un-stales) this same doc rather than accumulating packet history —
+ * matches §10.1's "cache it" framing, not an audit log of every generation.
+ */
+export function decisionPacketKey(
+  entityType: "AD" | "ADSET" | "CAMPAIGN",
+  entityId: string,
+): string {
+  assertValidIdSegment(entityId, "entityId");
+  return `${entityType}_${entityId}`;
+}
+
+// recommendations/{id}, backtestRuns/{id}, aiConversations/{id}, accountMemory/{id} — each
+// generates its own ID at write time (a request UUID, etc.), not derived from source data.
+// Later steps that own those ID schemes should add a helper here rather than hand-building one
+// inline, to keep this file the single place document IDs are decided.
 
 // syncRuns/{runId} — B1 decided this ID scheme: `runId` is the task's own idempotency key,
 // supplied by whatever enqueues the task (services/ingest/sync/taskQueue.ts) or generated

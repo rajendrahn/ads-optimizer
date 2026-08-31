@@ -120,6 +120,7 @@ function baseInput(overrides: Partial<Parameters<typeof assembleScalingEvidence>
     creativeFamilyId: null,
     creativeFamily: null,
     creativeFatigueNotApplicableReason: "not applicable",
+    reportingCurrency: "INR",
     ...overrides,
   };
 }
