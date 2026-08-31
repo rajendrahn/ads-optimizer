@@ -2881,8 +2881,54 @@ stale.
 - **PII boundary enforced in the tool layer** (§17.2) — aggregates and customer *type* only, never identity
 - `stop_reason` checked before reading content; server-side `fallbacks` configured (§19.1)
 - Provenance recorded per §19.4
+- **External ad-optimization knowledge** — see the dedicated subsection below. Added at the user's
+  direction; not in the original design.
 
-**Out of scope.** The job pipeline — D4. Guardrail validation — D5.
+#### D3.1 — External ad-optimization knowledge (added by the user, not in the design)
+
+**Why.** As specified, the reasoner sees only this account's own numbers. It has no notion of what good
+practice looks like — when scaling a budget by 20% vs 50% is sane, what a healthy CTR or funnel drop-off
+looks like for jewellery/ecommerce, how Meta's learning phase actually behaves. The user wants Fable to
+have that context.
+
+**⚠️ Do NOT implement this as a live web search on every recommendation.** Three things break if you do:
+
+1. **E1's backtest stops being reproducible.** E1 rebuilds the world as of date T using only data available
+   at T, and calls leakage "the failure mode here, and it is silent". Live web content is neither
+   point-in-time nor stable, so a replayed recommendation would consult tomorrow's web to explain
+   yesterday's decision. Any web content reaching the model must be **versioned and pinned**, so a backtest
+   can reconstruct exactly what the model saw.
+2. **It poisons the §19.3 cache prefix.** Caching order is *tools → system → account context → packet*,
+   volatile last. Per-call web results injected early would invalidate the prefix on every request and
+   defeat the `cache_read_input_tokens` proof in this step's own Done-when.
+3. **Prompt injection.** Web pages are the least trusted input in the entire system — far more so than the
+   creative text §17.3 already frames. A page can contain text engineered to look like instructions.
+
+**Build it instead as a cached, versioned knowledge layer:**
+- A `adOptimizationKnowledge/{version}` document holding a curated, summarized playbook of ad-optimization
+  guidance, refreshed on an explicit operator-triggered task — **never implicitly per recommendation**.
+- Inject it in the **stable** part of the prompt (with the system/account context, before the packet) so it
+  is cached rather than re-sent, and stamp its `version` into the §19.4 provenance of every recommendation
+  that used it.
+- **Frame it as untrusted reference material** (§17.3), explicitly marked as general background that never
+  overrides this account's own measured evidence. The §14 evidence and §15 intervals remain authoritative;
+  a web-sourced heuristic must never override a `NOT_DISTINGUISHABLE` verdict or a guardrail.
+- Guardrails (D5) are enforced in code after the model returns and are **not** negotiable by anything this
+  knowledge says. Note this explicitly in D5 too.
+- Record each entry's source URL and retrieval date so a claim can be traced and re-checked.
+
+**Where the content comes from.** Anthropic's server-side web search tool is the natural fetcher, run inside
+the refresh task — not inside the recommendation path. A hand-curated seed playbook is an acceptable and
+cheaper v1; the requirement is that the knowledge is versioned, pinned and attributed, not that it is
+machine-fetched.
+
+**Done when.** A recommendation's provenance names the knowledge version it used; re-running the same packet
+against the same knowledge version is reproducible; `cache_read_input_tokens` is still non-zero, proving the
+knowledge sits in the cached prefix; and a synthetic knowledge entry instructing the model to ignore its
+guardrails does **not** change the guardrail outcome (test this — it is the injection case that matters).
+
+**Out of scope.** The job pipeline — D4. Guardrail validation — D5. Conversational/ad-hoc web lookups in the
+UI — Phase F, alongside the conversational follow-up already deferred there.
 
 **Done when.** A real packet yields a schema-valid recommendation; `usage.cache_read_input_tokens` is
 non-zero on a repeated call, proving the cache prefix is stable; a tool returning raw rows fails review.
@@ -2934,6 +2980,10 @@ add streaming later, SSE goes direct from Cloud Run.
 - Post-model validation: max change percent, minimum spend and purchases, decision unit actually being the
   budget owner
 - Violations rejected and downgraded to `INSUFFICIENT_DATA`
+- **Guardrails are not negotiable by D3.1's external knowledge layer.** That playbook is untrusted
+  reference material; nothing in it may relax a limit, and a knowledge entry that appears to instruct
+  otherwise must have no effect here. Guardrails run in code after the model returns, so this holds
+  structurally — keep it that way, and test the case.
 - **Every rejection logged with its reason** — §20.2 notes this log is itself a calibration signal for E3
 - Confidence reduced after very recent major edits and for composite creatives
 
