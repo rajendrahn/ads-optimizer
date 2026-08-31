@@ -6,6 +6,7 @@ import {
   metaInsightsDailyKey,
   metaInsightsDailyNormalizedKey,
   recommendationOutcomeKey,
+  seasonalCalendarWindowKey,
   shopifyOrderLineKey,
   shopifyRefundKey,
   shopifyRefundNormalizedKey,
@@ -37,11 +38,15 @@ describe("COLLECTIONS", () => {
       "shopifyOrdersNormalized",
       "shopifyRefundsNormalized",
       "shopifyDailyCoverage",
+      // C5's own — see shared/schema/seasonality.ts's module comment.
+      "seasonalCalendarWindows",
       "creativeAssets",
       "creativeFamilies",
       "adFeatures",
       "adsetFeatures",
       "accountFeatures",
+      // C2's own — see shared/schema/features.ts's module comment.
+      "creativeFamilyFeatures",
       "decisionPackets",
       "recommendations",
       "recommendationOutcomes",
@@ -112,6 +117,12 @@ describe("deterministic key helpers (§9.5)", () => {
     expect(shopifyRefundNormalizedKey("5123456789012", "999888777")).toBe(
       "5123456789012_999888777",
     );
+  });
+
+  it("seasonalCalendarWindowKey is deterministic in (label, startDay)", () => {
+    expect(seasonalCalendarWindowKey("diwali", "2025-10-19")).toBe("diwali_2025-10-19");
+    expect(seasonalCalendarWindowKey("diwali", "2026-11-07")).toBe("diwali_2026-11-07");
+    expect(() => seasonalCalendarWindowKey("", "2025-10-19")).toThrow();
   });
 
   it("recommendationOutcomeKey is 1:1 with the recommendation it evaluates", () => {

@@ -36,7 +36,7 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's and C1's real task types", () => {
+  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's and C2's real task types", () => {
     const registry = createDefaultRegistry();
     expect(registry.list()).toEqual([
       SYNC_NOOP,
@@ -52,6 +52,10 @@ describe("createDefaultRegistry", () => {
       "SHOPIFY_RESOLVE_ATTRIBUTION",
       "NORMALIZE_META_INSIGHTS_DAILY",
       "NORMALIZE_SHOPIFY_DAILY",
+      // C5's calendar/seasonality seed task.
+      "SEED_SEASONAL_CALENDAR",
+      // C2's own — the feature engine's full recompute (§10.1, §10.2).
+      "RECOMPUTE_FEATURES",
     ]);
   });
 

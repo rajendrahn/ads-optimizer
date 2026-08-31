@@ -58,6 +58,10 @@ export function normalizeShopifyOrder(
     customerId: order.customerId,
     resolvedAdId: order.resolvedAdId,
     resolvedCampaignId: order.resolvedCampaignId,
+    // C2 addition — see shared/schema/analytics.ts's comment on shopifyOrderNormalizedSchema for
+    // why these were missing and why C2 needed them carried through.
+    resolutionMethod: order.resolutionMethod ?? null,
+    resolutionConfidence: order.resolutionConfidence ?? null,
     source: order.source,
     sourceUpdatedAt: order.sourceUpdatedAt,
     computedAt: ctx.computedAt,

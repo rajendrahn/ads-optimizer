@@ -11,3 +11,4 @@ export * from "./sync.ts";
 export * from "./ai.ts";
 export * from "./settings.ts";
 export * from "./analytics.ts";
+export * from "./seasonality.ts";

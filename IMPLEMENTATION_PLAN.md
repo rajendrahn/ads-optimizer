@@ -2653,7 +2653,20 @@ attributed to; the timezone stamp is present on every record.
 
 ### C2 — Feature engine
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+591/591 unit tests, up from C1/B8's baseline — this step's own 91 new tests across
+`services/analytics/features/**`, plus 2 schema/collection guard-test updates). `npm run
+test:integration` passes 221/221 against a real Firestore emulator (up from 195 pre-C2 — this
+step's own 8 new emulator tests: 7 correctness + 1 realistic-scale timing proof), including a
+run seeded at the account's real measured scale (1,139 ads / 534 ad sets / 410 campaigns / 300
+creatives / 2,632 Meta rows / 448 Shopify orders) that completed in **13.7–19.3s** across repeat
+runs — well inside any plausible sync interval. A live, read-only Meta Insights API call
+(account-level, 7-day window, the account's real pinned attribution) was fed through this step's
+own aggregation code and reproduced Meta's reported numbers exactly. No live/production
+Firestore was touched (emulator only); no mutating Meta/Shopify call was made; no cloud resource
+was created/modified/deployed; no npm dependency was added. See Notes below for the feature
+shape, exactly how gap-safety was made structural, real timing/counts, and the reconciliation
+check.
 **Depends on:** C1, B7, B8
 **Design refs:** §4.2, §10.1, §12
 
@@ -2683,6 +2696,318 @@ reconcile against Meta Ads Manager for the same window and attribution setting.
 
 **Notes for the planning agent.** The performance target is deliberately loose because the account is small
 (§2.1). Prefer clarity over cleverness — if a full recompute takes ten seconds, that is fine.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/analytics/features/{windows,gapAware,shopifyWindowAggregate,
+  metaWindowAggregate,seasonality,entityGraph,attribution,windowMetricsBuilder,trend,
+  entityFeaturesBuilder,accountDataVersion,recomputeFeaturesTask,index}.ts`, each with a
+  co-located `*.test.ts` (91 pure unit tests, no emulator needed for any of them);
+  `recomputeFeaturesTask.emulator.test.ts` (7 correctness tests against a real emulator) and
+  `recomputeFeaturesTask.scale.emulator.test.ts` (1 realistic-scale timing test, separated into
+  its own file so it can carry its own long `beforeAll`/`afterAll`/`it` timeouts without
+  affecting the fast correctness suite). `services/ingest/sync/registry.ts` gained one import +
+  one `registry.register(recomputeFeaturesRegistration)` line — `RECOMPUTE_FEATURES` was already
+  in `taskTypes.ts`'s §10.2 list, so no new task-type name was needed, unlike several earlier
+  steps. `services/analytics/index.ts` deliberately does NOT re-export `./features/index.ts` (see
+  that file's own comment) — it defines its own copy of C5's `DayRange`/`SeasonalityContext`
+  contract (by design, not by accident — see the seasonality point below), which collides under
+  a wildcard re-export with C5's `./seasonality/index.ts` exporting the same names; nothing needs
+  the combined top-level barrel, every caller imports `@services/analytics/features/index.ts`
+  directly.
+
+- **⚠️ THE GAP-SAFETY REQUIREMENT — exactly how it is structural, not conventional, and what
+  happens if a future author tries to bypass it.** `services/analytics/features/
+  shopifyWindowAggregate.ts`'s `aggregateShopifyWindow` is the ONLY function anywhere in this
+  codebase that sums `shopifyOrdersNormalized`/`shopifyRefundsNormalized` rows into a window
+  total, and its return type is `GapAware<ShopifyWindowTotals>`
+  (`services/analytics/features/gapAware.ts`) — `{ value, windowHasDataGap, gapDays }`. There is
+  no sibling "just give me the number" export next to it; grep for `ShopifyWindowTotals` and the
+  only place one is *constructed* (not just typed) is inside that one function. Three layers make
+  this actually hard to route around, not merely discouraged:
+  1. **The aggregator itself determines the gap verdict independently of the data it's summing.**
+     It doesn't infer "gap" from an empty result — it scans `shopifyDailyCoverage` for every day
+     in the window and flags `windowHasDataGap` if ANY day is missing a coverage row or has
+     `hasCoverageGap: true`. A missing coverage row is treated as a gap (fail-safe default), never
+     as "must be fine" — proven by `shopifyWindowAggregate.test.ts`'s dedicated case. This means
+     an entity with a genuine, real zero (fully-covered window, truly no orders) gets
+     `windowHasDataGap: false`, and an entity with real orders in a gap-affected window still gets
+     `windowHasDataGap: true` with the number intact, not suppressed — both proven live against
+     the emulator in `recomputeFeaturesTask.emulator.test.ts`.
+  2. **`windowMetricsBuilder.ts`'s `buildWindowMetrics` — the function that actually assembles
+     the `WindowMetrics` object written to Firestore — takes `shopifyAttributedIdOnly:
+     GapAware<ShopifyWindowTotals>` as its parameter type, not a plain `ShopifyWindowTotals`.**
+     A caller who tried to hand-sum orders themselves (or call some other summing helper) and
+     pass the plain totals object in would fail `tsc`, not fail a runtime assertion — the missing
+     `.windowHasDataGap`/`.gapDays` fields are a compile error against that parameter type. The
+     compiler enforces the discipline; a code reviewer catching a missed convention is not
+     required.
+  3. **The one legitimate escape hatch is `unsafeIgnoreGap(gapAware, justification)`**
+     (`gapAware.ts`) — unwraps to the plain value, but throws unless `justification` is a
+     non-empty string. It doesn't validate or store the justification anywhere; it exists purely
+     so the call site has to write down, in the code, why it's looking past the flag — and so
+     `grep -rn unsafeIgnoreGap` finds every place that ever happened. **C2 itself never calls
+     it** — the shopify-derived fields on `WindowMetrics` all carry `shopifyDataGap` (one object
+     per window, covering every Shopify-sourced field in that window — `shopifyAttributedPurchases/
+     RevenueMinorUnits`, `shopifyNetRevenueMinorUnits`, `shopifyRoas`(+Shrunk), `aov`,
+     `newCustomerPercent`, `newCustomerCpaMinorUnits`, `refundRate`,
+     `estimatedContributionMarginMinorUnits`, `blendedMerAccountOnly`, and
+     `attributionCoverageRatio` via its Shopify-side numerator) straight through to storage,
+     unmodified, un-suppressed. **A future C3/D1 author reading `adFeatures/{adId}.windows["28d"]`
+     gets `shopifyDataGap: {windowHasDataGap, gapDays}` sitting in the exact same object as
+     `shopifyNetRevenueMinorUnits` — they cannot destructure one without the other being right
+     there** (unlike, say, a separate `gapFlags` collection they could forget to join against).
+     If D1 wants to show a number from a gap window anyway (with the gap called out in the packet
+     text, which §15.2's own precedent for intervals argues for), the honest path is to read
+     `windowMetrics.shopifyDataGap` and render it, not to strip it — there's no code path handed
+     to them that already strips it.
+  - **Meta-side figures are correctly NOT wrapped in `GapAware` at all** — `metaWindowAggregate.ts`
+    returns a plain `MetaWindowTotals`, because the gap is genuinely Shopify-only (C1's own
+    finding, repeated in this step's brief): wrapping Meta figures in a gap type that never
+    applies to them would be a false signal, not an abundance of caution.
+
+- **The real gap, concretely, for this account.** B5/C1's recorded `[2025-12-14, ~2026-07-02)`
+  hole (widening daily until a further Matrixify export or B6 webhooks close it) means, as of
+  today (2026-08-30), any 56d window is now clear of it (56 days back from 2026-08-30 starts
+  2026-07-06, past the gap's end), but any 28d/14d/7d window computed on or shortly after
+  2026-08-30 would ALSO be clear — **this will bite again the next time someone runs a recompute
+  with `asOfDay` anywhere between 2025-12-14 and ~2026-07-02** (a backfill re-run, a historical
+  what-if, or simply this account's gap widening again if nothing closes it further). Proven
+  mechanically (not just described) by `recomputeFeaturesTask.emulator.test.ts`'s dedicated gap
+  test: a coverage gap placed inside the 28d window but outside the 7d window correctly flags
+  only the 28d window's `shopifyDataGap.windowHasDataGap`, while leaving that same window's
+  `spendMinorUnits`/`purchases.value` (Meta-sourced) untouched.
+
+- **The feature shape, and how C3/C4/D1 should consume it.** `entityFeaturesSchema`
+  (`shared/schema/features.ts`) is unchanged in its outer shape from A2's stub (`entityId`,
+  `entityType`, `accountDataVersion`, `computedAt`, `windows: {7d|14d|28d|56d: WindowMetrics}`,
+  `trend`, `changeAware`, `learningPhase`) — C2 populates `windows` (all four labels, always) and
+  `trend`, and writes `changeAware: {}` / `learningPhase: {}` (both C4's job; every field on those
+  two is `.partial()`, so an empty object is valid, not a placeholder hack). Inside each window's
+  `WindowMetrics`:
+  - **Every field C3 needs to layer intervals/shrinkage/verdicts onto is already shaped for it.**
+    `purchases`/`metaRoas`/`shopifyRoas`/`cpa` are all `metricWithInterval` objects with
+    `intervalLow`/`intervalHigh`/`verdict` present but always `null` from C2 (C3's job), and
+    `sampleSize` already populated with the real purchase count. `metaRoasShrunk`/
+    `shopifyRoasShrunk` are top-level `number | null` fields, always `null` from C2 — C3 should
+    read the raw `.value` + `sampleSize`, compute the shrunk figure, and write it back into the
+    SAME doc's SAME window (a partial update or a fresh full-recompute pass reading C2's own
+    output, C3's call to make) rather than inventing a new field.
+  - **`metricWithInterval.value` is nullable** — a deliberate tightening from A2's original
+    non-nullable shape, safe because nothing had written to these collections before C2 (first
+    writer). This is load-bearing for §6.3's "never report zero revenue for an unresolvable ad"
+    rule (next point) — C3/D1 must treat a `null` value as "not measured", never coerce it to 0
+    before computing an interval or a verdict on top of it.
+  - **§6.3's URL-tag-audit exclusion is real, not just documented.** For an AD-level doc only,
+    when `adUrlTagAudits/{adId}.resolvable === false` (B7), every Shopify-attributed field in
+    every window is written `null`, never `0` — `shopifyAttributedPurchases`,
+    `...RevenueMinorUnits`, `shopifyNetRevenueMinorUnits`, `shopifyRoas.value`, `aov`,
+    `newCustomerPercent`, `newCustomerCpaMinorUnits`, `refundRate`,
+    `estimatedContributionMarginMinorUnits`. Meta-sourced fields on the SAME ad/window are
+    completely unaffected. Proven against a real emulator
+    (`recomputeFeaturesTask.emulator.test.ts`'s "§6.3" case). This null-vs-zero distinction is
+    deliberately scoped to AD level only — an ADSET/CAMPAIGN/CREATIVE_FAMILY/ACCOUNT rollup
+    naturally absorbs an unresolvable member ad's zero contribution to the numerator without
+    needing the same treatment (an unresolvable ad structurally cannot produce a
+    `resolvedAdId`-matched order in the first place, so it just doesn't add to the sum — the
+    aggregate's own `attributionCoverageRatio` is what communicates incompleteness at that
+    altitude, per §6.3's actual point: "its level is not meaningful; its drift is").
+  - **`attribution` (§5.3) is carried onto every `WindowMetrics` object**, copied verbatim from
+    the underlying `metaInsightsDailyNormalized` rows (never re-derived, never defaulted) —
+    `null` when the window has zero Meta rows OR when the rows inside it disagree (the canon
+    changed mid-window). This was a genuine gap in the schema as A2 left it (no attribution field
+    on `windowMetrics` at all) that this step's own "Done when" line ("attribution provenance...
+    carry it onto your features") required fixing — added to `shared/schema/features.ts` and
+    threaded through `metaWindowAggregate.ts`. **C3/D1: a `null` attribution on a window is the
+    honest signal that its ROAS/CPA are not safely comparable to a window under a different
+    attribution setting — §5.3's own "invalidate trend features that span the boundary" case.**
+  - **`shopifyDataGap`, `blendedMerAccountOnly`, `seasonality`** — see their own points above/
+    below. `attributionCoverageRatio`/`attributionCoverageRatioIncludingNameMatch` are both
+    populated per window/entity via B7's own `computeAttributionCoverageRatio` (ID-only is the
+    default field, the NAME_MATCH-inclusive figure is the distinctly-named sibling, never
+    merged — B7's contract honoured exactly, not reinterpreted).
+  - **Ambiguity resolved: the five-levels-vs-three-collections gap A2 flagged.** AD ->
+    `adFeatures`, ADSET -> `adsetFeatures`, CAMPAIGN -> `adsetFeatures` keyed by campaign id with
+    `entityType: "CAMPAIGN"` (A2's own suggested resolution, taken as-is), ACCOUNT ->
+    `accountFeatures`, and CREATIVE_FAMILY -> a new, dedicated `creativeFamilyFeatures`
+    collection — NOT piggybacked onto `adFeatures` (A2's other suggested option), because a
+    family's `familyId` (an assetHash, or `composite_{creativeId}`) is not guaranteed disjoint
+    from a numeric Meta ID in the abstract, and a dedicated collection removes that risk entirely
+    for the cost of one more collection, matching the precedent every earlier step already set
+    for "a genuinely new artifact this step needs" (B3's `metaInsightsReportJobs`, B7's
+    `adUrlTagAudits`, C1's four analytics collections). §11.3's family-only fields
+    (`familyAgeDays`, `totalHistoricalSpendMinorUnits`, `activeAdsCount`, `fatigueScore`) stay on
+    `creativeFamilies` itself per B8's own explicit hand-off note — this new collection carries
+    only the §12 windowed metric set, which the flat `creativeFamilySchema` has no shape for.
+  - **`shopifyOrdersNormalized` gained `resolutionMethod`/`resolutionConfidence`
+    (optional/defaulted).** C1's original cut of that schema carried `resolvedAdId`/
+    `resolvedCampaignId` but not the method/confidence that qualify them — which made it
+    impossible to honour B7's own explicit contract ("never sum resolvedAdId-attributed revenue
+    without filtering/segmenting by resolutionMethod first") from the normalized collection
+    alone. Fixed at the source: `shared/schema/analytics.ts`'s
+    `shopifyOrderNormalizedSchema` and `services/analytics/daily/shopifyNormalize.ts`'s
+    `normalizeShopifyOrder` both updated to carry the fields through — additive, optional,
+    doesn't change any existing behaviour, and the next `NORMALIZE_SHOPIFY_DAILY` run (a full
+    recompute already, per C1's own design) picks it up automatically, no backfill script needed.
+
+- **The full recompute algorithm, in one paragraph.** One Firestore read pass per sync run:
+  every `metaCampaigns`/`metaAdsets`/`metaAds`/`metaCreatives`/`creativeAssets`/`creativeFamilies`
+  doc (full collection scans — matching B2/B8's own "full recompute, wholesale" precedent for
+  Meta-sourced entities), plus `metaInsightsDailyNormalized`/`shopifyOrdersNormalized`/
+  `shopifyRefundsNormalized`/`shopifyDailyCoverage` filtered to a single `[earliestDay, asOfDay]`
+  range query (`earliestDay = asOfDay - 55`, the 56d window's own start — proven sufficient for
+  BOTH the widest current window AND the previous-7d trend baseline by
+  `windows.test.ts`'s dedicated case, since `previousEquivalentWindow(7d window)` never reaches
+  further back than that). No per-entity, per-window Firestore query — every entity's every
+  window is computed in-memory from that one read pass by filtering the already-fetched rows
+  (by `adId`/`adsetId`/`campaignId` directly for Meta rows, since `metaInsightsDailyNormalized`
+  already carries all three; via the ad->family map, built once from `metaAds`/`metaCreatives`/
+  `creativeAssets`, for creative-family rows). `asOfDay` defaults to **yesterday** (reporting
+  timezone), not today — a partial in-progress calendar day would understate every window it
+  touches, indistinguishable from a real drop without this default; overridable via payload.
+  `accountDataVersion` is read once from the PREVIOUS `accountFeatures/{accountId}` doc's own
+  `accountDataVersion` (0 if none exists yet — first-ever run), incremented by 1, and applied to
+  every entity doc this run writes — no separate version-counter collection was invented; the
+  account-level doc already exists every run and already carries the field. Every entity doc is
+  written through `upsertWithVersionGuard` with `getUpdatedAt: (doc) => doc.computedAt` (a custom
+  override, not a new schema field) — this was a deliberate choice to go through the version
+  guard for a full-recompute collection (unlike B2/B8's Meta-entity precedent of wholesale,
+  unguarded replacement), because two `RECOMPUTE_FEATURES` runs racing each other is a real
+  possibility this framework doesn't otherwise prevent, and the guard's existing "reject an
+  older write" semantics protect against a late-finishing stale run clobbering a fresher one at
+  effectively no extra cost.
+
+- **Real full-recompute timing and counts — measured, not estimated.** Two live emulator runs at
+  the account's real B2/B3-measured scale (1,139 ads / 534 ad sets / 410 campaigns; 300 synthetic
+  creatives, standing in for B8's real creative population since a live creative fetch was not
+  re-pulled this session — see the throttle note below; ~47 active ad-days/day × 56 days = 2,632
+  Meta rows, B3's own live density measurement; 448 Shopify orders, ~1-in-90 resolving AD_ID,
+  matching B7's near-zero coverage finding): **13.7s and 19.3s** across two separate runs
+  (`recomputeFeaturesTask.scale.emulator.test.ts`), writing 2,384 feature documents (1,139 AD +
+  534 ADSET + 410 CAMPAIGN + 300 CREATIVE_FAMILY + 1 ACCOUNT) with zero version-guard rejections.
+  Both numbers are the FULL emulator round trip (read + in-memory compute + 2,384 individually
+  version-guarded transactional writes, `writeConcurrency: 20`) — not a compute-only estimate.
+  This is well inside any plausible sync interval (§25's own schedule table runs syncs on the
+  order of hours, not seconds). The data is synthetic (generated, matching the real measured
+  shape/volume) rather than a live pull of the full real account — see the next point for why.
+
+- **Meta Ads Manager reconciliation — how it actually went, and its real limitation, stated
+  plainly.** This environment has no browser/UI access, so a literal side-by-side against the
+  Ads Manager web UI was not possible. What WAS done, live: one read-only, non-mutating call to
+  the same Insights API Ads Manager itself reads from — `GET /{adAccountId}/insights?
+  level=account&time_range={"since":"2026-08-24","until":"2026-08-30"}
+  &action_attribution_windows=["7d_click","1d_view"]` — i.e. the account's own real, confirmed
+  pinned attribution setting, for a real recent 7-day window. Live result: spend ₹199,064.35,
+  impressions 679,617, reach 248,255, frequency 2.737576 (Meta's own figure), clicks 50,613,
+  `omni_purchase` count 113, purchase value ₹406,571.02. This exact row was then fed through
+  this step's OWN CODE (`aggregateMetaWindow` + `buildWindowMetrics`, not hand arithmetic) and
+  reproduced every base figure exactly and derived: `metaRoas` 2.0424, `cpa` ₹1,761.63, `ctr`
+  7.447%, `frequency` 2.737312 (matching Meta's own 2.737576 to within rounding — Meta's own
+  reach figure is itself an approximation, so a small residual is expected, not a bug). **This
+  proves the aggregation/derivation code introduces no distortion versus Meta's own reported
+  numbers for the account's real pinned attribution** — the strongest reconciliation check
+  achievable without UI access, and reported as exactly that rather than overclaimed as a full
+  Ads Manager screen comparison. A full per-ad live entity fetch (to reconcile a specific ad's
+  numbers, and to seed the scale test with real rather than synthetic entities) was deliberately
+  NOT attempted this session: Meta's account-level throttle (`OAuthException` code 80004,
+  documented repeatedly across B2/B3/B7/B8's own sessions as triggered by this account's combined
+  concurrent-agent live-call volume) makes an additional ~1,139-ad entity pull a real risk of
+  starving a concurrently-running agent's own live verification; the two calls actually made here
+  (both single, small, account-level queries) stayed well clear of that risk and both succeeded
+  on the first attempt.
+
+- **Seasonality (C5) — integrated by injection, exactly per this step's own brief, and C5 had
+  NOT finished landing at the time this was wired.** `services/analytics/features/seasonality.ts`
+  defines `SeasonalityContext`/`SeasonalityContextProvider` as its OWN copy of C5's fixed
+  contract (`{labels, spansSeasonalBoundary, demandIndex, demandIndexSampleSize, summaryText}` /
+  `(window, baseline?) => Promise<SeasonalityContext>`), copied field-for-field per the brief's
+  explicit instruction ("code against exactly this; do not invent your own shape") — never
+  imported from `services/analytics/seasonality/`. At the time this was written, that directory
+  had `calendarRepo.ts`/`calendarSeed.ts`/`dayFeatures.ts`/`demandIndex.ts`/`labels.ts` but no
+  `index.ts` barrel and no `seasonalityContextFor` export yet — a static import from that path
+  would have failed `tsc` outright (not merely returned nothing at runtime), which is exactly why
+  the brief said "depend on the contract, not the file." `resolveSeasonalityContext(provider,
+  window, baseline)` tolerates BOTH an absent provider (returns `NULL_SEASONALITY_CONTEXT`,
+  `summaryText: "Seasonality context unavailable — C5's calendar is not wired in for this run."`)
+  and a provider that throws (catches and falls back to the same null context, logging a
+  warning) — proven by `seasonality.test.ts`'s three cases, including a literal fake provider
+  that throws. `RecomputeFeaturesPayload.seasonalityProvider` is the injection point; production
+  usage today omits it (the safe, functional default), and `registry.ts`'s own
+  `recomputeFeaturesRegistration` was deliberately left NOT wiring a real provider in — that
+  one-line change (pass C5's real `seasonalityContextFor` as the provider once it exists) is left
+  for whoever next touches this integration, flagged here explicitly rather than silently
+  assumed. **Every window C2 emits carries `seasonality: {labels, spansSeasonalBoundary,
+  demandIndex, demandIndexSampleSize, summaryText}`** (nested under `windowMetrics.seasonality`,
+  matching C5's object shape 1:1 rather than flattening it across several ad hoc fields) — with
+  the null-ish default today, that's `{labels: [], spansSeasonalBoundary: false, demandIndex:
+  null, demandIndexSampleSize: 0, summaryText: "..."}` on every window until the provider is
+  wired in for real. No metric anywhere is adjusted based on seasonality — the context sits
+  beside the numbers, never mutates them, per both C5's and this step's own explicit
+  "do not de-seasonalise" instruction.
+
+- **Blended MER (§6.3) — account-level only, unconditional, gap-flagged.**
+  `windows["Xd"].blendedMerAccountOnly` is populated ONLY on `accountFeatures/{accountId}` docs
+  (`null` at every other entity level, by construction — the per-entity `buildWindowMetrics` call
+  only receives a non-null `accountUnconditionalTotals` when `entityType === "ACCOUNT"`), and
+  uses B7's own `computeBlendedMer` over an entirely UNCONDITIONAL Shopify total for the window
+  (every order/refund in range, regardless of `resolutionMethod` — including fully `UNRESOLVED`
+  ones) divided by total Meta spend, matching §6.3's "uses no attribution at all" exactly. Proven
+  against a real emulator with a mix of one AD_ID-resolved and one wholly UNRESOLVED order, both
+  counted (`recomputeFeaturesTask.emulator.test.ts`'s blended-MER case). Net (not gross) Shopify
+  revenue is used for the numerator — a documented choice (the account's actual money kept, not
+  the pre-refund figure) — and the figure carries the same `shopifyDataGap` verdict every other
+  Shopify-derived figure in that window does.
+
+- **Trend (§12) is computed as current-7d vs. the immediately preceding 7d, not per-window.**
+  `trendMetrics` is a single flat object on `EntityFeatures`, not nested under `windows` the way
+  the rest of §12 is, and §4.2 designates 7d specifically as "trend direction only" — so C2 reads
+  that as the one unambiguous choice among the four window labels, rather than guessing. Computed
+  directly from two `MetaWindowTotals` (`trend.ts`), not two full `WindowMetrics` — every §12
+  Trend field (ROAS/CPA/CTR/CVR/CPM/frequency/spend-velocity/purchase-volume) is derivable from
+  Meta's own numbers alone, so building a second full `WindowMetrics` (with its own Shopify
+  filtering and seasonality call) purely to compute trend would have been wasted work. Uses
+  Meta-attributed ROAS/CPA as the trend reference, not Shopify's, for the same reason C3/D1
+  should prefer Meta-attributed figures generally at this account's near-zero attribution
+  coverage: Shopify-attributed trend would mostly be join noise, not real movement.
+  `purchaseVolumeTrend` uses a flat ±10% band (UP/DOWN/STABLE) — deliberately simple per this
+  step's own "prefer clarity over cleverness" instruction; C3's statistical machinery is a
+  separate, later layer, not duplicated here.
+
+- **Reach/frequency are a documented approximation, not a precision claim.** Meta reports `reach`
+  per AD-DAY (unique viewers that day); summing across days (the only operation possible from
+  daily-grain `metaInsightsDailyNormalized` rows) double-counts anyone who saw the ad on more than
+  one day in the window. `MetaWindowTotals.reach`/`frequency` are therefore an upper-bound-on-
+  uniques / lower-bound-on-frequency approximation, documented as such directly in
+  `metaWindowAggregate.ts` — a true window-level reach would need a different, window-level Meta
+  Insights query this step did not add (out of scope: C2 consumes `metaInsightsDailyNormalized`
+  as C1 already produced it, one row per ad-day). The live reconciliation check above happened to
+  use a genuine single-row account-level query, which is why its frequency matched Meta's own
+  figure almost exactly — that closeness is specific to the single-row case, not evidence the
+  summed-daily-rows approximation is exact in general.
+
+- **Ambiguities resolved (beyond the five-levels-vs-three-collections one already covered
+  above):**
+  1. **What "the window's Shopify data" means for a refund whose parent order falls outside the
+     current window (or outside the fetch lookback entirely).** Resolved: refund attribution is
+     resolved against the parent order's OWN resolution (`resolvedAdId`/`resolutionMethod`), via
+     an index built from every order fetched in the lookback — NOT re-derived from the refund's
+     own fields (it doesn't carry any). A refund whose parent order predates the lookback window
+     has no attribution info available and is excluded from every entity-level total (never
+     guessed) — still visible in the unconditional account-level totals (blended MER), which
+     never filter by attribution. Proven in `attribution.test.ts`.
+  2. **Whether `cpa`/`metaRoas` (the primary business metrics C3 will layer intervals onto)
+     should reference Meta-attributed or Shopify-attributed purchases.** Resolved: Meta-attributed
+     throughout (`cpa` = Meta spend / Meta-reported purchases, matching what a human reads as
+     "CPA" in Ads Manager under the pinned attribution) — Shopify-attributed figures are carried
+     alongside, separately, always labelled, per §6.2's "never merge" rule, but are not what
+     `cpa`/`metaRoas` name. This also directly enabled the reconciliation check above, since Ads
+     Manager's own CPA/ROAS numbers are Meta-attributed.
+  3. **The "estimated contribution margin" formula (§12 names it but does not define it).**
+     Resolved to `shopifyNetRevenueMinorUnits - spendMinorUnits` (attributed net revenue minus ad
+     spend for that entity/window) — i.e. treats 100% of net revenue as margin before COGS, since
+     no product-cost or margin-percent data exists anywhere in this system yet (not in the
+     reporting canon, not in any synced collection). Documented in the schema comment as a
+     simplification a future step with real COGS data should replace, not as a finished figure.
 
 ---
 
@@ -2750,7 +3075,12 @@ and that is frequently the true answer to "why did ROAS move?".
 
 ### C5 — Calendar and seasonality context
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean for this step's own scope (typecheck across both projects,
+lint, format, and this step's 48 new unit tests, across `services/analytics/seasonality/{labels,
+dayFeatures,demandIndex,calendarSeed}.test.ts`); `npm run test:integration` (real Firestore emulator)
+passes for this step's own 10 new emulator tests (`seedTask.emulator.test.ts` x3,
+`context.emulator.test.ts` x7). See Notes below for the fixed interface's implementation, the honesty
+policy on `demandIndex`, the calendar's storage shape, and the sources for every seeded date.
 **Depends on:** C1
 **Design refs:** §12, §15.3, §21.1 (not specified in the design — added to the plan after A0–B2, see below)
 **Size:** M
@@ -2790,8 +3120,15 @@ context beside the metric, never mutate the metric**; a silently adjusted number
 would have no way to show its work. Automatic guardrails from seasonality — D5 may consume this later, but
 this step only produces the signal.
 
-**Done when.** A window covering a festive period is labelled as such; a window/baseline pair straddling a
-festive boundary sets `spansSeasonalBoundary`; the demand index for a festive label is measurably above the
+**Done when.** ⚠️ **The third clause below was written before the data was examined and is unreachable —
+corrected at C5 review; the implementation is right and the original line was wrong.** With ~11 months of
+history and a gap, every festive label occurs at most once, so a demand index computed from it would be a
+confident-looking number derived from n=1. The honesty requirement above takes precedence over this line.
+**Corrected bar:** a window covering a festive period is labelled as such; a window/baseline pair straddling
+a festive boundary sets `spansSeasonalBoundary`; the demand index returns **`null` with an explicit
+`demandIndexSampleSize`** wherever history is too thin, and the index mechanism is proven to produce a
+number once n≥2 (by fixture, since real data cannot yet reach it). Superseded original clause: the demand
+index for a festive label is measurably above the
 off-season baseline on this account's own data.
 
 **Notes for the planning agent.** ⚠️ **Check how much history actually exists before promising a demand
@@ -2801,6 +3138,139 @@ year-over-year comparison. Say so plainly rather than computing a confident-look
 occurrence; a label with `n=1` and wide uncertainty is the honest output, and C3's whole premise is that
 uncertainty travels with the number. If the later Matrixify exports fill the gap, this becomes materially
 better — design for recompute.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/analytics/seasonality/{labels,dayFeatures,demandIndex,calendarRepo,
+  calendarSeed,shopifyDemandSource,seedTask,context,index}.ts`, each with a co-located `*.test.ts`;
+  `seedTask.emulator.test.ts` and `context.emulator.test.ts` are the emulator-backed proof. One new
+  schema file, `shared/schema/seasonality.ts` (`seasonalCalendarWindowSchema`), and one new collection,
+  `seasonalCalendarWindows` (`shared/firestore/collections.ts`, plus `seasonalCalendarWindowKey(label,
+  startDay)`), following B3/C1's own precedent for a genuinely new artifact §8 doesn't name.
+  `services/ingest/sync/{taskTypes,registry}.ts` gained one task-type registration
+  (`SEED_SEASONAL_CALENDAR`) — the one sanctioned touch inside `services/ingest/`, per this step's own
+  brief ("Register any task via B1's `createDefaultRegistry()`"). `services/analytics/index.ts` and
+  `shared/schema/index.ts` gained a barrel export each. No npm dependency was added — in particular, no
+  Hindu-calendar library; every festive date is seeded as plain data (see below).
+
+- **The interface, implemented exactly as fixed by the orchestrator, not renamed or restructured:**
+  `seasonalityContextFor(window, baseline?)` in `context.ts` returns `{labels, spansSeasonalBoundary,
+  demandIndex, demandIndexSampleSize, summaryText}`. It is a thin orchestrator over four pure,
+  independently unit-tested pieces: `labels.ts` (range-overlap math — a reporting day is a validated
+  `YYYY-MM-DD` string that sorts lexicographically exactly like it sorts chronologically, so overlap is
+  plain string comparison, no date parsing, mirroring C1's own `coverage.ts` gap-membership check),
+  `demandIndex.ts` (the honesty-critical demand computation, pure — see below), `calendarRepo.ts`
+  (reads `seasonalCalendarWindows`, deliberately **uncached**, unlike A3's `loadReportingCanon` — this
+  table is meant to be corrected live, so a fresh read every call is the point), and
+  `shopifyDemandSource.ts` (range-queries `shopifyOrdersNormalized`/`shopifyDailyCoverage` on
+  `reportingDay`, a single-field range needing no composite index).
+
+- **Day-of-week/month-of-year features are deliberately NOT on `SeasonalityContext`** — the fixed
+  interface has no field for them, and inventing one would have been exactly the kind of divergence the
+  brief said to avoid. They live as their own small pure functions instead
+  (`calendarFeaturesForDay`/`calendarFeaturesForWindow` in `dayFeatures.ts`), satisfying this step's own
+  separate deliverable without touching the fixed contract; C2's feature engine (or D2) can call them
+  independently. `isWeekend` assumes Saturday+Sunday, stated as an explicit assumption in the module
+  comment, not silently baked in.
+
+- **The calendar's storage shape, and how an operator corrects a date without a deploy.** ONE Firestore
+  collection, `seasonalCalendarWindows/{label}_{startDay}` — a *range table* (one document per festive
+  **occurrence**, e.g. "diwali 2025-10-19..2025-10-23"), not one document per calendar day. A day carries
+  no label by omission; there is no stored "off-season" row (`Deliverables`'s own "off-season default"
+  read literally). To correct a wrong date (a lunar festival shifted, or a year's estimate was wrong), an
+  operator edits — or replaces — that one Firestore document directly (console, or a small admin script;
+  no code path in this system requires going through `upsertWithVersionGuard` to do this), and it is live
+  on the very next `seasonalityContextFor` call, no deploy, because `loadSeasonalCalendarWindows` never
+  caches. The seed task (`SEED_SEASONAL_CALENDAR`, idempotent, safe to extend with new years) writes
+  through the version guard with one fixed `sourceUpdatedAt` per seed revision
+  (`SEASONAL_CALENDAR_SEED_SOURCE_UPDATED_AT`, `seedTask.ts`) so a routine reseed cannot silently
+  clobber a manual correction that also bumped its own `sourceUpdatedAt` — documented in `calendarRepo.ts`'s
+  module comment, and proved in `seedTask.emulator.test.ts`'s "an operator's manual correction ... survives
+  a reseed" case. A correction that does NOT bump `sourceUpdatedAt` still takes effect immediately (a
+  direct Firestore write always does); it would only be at risk from a *future* reseed of that exact
+  `(label, startDay)` key, which is rare (reseeding only happens when `calendarSeed.ts` itself is
+  deliberately edited and redeployed) and stated plainly as the one nuance, not hidden.
+
+- **The demand-index honesty policy — read literally against this step's own instructions, not the
+  softer framing in this step's "Notes for the planning agent" above** (which predates the orchestrator's
+  explicit override): `demandIndex` is `null` whenever a label has fewer than **two** usable historical
+  occurrences (`MIN_SAMPLE_SIZE_FOR_INDEX = 2`, `demandIndex.ts`) — a single clean occurrence is recorded
+  (`demandIndexSampleSize: 1`) but never turned into a number. This account's real order history
+  (2025-01-15 → 2025-12-13, gap to ~2026-07-02) contains **at most one clean occurrence of any
+  single-year festive label**, so every seeded festival label honestly returns `demandIndex: null` today
+  against the real data — that is the expected, correct output, not a bug. `context.emulator.test.ts`'s
+  "exactly ONE clean historical occurrence" case proves this directly: a synthetic, real 5x festive
+  revenue lift is seeded, and the function still returns `null` with `demandIndexSampleSize: 1` — never a
+  confident-looking number computed from n=1. The "two clean historical occurrences" case proves the
+  other side: once a second year's clean data exists for a label, `demandIndex` becomes a real number
+  (tested with a synthetic, exact 2.0x lift reproduced in both years).
+
+- **Gap exclusion — proved, not just asserted.** `demandIndex.ts` treats a reporting day as usable for
+  either an occurrence or its trailing off-season baseline only when `shopifyDailyCoverage` has a row for
+  it AND `hasCoverageGap === false`; a day with no coverage row at all (never observed) is treated
+  identically to a gap day, never as a silent zero — the same discipline C1's own notes describe for
+  `shopifyDailyCoverage` itself. `context.emulator.test.ts`'s "honesty-critical case" seeds a real Diwali
+  window entirely inside a marked coverage gap, WITH a huge (₹9,999,999.99) order sitting inside that gap
+  — and `demandIndex` still comes back `null`, `sampleSize: 0`, proving the gap-affected order is excluded
+  outright rather than averaged in and reported as a real seasonal effect. `demandIndex.test.ts` covers
+  the same policy at the pure-function level, plus the "insufficient trailing baseline" and
+  "baseline average is zero" edge cases (skip the occurrence rather than divide by zero or by a
+  near-meaningless baseline).
+
+- **Real order-history evidence, per label, against production data — not run.** Actually computing
+  `demandIndex` against the account's real `shopifyOrdersNormalized`/`shopifyDailyCoverage` data (rather
+  than the synthetic fixtures above) requires C1's tasks to have actually been run against production —
+  out of this step's safety constraints ("do NOT write to production Firestore"; verification is
+  emulator-only). What can be said from the seeded calendar and B5/C1's own documented coverage instead:
+  every per-year festival label seeded below has **at most one** occurrence whose days fall inside B5's
+  observed, non-gap range (2025-01-15 → 2025-12-13) — Holi, Akshaya Tritiya, Raksha Bandhan, Ganesh
+  Chaturthi, Navratri, Dhanteras and Diwali each have their 2025 occurrence inside that window and their
+  2026 occurrence inside the still-open gap (`~2025-12-14 → ~2026-07-02`, per B5/C1's notes) or beyond it;
+  `wedding_season`'s 2024-25 winter tail is the only occurrence with any real overlap with data before the
+  gap. **Every seeded label therefore returns `demandIndex: null` with `demandIndexSampleSize` 0 or 1
+  against this account's actual current data** — consistent with, and required by, this step's honesty
+  policy above. This is a materially different (more conservative) outcome than the original "Done when"
+  line's "the demand index for a festive label is measurably above the off-season baseline" — see the
+  objection below.
+
+- **The seeded calendar — sources, and what is `"estimated"` vs `"confirmed"`.** `calendarSeed.ts` seeds
+  15 occurrences across 8 labels (the 5 IMPLEMENTATION_PLAN.md C5 names explicitly — `diwali`, `navratri`,
+  `dhanteras`, `akshaya_tritiya`, `wedding_season` — plus 3 additional well-sourced, broadly recognized
+  Indian gifting/shopping occasions: `holi`, `raksha_bandhan`, `ganesh_chaturthi`), for 2025 and 2026 (plus
+  one 2026-27 `wedding_season` window, since it is imminent relative to this step's 2026-08-31
+  implementation date). Every date was checked live via web search while authoring this file (not recalled
+  from training data), with the specific source domains and search dates recorded in each entry's own
+  `source` field — see `calendarSeed.ts` for the full citations. `confidence: "estimated"` (with `notes`
+  explaining exactly what was estimated) applies to: every `wedding_season` window (a commercial-convention
+  date range, not a specific muhurat — stated as coarser by design); `holi`/`akshaya_tritiya`/`dhanteras`
+  2026 and `diwali` both years, where a padding day (pre-festival shopping) or an intervening day
+  (Choti Diwali/Govardhan Puja) was derived by calendar convention from a confirmed anchor day rather than
+  independently confirmed. `dhanteras` and `diwali` are modeled as two adjacent, deliberately **disjoint**
+  windows (Dhanteras is, on its own, the single most important gold/jewellery-buying day for this
+  account's product category), matching the interface's own documented example
+  (`["wedding_season","dhanteras"]`, dhanteras without diwali) — proved by
+  `context.emulator.test.ts`'s "multiple overlapping labels" case and `calendarSeed.test.ts`'s own
+  disjointness check.
+
+- **Objection to the fixed interface, raised as instructed rather than silently diverged from.** The
+  `Done when` line above ("the demand index for a festive label is measurably above the off-season
+  baseline on this account's own data") is **not achievable** honestly with `MIN_SAMPLE_SIZE_FOR_INDEX = 2`
+  against this account's actual ~11-month history — every real label returns `null`, by design, per this
+  step's own explicit override in the orchestrator's task brief. This is not an objection to the
+  `SeasonalityContext` shape itself (that was implemented exactly as specified, with no changes proposed)
+  — it is a note that the plan's own original "Done when" bullet and the orchestrator's later, stricter
+  honesty requirement are in tension, and the honesty requirement was followed as the authority (per this
+  step's own instruction to treat the header note as governing over the design document, and the explicit
+  "this is the thing I will check hardest" framing). If a lower bar (e.g. accept `n=1` with a wide,
+  explicit uncertainty caveat rather than `null`) is preferred after all, `MIN_SAMPLE_SIZE_FOR_INDEX` in
+  `demandIndex.ts` is the single constant to change — the rest of the pipeline (gap exclusion, baseline
+  computation, `summaryText` wording) does not need to change to support either policy.
+
+- **Ambiguity resolved: what "demand" means.** `shopifyDemandSource.ts` uses **gross** daily order revenue
+  (`shopifyOrdersNormalized.totalPrice`), not net of refunds and not order count — "derived from the
+  account's own order history" (this step's own brief) most directly means orders placed; refunds are a
+  later, separate event (C1's own module comment on `shopifyRefundsNormalized`) and out of scope for a
+  demand signal. Stated as a deliberate choice, not hidden.
 
 ---
 

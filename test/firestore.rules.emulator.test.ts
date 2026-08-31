@@ -42,7 +42,7 @@ const collectionNames = Object.values(COLLECTIONS);
 
 describe("firestore.rules — §17.1 deny-all", () => {
   it("covers every collection in §8 (guards against this test file drifting from collections.ts)", () => {
-    expect(collectionNames.length).toBe(30); // 24 + B3's metaInsightsReportJobs + B7's adUrlTagAudits + C1's 4
+    expect(collectionNames.length).toBe(32); // 24 + B3's metaInsightsReportJobs + B7's adUrlTagAudits + C1's 4 + C5's seasonalCalendarWindows + C2's creativeFamilyFeatures
   });
 
   it.each(collectionNames)("denies an unauthenticated client reading %s", async (name) => {

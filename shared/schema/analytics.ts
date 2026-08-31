@@ -101,6 +101,15 @@ export const shopifyOrderNormalizedSchema = z.object({
   // not resolve, join or invent an ad/campaign id.
   resolvedAdId: z.string().nullable(),
   resolvedCampaignId: z.string().nullable(),
+  // C2 addition (optional/defaulted per A2's schema-evolution rule) — C1's original cut of this
+  // schema carried resolvedAdId/resolvedCampaignId but NOT the method/confidence that qualify
+  // them, which made it impossible for a downstream reader of ONLY this normalized collection to
+  // honour B7's explicit contract ("never sum resolvedAdId-attributed revenue without filtering/
+  // segmenting by resolutionMethod first — this is the single most important contract this step
+  // hands downstream"). Mirrors shopifyOrderSchema's own fields exactly; see that schema's
+  // comment for what AD_ID/NAME_MATCH/UNRESOLVED and the confidence constants mean.
+  resolutionMethod: z.enum(["AD_ID", "NAME_MATCH", "UNRESOLVED"]).nullable().optional(),
+  resolutionConfidence: z.number().min(0).max(1).nullable().optional(),
   source: z.string(), // ShopifyOrderSource, carried through for traceability
   sourceUpdatedAt: firestoreTimestamp, // version-guard field — carried from shopifyOrders
   computedAt: firestoreTimestamp,

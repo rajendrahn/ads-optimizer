@@ -35,6 +35,8 @@ import {
   normalizeMetaInsightsDailyRegistration,
   normalizeShopifyDailyRegistration,
 } from "../../analytics/daily/index.ts";
+import { seedSeasonalCalendarRegistration } from "../../analytics/seasonality/index.ts";
+import { recomputeFeaturesRegistration } from "../../analytics/features/index.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -136,5 +138,12 @@ export function createDefaultRegistry(): TaskRegistry {
   // Shopify call; see services/analytics/daily's own module comments.
   registry.register(normalizeMetaInsightsDailyRegistration);
   registry.register(normalizeShopifyDailyRegistration);
+  // C5's calendar/seasonality context (added to the plan by the user, not in the design) —
+  // seeds the seasonal calendar table from data checked into the repo. Firestore-only.
+  registry.register(seedSeasonalCalendarRegistration);
+  // C2's feature engine (§4.2, §10.1, §12) — full recompute of every entity's windowed metrics
+  // over C1's normalized collections. §10.2's own name, already in taskTypes.ts's list.
+  // Firestore-only; no live Meta/Shopify call, no watermark of its own.
+  registry.register(recomputeFeaturesRegistration);
   return registry;
 }

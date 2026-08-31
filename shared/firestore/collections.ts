@@ -52,12 +52,20 @@ export const COLLECTIONS = {
   shopifyRefundsNormalized: "shopifyRefundsNormalized",
   shopifyDailyCoverage: "shopifyDailyCoverage",
 
+  // C5's own — the calendar-as-data table mapping reporting-day ranges to seasonal labels; not
+  // one of §8's named collections, see shared/schema/seasonality.ts's module comment for why.
+  seasonalCalendarWindows: "seasonalCalendarWindows",
+
   creativeAssets: "creativeAssets",
   creativeFamilies: "creativeFamilies",
 
   adFeatures: "adFeatures",
   adsetFeatures: "adsetFeatures",
   accountFeatures: "accountFeatures",
+  // C2's own — §12 computes features at five levels but §8 names only three collections; see
+  // shared/schema/features.ts's module comment for why creative-family features get a fourth,
+  // dedicated collection rather than piggybacking on adFeatures or the flat creativeFamilies doc.
+  creativeFamilyFeatures: "creativeFamilyFeatures",
 
   decisionPackets: "decisionPackets",
   recommendations: "recommendations",
@@ -176,6 +184,18 @@ export function shopifyRefundNormalizedKey(orderId: string, refundId: string): s
 /** shopifyDailyCoverage/{reportingDay} — one per canon reporting day; use the day string
  * directly, no helper (it is already a validated `YYYY-MM-DD`, unlike a platform ID). */
 
+/**
+ * seasonalCalendarWindows/{label}_{startDay} — C5's own. Deterministic in (label, startDay) so
+ * re-seeding the same occurrence (services/analytics/seasonality/seedTask.ts) is idempotent, and
+ * distinct occurrences of the same label (e.g. "diwali" in 2025 and again in 2026) never
+ * collide, since their startDay differs.
+ */
+export function seasonalCalendarWindowKey(label: string, startDay: string): string {
+  assertValidIdSegment(label, "label");
+  assertValidIdSegment(startDay, "startDay");
+  return `${label}_${startDay}`;
+}
+
 /** creativeAssets/{assetHash} — §9.5's given example; use the hash directly, no helper. */
 
 // creativeFamilies/{familyId} — B8's grouping logic decides which asset seeds a family
@@ -188,7 +208,9 @@ export function shopifyRefundNormalizedKey(orderId: string, refundId: string): s
 // `composite_{creativeId}` (services/ingest/meta/creative/identity.ts's `compositeFamilyId`),
 // one family per composite, no cross-composite merging attempted.
 
-/** adFeatures/{adId}, adsetFeatures/{adsetId} — use the entity's own ID directly. */
+/** adFeatures/{adId}, adsetFeatures/{adsetId|campaignId}, creativeFamilyFeatures/{familyId} —
+ * use the entity's own ID directly (adsetFeatures also holds CAMPAIGN-typed docs, keyed by
+ * campaign id — shared/schema/features.ts's own ambiguity note explains why). */
 
 /** accountFeatures/{accountId}, settings/{accountId} — use the real Meta ad account ID
  * directly (not a magic singleton string), consistent with every other level using its own

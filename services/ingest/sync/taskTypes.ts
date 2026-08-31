@@ -59,6 +59,12 @@ export const SYNC_TASK_TYPES = [
   // Shopify each get their own independently-retriable task type rather than one combined task.
   "NORMALIZE_META_INSIGHTS_DAILY",
   "NORMALIZE_SHOPIFY_DAILY",
+  // C5's addition — not in §10.2's original list (calendar/seasonality context isn't in the
+  // design at all; see IMPLEMENTATION_PLAN.md C5's own header). Seeds `seasonalCalendarWindows`
+  // (services/analytics/seasonality/seedTask.ts's own module comment) from data checked into the
+  // repo — Firestore-only, no live Meta/Shopify call, same "internal, no watermark" shape as
+  // C1's two normalize tasks above.
+  "SEED_SEASONAL_CALENDAR",
 ] as const;
 export type KnownTaskType = (typeof SYNC_TASK_TYPES)[number];
 
