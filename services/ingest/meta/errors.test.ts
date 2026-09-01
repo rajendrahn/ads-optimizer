@@ -16,6 +16,31 @@ describe("classifyMetaError", () => {
     expect(err.retryable).toBe(true);
   });
 
+  // Business Use Case throttles, reported per ad account. Regression test for a real
+  // production failure: the first live META_SYNC_ENTITIES run failed on code 80004, which was
+  // absent from RATE_LIMITED_CODES and so classified terminal — the task gave up instead of
+  // backing off, which is exactly the stalled-account outcome A4's spec warns about.
+  it.each([80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014])(
+    "classifies BUC throttle code %d as rate_limited, retryable",
+    (code) => {
+      const err = classifyMetaError(400, { error: { message: "too many calls", code } });
+      expect(err.kind).toBe("rate_limited");
+      expect(err.retryable).toBe(true);
+    },
+  );
+
+  it("classifies the exact production 80004 payload as retryable, not terminal", () => {
+    const err = classifyMetaError(400, {
+      error: {
+        message:
+          "There have been too many calls to this ad-account. Wait a bit and try again. For more info, please refer to https://developers.facebook.com/docs/graph-api/overview/rate-limiting#ads-management.",
+        code: 80004,
+      },
+    });
+    expect(err.kind).toBe("rate_limited");
+    expect(err.retryable).toBe(true);
+  });
+
   it("falls back to HTTP 401/403 for unauthorized when there's no recognized code", () => {
     expect(classifyMetaError(401, {}).kind).toBe("unauthorized");
     expect(classifyMetaError(403, {}).kind).toBe("unauthorized");

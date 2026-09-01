@@ -17,8 +17,22 @@ import { ApiError } from "../http/errors.ts";
 const UNAUTHORIZED_CODES = new Set([190]);
 
 /** Meta's rate-limit family: 4 = app-level request limit, 17 = user-level request limit,
- * 32 = page-level rate limit, 613 = custom/ads rate limit. */
-const RATE_LIMITED_CODES = new Set([4, 17, 32, 613]);
+ * 32 = page-level rate limit, 613 = custom/ads rate limit.
+ *
+ * The 80000-family are Business Use Case throttles, reported per ad account rather than per
+ * app or user — 80000 (ads management), 80003/80004 (ad account), 80005/80006/80008/80014
+ * (various BUC buckets). These are the SAME condition sec 7.1's X-Business-Use-Case-Usage
+ * header exists to pre-empt: when pre-emption fails, this is how Meta says so.
+ *
+ * ⚠️ 80004 was originally absent, and its absence was not theoretical. B8 flagged it during
+ * the build after six live attempts hit it; the first real production sync then failed on it
+ * after 380s — and because it fell through to the terminal `client_error` branch below, the
+ * task gave up rather than backing off, which is precisely the "a throttled account stalls
+ * every sync" outcome A4's spec calls the most likely source of pain. A throttle is by
+ * definition temporary, so every code in this family must be retryable. */
+const RATE_LIMITED_CODES = new Set([
+  4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014,
+]);
 
 interface GraphApiErrorBody {
   error?: {
