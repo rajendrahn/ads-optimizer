@@ -262,11 +262,8 @@ describe("FAILED — a genuine reasoner failure leaves a legible error state", (
 });
 
 describe("REJECTED — the real D5 guardrail rejects an over-limit change", () => {
-  // Longer timeout: createGuardrailValidator() (D5) independently RE-resolves the decision unit's
-  // evidence via resolveScalingEvidence — a second full evidence computation beyond the packet's
-  // own (guardrailAdapter.ts's own module comment: "the guardrail never trusts a packet... it
-  // re-derives today's ground truth... every time") — on top of D2's own packet build, against a
-  // ~30-ad synthetic account on the emulator. The default 5s test timeout is too tight for that.
+  // Longer timeout: this exercises the real D1/D2 evidence pipeline (~30-ad synthetic account) and
+  // D5's real `applyGuardrails` against the emulator. The default 5s test timeout is too tight.
   it("renders which guardrail rejected it and what limit it was judged against", async () => {
     const id = await askAndWait(DEMO_ENTITIES.rejected);
     const view = await getView(id);
@@ -276,9 +273,9 @@ describe("REJECTED — the real D5 guardrail rejects an over-limit change", () =
     expect(view.currentBudgetMinorUnits).toBeNull(); // cleared — §20.2, never actionable
     expect(view.guardrailRejection).not.toBeNull();
     expect(view.guardrailRejection?.reason.length).toBeGreaterThan(0);
-    // The resilient guardrailRejections lookup (viewModel.ts's findGuardrailRejectionLog) found
-    // the REAL D5 log despite the adapter's synthesized document id — proven by non-empty
-    // violations with a real judgedAgainst limit, not just the small {reason, rejectedAt} pair.
+    // The direct, keyed guardrailRejections lookup (viewModel.ts's findGuardrailRejectionLog)
+    // found the REAL D5 log by the real recommendationId — proven by non-empty violations with a
+    // real judgedAgainst limit, not just the small {reason, rejectedAt} pair.
     expect(view.guardrailRejection?.violations.length).toBeGreaterThan(0);
     const changeViolation = view.guardrailRejection?.violations.find(
       (v) => v.code === "MAX_CHANGE_PERCENT_EXCEEDED",

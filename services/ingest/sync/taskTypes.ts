@@ -103,3 +103,13 @@ export const SYNC_NOOP = "SYNC_NOOP";
  * separate Cloud Run "reasoner worker" instead, via the SAME `runSyncTask`/`handleTaskRequest`
  * framework (see services/reasoner/job/workerRuntime.ts). */
 export const GENERATE_RECOMMENDATION = "GENERATE_RECOMMENDATION";
+
+/** E2's own — §21.1: evaluate an accepted recommendation's outcome once its own
+ * `recheckConditions` are met, never on a fixed number of days. Already named in §10.2's own list
+ * above; this constant is E2's registration handle for it (mirroring `GENERATE_RECOMMENDATION`'s
+ * own convention) — see services/evidence/recommendationOutcomeTask.ts. Unlike
+ * `GENERATE_RECOMMENDATION`, this task makes no model call and has no 60-second-ceiling risk (it
+ * is a pure Firestore read/compute/write, the same shape as COMPUTE_STATISTICS/
+ * ENRICH_CHANGE_FEATURES/MARK_DECISION_PACKETS_STALE), so it is registered on the ordinary
+ * `services/ingest/sync/registry.ts` default registry, not a dedicated reasoner-worker one. */
+export const EVALUATE_RECOMMENDATION_OUTCOME = "EVALUATE_RECOMMENDATION_OUTCOME";

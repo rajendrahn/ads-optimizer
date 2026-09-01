@@ -6,9 +6,9 @@
 // job/` are untouched, and web/server/deps.ts only reaches for this when
 // `ANTHROPIC_LIVE` is unset.
 //
-// The real guardrail validator (`createGuardrailValidator` — D5, imported read-only from
-// `services/reasoner/index.ts`) still runs against whatever this fake model proposes, so a demo
-// run can genuinely produce a REJECTED card, not just a scripted one — see deps.ts.
+// The real guardrail application (`applyGuardrails` — D5, called unconditionally inside
+// `createGenerateRecommendationHandler`) still runs against whatever this fake model proposes, so
+// a demo run can genuinely produce a REJECTED card, not just a scripted one — see deps.ts.
 
 import type Anthropic from "@anthropic-ai/sdk";
 import type { DecisionPacket } from "@shared/schema/index.ts";

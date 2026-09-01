@@ -40,6 +40,7 @@ import { recomputeFeaturesRegistration } from "../../analytics/features/index.ts
 import { enrichChangeFeaturesRegistration } from "../../analytics/changeFeatures/index.ts";
 import { computeStatisticsRegistration } from "../../analytics/statistics/index.ts";
 import { markDecisionPacketsStaleRegistration } from "../../evidence/decisionPacketStore.ts";
+import { evaluateRecommendationOutcomesRegistration } from "../../evidence/recommendationOutcomeTask.ts";
 
 export interface SyncStateTarget {
   source: "meta" | "shopify";
@@ -164,5 +165,12 @@ export function createDefaultRegistry(): TaskRegistry {
   // AFTER RECOMPUTE_FEATURES; see decisionPacketStore.ts's own module comment for why packet
   // generation itself is NOT a task type but this bulk staleness pass is.
   registry.register(markDecisionPacketsStaleRegistration);
+  // E2's own — §21.1: evaluate an accepted recommendation's outcome once its own
+  // recheckConditions are met, never on a fixed number of days. Firestore-only; no live Meta/
+  // Shopify/Anthropic call, no watermark of its own — see recommendationOutcomeTask.ts's own
+  // module comment for why this belongs on the ordinary sync registry rather than the reasoner's
+  // dedicated worker registry (unlike GENERATE_RECOMMENDATION, this task makes no model call and
+  // has no 60-second-ceiling risk).
+  registry.register(evaluateRecommendationOutcomesRegistration);
   return registry;
 }

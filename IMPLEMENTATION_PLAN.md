@@ -4512,6 +4512,47 @@ touched (emulator only); no cloud resource was created/modified/deployed; no liv
 was made anywhere in this step (every test uses a scripted fake Anthropic client — the pipeline
 is what this step tests, not the model, per its own "prefer a faked reasoner" instruction); no
 npm dependency was added.
+
+**⚠️ Corrective update (post-D6, pre-Phase-E; done by the orchestrator, not a new D-step) — the
+guardrail rejection log is now joinable by `recommendationId`.** §20.2 says the rejection log is
+itself a calibration signal for E3, but as wired at D6-completion time (`generateRecommendationHandler`
+using D5's narrow-seam adapter, `createGuardrailValidator`), every rejection log entry was written
+under a SYNTHESIZED id (`adapter_{type}_{id}_{epochMillis}`), not the real `recommendationId` —
+see D5's own "Integration with D4" note below for how that happened. **Fixed:**
+`services/reasoner/job/generateRecommendationTask.ts`'s task handler now calls D5's
+`applyGuardrails` (guardrailLog.ts) directly, inside its own `try` block, where the real
+`recommendationId`/`namedEntity`/`accountDataVersion`/`adOptimizationKnowledgeVersion` are already
+in scope (no re-fetch) — `guardrailRejections/{id}` is now keyed on the real id. As a consequence:
+`guardrailSeam.ts` (the narrow `GuardrailValidator` injection type this step originally defined)
+and `guardrailAdapter.ts` (D5's conforming adapter) are both **deleted** — there is now exactly one
+guardrail integration path in production, closing the exact hazard this codebase already hit once
+before with C2/C5's seasonality provider ("nobody tests the production default"). A bonus fix that
+fell out of this: the narrow adapter's `GuardrailVerdict` had no field for D5's `adjustedConfidence`
+(the recent-major-change/composite-creative confidence penalties), so a COMPLETE recommendation's
+persisted `confidence` was always the model's own raw number, never D5's adjusted one — the direct
+`applyGuardrails` call fixes this too (`confidence: application.adjustedConfidence`). D6's own
+`web/server/viewModel.ts` fallback prefix-query for the synthesized-id shape (`findGuardrailRejectionLog`)
+is likewise **removed**, not just left dormant — this system has never been deployed (every phase's
+own Status line confirms no cloud resource was ever created), so there is no real historical data
+under the old scheme to stay compatible with; see that function's own updated module comment.
+`decisionPacketStore.ts`'s `generateAndCacheDecisionPacket` gained one new field on its result,
+`evidenceResult: ScalingEvidenceResult` — D1's own already-computed evidence, now returned
+alongside the packet so `generateRecommendationTask.ts` doesn't have to re-resolve it a second time
+(the narrow adapter used to) or reconstruct it from the packet's untyped Firestore blob. New tests:
+`generateRecommendationTask.emulator.test.ts`'s test 4 was rewritten to assert the rejection log is
+readable by a direct `.get(recommendationId)`; **test 4b is the deliverable this fix was really
+for** — it proves the PRODUCTION DEFAULT (a handler built via `createGenerateRecommendationHandler`
+with only the Anthropic client overridden, no guardrail-related option at all — none exists any
+more) actually enforces guardrails, which nothing in either D4's or D5's own original test suite
+did (each injected its own stand-in validator); test 4c is a `TS2353` compile-error structural
+proof that `GenerateRecommendationHandlerDeps` has no guardrail-bypassing field any more. Both
+knowledge-document-exclusion guarantees still hold, proven the same way as before
+(`guardrails.test.ts`'s own `GuardrailInput` compile-error test, unchanged) — `validateGuardrails`'s
+input type was never touched by this fix; only its caller changed. `npm run check` (barring an
+unrelated, concurrently-in-progress `services/backtest/` formatting issue outside this fix's scope)
+and `npm run test:integration` both pass — 795/795 unit, 12/12 web, 298/298 integration (up from
+D6's 797/12/296: net −2 unit from deleting `guardrailSeam.test.ts`'s 2 tests, net +2 integration
+from this fix's new tests 4b/4c).
 **Depends on:** D3
 **Design refs:** §16.1
 
@@ -4622,6 +4663,21 @@ add streaming later, SSE goes direct from Cloud Run.
   site in `generateRecommendationTask.ts` (currently defaulted to `passthroughGuardrailValidator`
   in the production `generateRecommendationRegistration`/`generateRecommendationHandler`
   exports) — no other file in this step's pipeline needs to change.
+
+  **⚠️ Superseded — see the "Corrective update" note at the top of this D4 section.** This whole
+  seam (`guardrailSeam.ts`, `GuardrailValidator`, `passthroughGuardrailValidator`) is deleted.
+  `createGenerateRecommendationHandler` no longer takes a `guardrailValidator` option of any kind
+  — it calls D5's real `applyGuardrails` unconditionally, with the recommendationId/namedEntity/
+  accountDataVersion/adOptimizationKnowledgeVersion already in scope in its own try block, so the
+  narrowness this bullet describes (and the reason a real recommendationId was unreachable at the
+  validator's call site) no longer applies. The knowledge-document exclusion guarantee this bullet
+  describes still holds — just enforced by `validateGuardrails`'s own input type
+  (`{recommendation, evidenceResult, canon}`, no knowledge field, proven by `guardrails.test.ts`'s
+  `TS2353` test) rather than by this now-deleted seam, which in retrospect never enforced it either
+  (a `GuardrailValidator` could always have closed over a knowledge document itself — nothing in
+  its type prevented that; the real guarantee was always `validateGuardrails`'s own signature).
+  Left in place below as a historical record of what was originally built and why, not as current
+  behaviour.
 
 - **Architecture ambiguity resolved: `GENERATE_RECOMMENDATION` is deliberately NOT registered
   into `services/ingest/sync/registry.ts`'s `createDefaultRegistry()`.** That registry backs
@@ -4761,6 +4817,19 @@ step registers no Cloud Tasks task type — see below for why). See Notes below 
 enforced and its limit's source, the structural guarantee against the knowledge document, the
 rejection log's exact shape, and how this step integrates with D4 (built concurrently, landed
 first, and left a narrower seam than originally assumed — read this before wiring production).
+
+**⚠️ Corrective update (post-D6, pre-Phase-E) — see D4's own "Corrective update" note above for
+the full write-up.** The narrower integration path this section originally documented
+(`createGuardrailValidator`/`guardrailAdapter.ts`) is what production actually ran, and its
+"honestly-stated limitation" below (synthesized `recommendationId`) turned out to make the §20.2
+rejection log unjoinable — not merely a cosmetic gap. `guardrailAdapter.ts` is now **deleted**, and
+so is D4's `guardrailSeam.ts` it conformed to. `applyGuardrails` (guardrailLog.ts) — described
+below as "the integration D4's own `generateRecommendationTask.ts` should call directly" — is now
+exactly that: the ONLY guardrail integration path in production, called directly from
+`generateRecommendationTask.ts`'s own task handler. Everything below about `validateGuardrails`'s
+own structural guarantee, the five enforced guardrails, the confidence-reduction logic, and the
+rejection log's shape is unchanged and still accurate — only the "Integration with D4" section
+below (and its "two integration paths" framing) is superseded; see that bullet's own updated note.
 **Depends on:** D3
 **Design refs:** §20.2
 
@@ -4990,6 +5059,23 @@ non-budget-owner is rejected.
   ("Swapping in D5's real validator is a one-line change... once it exists") — left undone here
   since that file belongs to D4's step, not this one, per the coordinator's explicit "stay out of
   D4's pipeline/worker code" instruction; flagged here rather than silently left unfindable.
+
+  **⚠️ Superseded — see the "Corrective update" notes at the top of this D5 section and D4's own
+  section.** Production was later wired to path 2 (`createGuardrailValidator`) exactly because it
+  was the zero-touch swap this bullet describes — and path 2's "honestly-stated cost" above
+  (synthesized `recommendationId`, `null` `namedEntity`/`adOptimizationKnowledgeVersion` in the
+  log) turned out to be a real bug, not an acceptable trade-off: §20.2 calls the rejection log
+  itself a calibration signal for E3, and a log keyed by a synthesized id can never be joined back
+  to the recommendation it rejected. The fix (done by the orchestrator, post-D6): path 1
+  (`applyGuardrails`) is now called directly from inside `generateRecommendationTask.ts`'s own
+  task handler, exactly as this bullet already recommended — "left undone here since that file
+  belongs to D4's step" no longer applies, since this is now a deliberate cross-cutting fix, not a
+  boundary violation. Both `guardrailAdapter.ts` and `guardrailSeam.ts` are deleted; path 2 no
+  longer exists, so "two integration paths" above is now "one." A bonus consequence: path 1's own
+  `adjustedConfidence` (described above, "persist in place of the model's own `confidence`") is
+  now actually persisted — path 2's `GuardrailVerdict` had no field for it, so D5's own
+  confidence-reduction guardrail (recent-major-change/composite-creative penalties, described
+  below) was silently never reflected in a stored recommendation's `confidence` until this fix.
 
 - **Ambiguities resolved:**
   1. **What input shape `validateGuardrails` should take**, given the design only says "post-model
@@ -5261,7 +5347,18 @@ Do this before adding decision types. The second one should be built on somethin
 
 ### E1 — Backtest harness
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across all three projects, lint, format,
+843/843 unit tests — this step's own 38 new tests across `services/backtest/**`). `npm run
+test:integration` passes 304/304 against a real Firestore emulator (up from 302 pre-E1 — this
+step's own 2 new emulator tests: `syncRunSource.emulator.test.ts` and the end-to-end
+`runBacktest.emulator.test.ts`). **The real `gs://sng-meta-ads-optimizer-archive` bucket was
+read-only listed (never written) and found EMPTY** — see Notes below; this step's proof runs
+entirely against reconstructed/synthetic history via the Firestore emulator and an in-memory fake
+archive bucket, never real archived data (none exists yet). No production Firestore or Cloud
+Storage was written to anywhere in this step; no cloud resource was created/modified/deployed; no
+npm dependency was added; `services/reasoner/` and E2's outcome-evaluation code were not touched.
+See Notes below for exactly how the point-in-time constraint is made structural, the leakage
+tests and how they'd fail without it, `backtestRuns`' real shape, and the strategy comparison.
 **Depends on:** D5, §23 archive populated
 **Design refs:** §21.2, §23
 
@@ -5288,11 +5385,267 @@ prove no post-T data enters the reconstruction.
 accidentally sees the future will look excellent. Make the point-in-time constraint structural (filter at
 the archive read boundary), not a convention that later code can forget.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/backtest/{archivePath,pointInTimeArchive,syncRunSource,
+  reconstructMeta,reconstructShopify,evidence,strategies,outcome,runBacktest,testFixtures,
+  index}.ts`, each with a co-located `*.test.ts` (pure) except `pointInTimeArchive.ts`/
+  `syncRunSource.ts`/`runBacktest.ts`, which additionally have `*.emulator.test.ts` (real
+  Firestore). `testFixtures.ts` (not a test file itself, same convention as B2's
+  `testFixtures.ts`) holds a shared in-memory fake archive bucket + fake `syncRuns` source. No
+  existing file outside `services/backtest/` was modified — `services/ingest/sync/archiver.ts`
+  (B1, Done) was read but deliberately NOT touched (see the structural point below); no schema
+  file changed (`backtestRunSchema` already existed, built by A2).
+
+- **⚠️ THE POINT-IN-TIME CONSTRAINT — exactly how it is structural, and the subtle trap it avoids.**
+  `PointInTimeArchiveReader` (`pointInTimeArchive.ts`) has a **private constructor**; the only way
+  to get one is `PointInTimeArchiveReader.create({ asOfInstant, archive, listable, syncRuns })`,
+  where `asOfInstant` is a required field with no default — a call site that omits it fails
+  `tsc`, not a runtime check (proved by `pointInTimeArchive.test.ts`'s "cannot be constructed
+  without asOfInstant" case, a `@ts-expect-error` test in the same style as D5's own guardrails.ts
+  structural-guarantee test). The reader exposes exactly one way to get payloads out —
+  `readArchivedPayloads(source, resource?)` — and there is no `read(path)` passthrough, no
+  "give me everything" sibling method, mirroring C2's `GapAware<T>` discipline exactly: the unsafe
+  operation isn't discouraged, it isn't reachable.
+  - **The subtle part, and why it is the single most important thing in this step.** §23's archive
+    path partitions by the reporting day a payload is **about** (archiver.ts's own module
+    comment: "a backfill task archives payloads under the day the data is about... regardless of
+    when the fetch actually ran"), never by when it was fetched. A naive leakage filter —
+    "exclude any payload whose `day > T`" — is **wrong**: a Shopify order for day D that only
+    becomes visible after a LATE reconciliation sync completes well after T is still archived
+    under day D, so a day-only filter would let it straight through whenever D <= T, even though
+    the system genuinely did not know it at T. This is exactly the "silent" failure the step
+    brief warns about — the result would look like an ordinary backtest, not an obviously broken
+    one. The only honest boundary is **when the sync run that produced the payload finished**:
+    `PointInTimeArchiveReader.create` reads every `syncRuns` doc (B1's own bookkeeping — full
+    collection scan, no new index, matching this codebase's own small-account-scale precedent)
+    and computes `allowedRunIds` = every run with `status === "SUCCEEDED"` and
+    `finishedAt <= asOfInstant`, **once, at construction**. `readArchivedPayloads` parses each
+    listed object name (`archivePath.ts`'s `parseRawArchivePath`, the pure inverse of `buildRaw
+    ArchivePath`) and keeps only records whose `runId` is in that set — the payload's own `day`
+    is carried through on the returned record purely for windowing, and plays **no role** in the
+    filter decision.
+  - **The leakage test that would fail if this were removed, exactly.**
+    `pointInTimeArchive.test.ts`'s case named "THE LEAKAGE CASE" archives a payload dated
+    `2026-01-05` (well before `T = 2026-02-01`) whose producing run (`run-late-reconciliation`)
+    only finishes on `2026-03-01` — **after** T. `readArchivedPayloads("meta", "insights_page")`
+    at `asOfInstant = T` asserts `toHaveLength(0)`. **If the constraint were implemented as a
+    day-only filter** (`parsed.day <= asOfInstant`, the naive/wrong version), this assertion would
+    fail: `2026-01-05 <= 2026-02-01` is true, so the payload would be wrongly included, and the
+    test's `expect(records).toHaveLength(0)` would report `received [1]` instead of `[]`. **If the
+    run-completion filter were removed entirely** (no `syncRuns` check at all — every archived
+    payload trusted unconditionally), the same test would fail the same way, for the same reason.
+    The same test's second half re-runs the identical scenario with `asOfInstant` moved to
+    `2026-03-02` (one day after the run's own completion) and asserts the payload **is** now
+    visible — proving this is genuinely a knowledge-at-T boundary, not a filter that just hides
+    everything. `runBacktest.emulator.test.ts` repeats the same shape end to end through the real
+    orchestrator (a "leak batch": an enormous, inflated Meta insights row for the winning ad set,
+    dated **inside** the primary decision window, archived by a run that finishes long after
+    even the outcome horizon) and asserts the decision's `changePercent` stays inside D1's own
+    `[5,15]%` safe range (impossible if a figure orders of magnitude larger had leaked in) and the
+    scored outcome's purchase count stays in the tens, not the billions the leak payload carries.
+  - **What was deliberately NOT changed to build this:** `services/ingest/sync/archiver.ts` itself
+    (B1, Done) — `RawArchiveStore` still has only `archive`/`read`, no listing capability was added
+    to it, so every existing `dummyArchiver: RawArchiveStore` fixture across ~20 other steps' test
+    files is untouched. Listing is a **new, separate** interface (`ArchiveListable`,
+    `listObjectNames(prefix)`) that a real `@google-cloud/storage` `Bucket` already satisfies
+    structurally via its own `getFiles` (`wrapGcsBucketAsListable`) — the real archive store
+    (`GcsRawArchiveStore`) is reused completely unmodified for `.read(path)`.
+
+- **What archived history actually exists — established directly, before writing a line of
+  reconstruction code (per this step's own explicit instruction).** A read-only,
+  non-mutating list of `gs://sng-meta-ads-optimizer-archive` (`prefix: "raw/"`) was run live
+  against the real bucket (ADC available in this environment, same as prior steps' live
+  verification): **the bucket exists but contains zero objects under `raw/`.** This matches the
+  brief's own prediction exactly — every B2/B3/B5/B6/B7/B8 sync task's `ctx.archiver.archive(...)`
+  call path is real and wired (confirmed by grep: `entitySync.ts`, `configSnapshot.ts`,
+  `insightsSync.ts`/`pollAsyncReport.ts`, `ordersSync.ts`/`matrixifyImport.ts`,
+  `processTask.ts` all call it), but **no production sync has ever actually run** — every prior
+  step's own live verification ran against the Firestore emulator, or made a small number of
+  hand-counted live API calls that were never routed through a deployed sync pipeline. **There is
+  therefore no real history to replay a real backtest against yet.** Per this step's own
+  instruction ("build the harness properly, prove it on reconstructed/synthetic history, and say
+  clearly what it has not yet been run against"): the harness (`PointInTimeArchiveReader` through
+  `runBacktestForDate`) is real, production-shaped code with no synthetic shortcuts in its own
+  logic — it reuses B2/B3/B5/C1/C2/C3/D1's own real parsing/normalization/aggregation/eligibility
+  functions unmodified throughout (see the next point) — but its one proof, `runBacktest.
+  emulator.test.ts`, seeds SYNTHETIC archive payloads (fabricated ad sets, fabricated order
+  history, synthetic customer ids per this step's own "never real identifiers" constraint) into
+  an in-memory fake bucket, not real archived data. **This has NOT been run against the real
+  account's history — that will only be possible once a real sync deployment (B1's own listed
+  provisioning steps) has actually run for a while and populated the real bucket.** Reported
+  plainly rather than presented as a real result.
+
+- **The reconstruction pipeline reuses B2/B3/B5/C1/C2/C3/D1's own pure functions UNCHANGED — no
+  new parsing logic was written.** `reconstructMeta.ts` feeds each archived `"insights_page"`
+  payload's rows through B3's real `normalizeInsightsRow` (`services/ingest/meta/insights/
+  normalize.ts`) and then C1's real `normalizeMetaInsightsDailyRow`
+  (`services/analytics/daily/metaNormalize.ts`) — the exact same two functions production calls.
+  `reconstructShopify.ts` does the same for archived `"orders_csv_import"` CSV text through B5's
+  real `parseMatrixifyCsv`/`normalizeMatrixifyOrderGroup` and C1's real `normalizeShopifyOrder`/
+  `normalizeShopifyRefund`/`computeShopifyDailyCoverage`. `evidence.ts` reuses C2's real
+  `aggregateMetaWindow`/`buildWindowMetrics` and C3's real `computeWindowStatistics` unchanged.
+  `strategies.ts`'s SYSTEM strategy reuses D1's real `computeEligibilityAndRange`
+  (`services/evidence/eligibility.ts`) unchanged. This is deliberate: a backtest whose
+  reconstruction used DIFFERENT code from production would not actually be testing "would the
+  account's own machinery have said yes here" — it would be testing a parallel reimplementation
+  that could silently drift from what D1/C3 really compute, the exact "convention a later author
+  forgets" failure this whole project has been bitten by twice already (C2/C5's seasonality
+  provider, D4/D5's guardrail seam).
+
+- **Two real, documented scope cuts — not reconstructed from the archive, flagged rather than
+  silently assumed:**
+  1. **Meta entity/budget-ownership config (D1's `budgetOwnerResolution.ts`) is not
+     reconstructed.** Every ad set present in the reconstructed Meta insights rows is treated as
+     its own decision unit directly, rather than re-deriving CBO/ABO ownership from the archive's
+     "campaigns"/"adsets" resources through `services/ingest/meta/entities/normalize.ts`'s
+     `normalizeCampaign`/`normalizeAdset`. A future iteration wanting full budget-owner fidelity
+     should extend `reconstructMeta.ts` with a sibling that parses those two resources and feeds
+     D1's real resolver — flagged, not silently narrowed.
+  2. **Shopify's incremental GraphQL sync resource (`"orders_sync"`, ordersSync.ts) is not
+     reconstructed** — only the CSV backfill resource (`"orders_csv_import"`, matrixifyImport.ts).
+     This account's deep, multi-month replayable HISTORY came from the CSV backfill; the GraphQL
+     path is a 60-day-bounded incremental sync, a strict subset of what the CSV path already
+     covers over any window old enough to be worth backtesting. A sibling
+     `reconstructShopifyOrdersFromGraphqlAsOf`, reusing `normalizeGraphqlOrder` the same way, is
+     the documented extension point for replaying the most recent ~60 days at that granularity.
+
+- **The outcome metric, and why (per this step's own explicit "choose your outcome metric and
+  justify it" instruction).** Both strategies decide and are scored on **Meta-attributed
+  `metaRoas`/`cpa`**, never Shopify-attributed per-entity figures — because B7's own measured
+  real coverage is ~0.02% (the store's Magic checkout app bypasses Shopify's own session
+  tracking, a structural cause, not a fixable tagging gap), exactly the same reasoning D1's own
+  `eligibility.ts` already applies (its gates read `metaRoasVerdict`/`cpaVerdict`, never
+  `shopifyRoas` — D1's own "Reality #4"). `evidence.ts` therefore never reconstructs Shopify's
+  per-entity attribution join (B7's `entityGraph`/`ordersAttributedToEntity`) at all — every ad
+  set's Shopify-side totals in `buildWindowMetrics`'s input are an honest, explicit
+  `markGap(zeroTotals, false, [])`, matched by `shopifyMetricsExcludedAsUnresolvable: false` (not
+  a fabricated non-zero, and not the audit-unresolvable null case either — genuinely "not
+  attempted here"). Reconstructed Shopify data is used for exactly one thing:
+  **account-level blended MER** (§6.3, `totalShopifyRevenue / totalMetaSpend`, no attribution at
+  all) reported as CONTEXT alongside each backtest result (`RunBacktestResult.blendedMerContext`),
+  never as an input to either strategy's decision.
+
+- **How the Shopify data-gap and C5 seasonality are handled, concretely.**
+  - **Gap.** `reconstructShopify.ts` takes `knownGaps` (B5's own recorded `syncState/
+    shopify_orders.knownGaps` shape, `SyncStateKnownGap[]`) as an explicit input — never
+    re-derived — and calls C1's real `computeShopifyDailyCoverage` to build a genuine
+    `shopifyDailyCoverage`-equivalent map. `runBacktestForDate` computes `blendedMerContext.
+    windowHasDataGap`/`gapDays` from that map for the primary window and reports it plainly;
+    proven live in `runBacktest.emulator.test.ts` with a synthetic gap
+    (`[2026-07-10, 2026-07-15)`) overlapping the primary window — `windowHasDataGap` comes back
+    `true` with real gap days listed, not a silent number. Because neither strategy's DECISION
+    ever reads Shopify figures (see the outcome-metric point above), the account's real
+    `[2025-12-14, ~2026-07-02)` hole cannot masquerade as a revenue collapse in either strategy's
+    choice — it can only ever taint the reported blended-MER context, and only visibly so.
+  - **Seasonality.** `runBacktestForDate` accepts an optional `seasonalityProvider` matching C2's
+    own exact `SeasonalityContextProvider` contract (`services/analytics/features/seasonality.ts`)
+    and threads it straight into `evidence.ts`'s `buildAdSetWindowEvidence`, which passes it to
+    C2's real `buildWindowMetrics` — so when a real provider is supplied (C5's own real
+    `seasonalityContextFor`, `services/analytics/seasonality/context.ts`, which reads the real
+    `seasonalCalendarWindows` collection and needs no injection of its own), `spansSeasonalBoundary`
+    flows into C3's real `computeWindowStatistics`, which already forces `NOT_DISTINGUISHABLE`
+    (never a confident verdict) on a window whose baseline sits in a different seasonal regime —
+    for both `metaRoas` and `cpa`. When no provider is supplied (as in this step's own emulator
+    proof, which needed no seasonal calendar to demonstrate the mechanism), evidence.ts falls back
+    to C2's own `NULL_SEASONALITY_CONTEXT` — the same honest "unavailable" default C2 itself uses,
+    never a fabricated off-season assumption. No metric anywhere is de-seasonalised — the context
+    only ever suppresses a verdict or sits beside a number, per C5's own explicit instruction and
+    this step's own.
+
+- **The two strategies, concretely, and how they compare on this step's own synthetic proof.**
+  `strategies.ts`'s **SYSTEM** strategy evaluates D1's real `computeEligibilityAndRange` against
+  every delivering ad set's primary-window (28d) verdicts and picks the eligible candidate with
+  the highest confidence — `learningPhase`/`recentMajorChanges` are honestly `null`/`false` (not
+  reconstructed from the archive, an explicit scope cut, never a fabricated block), and a proposed
+  change is independently re-checked against `resolveGuardrailThresholds(canon).maxChangePercent`
+  (the same canon-sourced limit D5 reads, reused by name rather than reinvented — see the next
+  point for why `services/reasoner/` itself was not imported). **NAIVE** (§29 criterion 10's own
+  literal baseline) ranks ad sets by RAW, unshrunk, un-interval-checked 7-day ROAS and always
+  scales the winner by a fixed 20%, with no purchase-floor or guardrail check of any kind —
+  `confidence` is always `null` (naive makes no calibrated probability claim to score). In
+  `runBacktest.emulator.test.ts`'s synthetic scenario (a steady, well-measured 56-purchase/28d,
+  5x-ROAS "winner" ad set; a steady, well-measured, below-target "loser"; and a 3-purchase
+  "newcomer" whose 7-day window shows a lucky 30x raw ROAS): **SYSTEM correctly refuses the
+  newcomer** (3 purchases, far below the 30-purchase floor → `NOT_DISTINGUISHABLE`, ineligible)
+  **and picks the winner; NAIVE, which never checks the floor, picks the newcomer.** The
+  synthetic "actual future" (28-day horizon) has the winner's real performance hold
+  (`scaledSuccessfully: true`, Brier component < 0.25 for a confident, correct call) while the
+  newcomer's luck regresses to a genuinely below-target ROAS (`scaledSuccessfully: false`) — a
+  concrete instance of SYSTEM beating NAIVE, on this synthetic run. **This is a demonstration
+  that the harness and its comparison mechanics work correctly, not a claim about the real
+  account's strategy quality** — that requires real archived history, which does not exist yet
+  (see above).
+
+- **`backtestRuns`' real, exact shape — for E3 to calibrate over.** One document per
+  `(asOfDate, strategy)` — `runBacktestForDate` always writes exactly two per call, both sharing
+  the same `asOfDate`. Schema (`shared/schema/sync.ts`, built by A2, untouched by this step):
+  ```
+  backtestRunId: string        // "bt_{SYSTEM|NAIVE}_{asOfDate}_{randomUUID()}"
+  asOfDate: ReportingDay        // T, "YYYY-MM-DD"
+  strategy: "SYSTEM" | "NAIVE_HIGHEST_RECENT_ROAS"
+  decisionUnit: { type: "ADSET"; id: string } | null   // null iff INSUFFICIENT_DATA
+  generatedRecommendation: unknown   // BacktestRecommendation, JSON-round-tripped before write
+                                      //   (D2's own undefined-vs-Firestore lesson, reused
+                                      //   defensively — see runBacktest.ts's jsonSafe())
+  actualOutcome: unknown              // ActualOutcome, same JSON-round-trip
+  brierScoreComponent: number | null  // null unless: recommendation === "INCREASE_BUDGET" AND
+                                       //   confidence !== null AND the outcome was measurable
+  createdAt: FirestoreTimestamp
+  ```
+  `generatedRecommendation` (`strategies.ts`'s `BacktestRecommendation`) always has:
+  `{strategy, decisionUnit, recommendation: "INCREASE_BUDGET"|"HOLD"|"INSUFFICIENT_DATA",
+  changePercent: number|null, confidence: number|null, primaryReasons: string[],
+  guardrailRejected: boolean, guardrailReason: string|null}`. `actualOutcome`
+  (`outcome.ts`'s `ActualOutcome`) always has: `{decisionUnit, window: {startDay,endDay},
+  meta: MetaWindowTotals|null, metaRoas: number|null, verdict: Verdict|null,
+  scaledSuccessfully: boolean|null}`. E3 can query `backtestRuns` by `strategy` and compare
+  `brierScoreComponent` distributions directly — `NAIVE_HIGHEST_RECENT_ROAS` rows will always
+  carry `brierScoreComponent: null` (by design, see the outcome-metric point above), so a
+  SYSTEM-vs-NAIVE calibration comparison should read `SYSTEM`'s own Brier trend and treat NAIVE's
+  `scaledSuccessfully` rate as the comparison baseline instead, not its (nonexistent) calibration.
+
+- **Ambiguities resolved:**
+  1. **What "the recommendation that would have been made at T" means, given this step's own
+     instruction to prefer a faked reasoner over live/faked LLM calls.** Resolved: SYSTEM's
+     recommendation is a deterministic function of the SAME evidence D3's model would have
+     reasoned over (D1's real `computeEligibilityAndRange`), not an attempt to imitate the
+     model's prose — since D1's eligibility gates and D5's guardrails already bound what the
+     model's structured output is allowed to say (§20.2: guardrails run in code, never delegated
+     to the model), a deterministic function of that same evidence is a faithful, zero-cost proxy
+     for the guardrail-bounded OUTCOME of the model's reasoning. Stated plainly as a scope choice,
+     not a claim that it reproduces what Claude would literally have written.
+  2. **Whether to import `services/reasoner/`'s real `validateGuardrails`/`RecommendationOutput`
+     for full fidelity.** Resolved: no — the coordinator's own safety constraint says to stay out
+     of `services/reasoner/` (a concurrent agent owns a fix there), and `validateGuardrails`'s
+     real input type (`GuardrailInput`) requires a full `ScalingEvidenceResult`/`RecommendationOutput`
+     this step's Meta-only, budget-ownership-simplified reconstruction does not produce. E1 instead
+     reuses `resolveGuardrailThresholds` (shared/canon, not `services/reasoner/`) directly for the
+     one guardrail check that matters at this decision altitude (max change percent) — the same
+     canon-sourced number D5 itself reads, so a settings correction changes both together.
+  3. **Whether the naive strategy should be guardrail-clamped too.** Resolved: no — clamping it
+     would make it a smarter baseline than §29 criterion 10 actually describes ("scale whatever
+     had the highest recent ROAS", no qualifiers). NAIVE's fixed 20% change is explicitly NOT
+     checked against `maxChangePercent`.
+  4. **What decision altitude to backtest at.** Resolved: ad set — this account's real §4.1 budget
+     owner in the common (ABO) case, and the altitude D1's own real fixtures (`AS_17`) already
+     use. Campaign-level CBO backtesting is left to whoever extends this step per the
+     budget-ownership scope cut above.
+
 ---
 
 ### E2 — Outcome evaluation
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across all three tsconfig projects, lint,
+lint:web, format:check, 843/843 unit tests, up from 831 pre-E2 — this step's own 12 new pure tests in
+`services/evidence/outcomeEvaluation.test.ts`, no Firestore). `npm run test:integration`-equivalent run
+(against a self-hosted emulator on alternate ports — see below for why) passes: this step's own 4 new
+emulator tests in `services/evidence/recommendationOutcomeTask.emulator.test.ts`, plus the full
+pre-existing emulator suite unaffected by this step's schema/registry changes. No production Firestore
+was touched (emulator only); no live Anthropic/Meta/Shopify call was made anywhere in this step (E2
+evaluates already-stored data); no cloud resource was created/modified/deployed; no npm dependency was
+added. See Notes below for the trigger mechanism, the shrunk-baseline proof, the seasonal-confound flag,
+and the exact classification shape E3 will consume.
 **Depends on:** D5
 **Design refs:** §21.1
 
@@ -5320,6 +5673,211 @@ evaluated against its shrunk baseline.
 **Notes for the planning agent.** §21.1 exists because v1 evaluated on `roas3d`, and at this volume three
 days is roughly two purchases. If you find yourself adding a time-based fallback trigger, re-read it —
 a recommendation that never accumulates enough evidence to judge should stay unjudged.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/evidence/{outcomeEvaluation,recommendationOutcomeTask}.ts`, each with
+  a co-located test — `outcomeEvaluation.test.ts` (12 pure tests, no Firestore, no live call) and
+  `recommendationOutcomeTask.emulator.test.ts` (4 tests, real Firestore emulator). Split exactly on
+  D1/D2/C3's own precedent: `outcomeEvaluation.ts`'s `computeRecommendationOutcome` is a pure function
+  (recommendation + packet + already-fetched Meta rows in → a discriminated result out, no Firestore, no
+  I/O); `recommendationOutcomeTask.ts` is the thin Firestore glue (find candidates, fetch each one's
+  packet and Meta rows, call the pure function, write only on `EVALUATED`) plus the
+  `EVALUATE_RECOMMENDATION_OUTCOME` `TaskHandler`/`TaskRegistration`. Also touched: `shared/schema/
+  decisions.ts` (`recommendationOutcomeSchema` extended additively — see below), `services/ingest/sync/
+  taskTypes.ts` (exported the `EVALUATE_RECOMMENDATION_OUTCOME` constant — the string itself was already
+  in §10.2's own list, added by B1; this mirrors `GENERATE_RECOMMENDATION`'s own convention),
+  `services/ingest/sync/registry.ts` (one import + one `registry.register(...)` line, on the ORDINARY
+  default registry — this task makes no model call and has no 60-second-ceiling risk, unlike
+  `GENERATE_RECOMMENDATION`, so it does not need the reasoner's dedicated worker registry),
+  `services/ingest/sync/registry.test.ts` (its exact-list assertion, +1 entry), `services/evidence/
+  index.ts` (barrel exports). **`services/reasoner/` and `services/backtest/` were not touched at
+  all** — confirmed by `git status`-equivalent review before every edit, per the coordinator's explicit
+  "stay out of both" instruction (the concurrent guardrail-log fix and E1's backtest harness live there).
+
+- **The trigger, and the proof an unmet-conditions recommendation stays unjudged.** There is no
+  time-based fallback anywhere in this step — `computeRecommendationOutcome` reads a recommendation's
+  own `recheckConditions.{minimumAdditionalSpendMinorUnits,minimumAdditionalPurchases}` and walks the
+  reporting days from the day after `acceptedAt` forward, accumulating Meta-attributed spend/purchases
+  **day by day** (via C2's own `aggregateMetaWindow`), stopping at the FIRST day both thresholds are met
+  (AND, not OR — see "Ambiguities resolved" below). If neither the seeded evidence nor `asOfDay` ever
+  crosses both thresholds, the function returns `{kind: "NOT_YET_ELIGIBLE", reason: "..."}` and
+  `recommendationOutcomeTask.ts` writes **nothing** — no `recommendationOutcomes/{id}` document, not a
+  document with a null classification. **The actual proof**
+  (`recommendationOutcomeTask.emulator.test.ts` test 1): a recommendation accepted with real
+  `recheckConditions`, given only 3 tiny days of real post-acceptance `metaInsightsDailyNormalized` rows
+  (nowhere near either threshold), run through the REAL, registered `EVALUATE_RECOMMENDATION_OUTCOME`
+  task via `runSyncTask`/`createDefaultRegistry()` — the task reports `SUCCEEDED` with
+  `summary.notYetEligible: 1`, `summary.evaluated: 0`, and `outcomesRepo.get("rec_unmet")` returns
+  **`null`** — the recommendation's own absence from the collection IS the proof, not a status field
+  claiming so. A companion pure test (`outcomeEvaluation.test.ts`, "NOT_YET_ELIGIBLE: unmet recheck
+  conditions") exercises the same path without Firestore. A second emulator test proves the SAME
+  recommendation, once enough real evidence has accumulated, DOES get evaluated (test 2, below) — so
+  "not evaluated" is demonstrably about the evidence, not a bug that would also block a legitimate case.
+  Re-running the task after a recommendation is already evaluated is a no-op by construction
+  (`recommendationOutcomeTask.ts`'s `alreadyEvaluated` set, built from a full `recommendationOutcomes`
+  scan, filters it out of the candidate list before any work happens on it — proven in emulator test 2's
+  own second `runEvaluateTask` call: `summary.candidatesConsidered: 0`, `summary.evaluated: 0`).
+
+- **The shrunk-baseline proof, explicit.** `baselineShrunk` is read from
+  `decisionPacket.evidence.windows[primaryWindow].metaRoasShrunk` — the exact field C3 writes
+  (`metaRoasShrunk: number | null`, sitting beside the raw `metaRoas.value` in the SAME stored window
+  object) — via a narrow zod re-parse of the packet's untyped `evidence: Record<string, unknown>` field
+  (`scalingEvidenceShapeSchema` in `outcomeEvaluation.ts`), never a cast. It is never recomputed: E2 does
+  not call C3's `shrinkTowardAccountMean` itself, does not read `statisticalThresholds.minPurchaseFloors`
+  to re-derive a pseudo-count, and does not touch the account mean — it reads the number ALREADY FROZEN
+  on the packet at generation time. This is what makes a later correction to shrinkage/threshold settings
+  change FUTURE recommendations' baselines without silently rewriting what a past outcome was judged
+  against — the same property D5's `guardrailRejections.violations[].judgedAgainst` gives guardrail
+  rejections, extended here to outcomes. **The actual proof**, both at the pure-function level
+  (`outcomeEvaluation.test.ts`, "compares against the SHRUNK baseline, never the raw value") and against
+  a real Firestore round-trip (`recommendationOutcomeTask.emulator.test.ts` test 2): a decision packet is
+  seeded with `metaRoas.value: 8.0` (a raw-looking figure, deliberately realistic — D1's own
+  `MetricSnapshot` shape) and `metaRoasShrunk: 3.5` (deliberately far apart so a wrong read is
+  unmistakable); after real evidence accumulates past the recheck thresholds, the stored
+  `recommendationOutcomes/{id}.baselineShrunk` is asserted to equal **exactly `3.5`**, never `8.0`. If a
+  future edit ever swapped in the raw value, this assertion fails immediately. A packet whose
+  `metaRoasShrunk` is `null` (no honest shrunk figure to compare against) is `SKIPPED`, never silently
+  substituting the raw value instead — the one place §15.3 is enforced as a hard stop, not a preference.
+
+- **Only Meta-attributed figures are used — never `shopifyRoas`/`shopifyRoasShrunk`.** `additionalSpend`/
+  `additionalPurchases`/`roasAfter` are all computed from `metaInsightsDailyNormalized` via C2's own
+  `aggregateMetaWindow` (spend, purchase count, purchase value) — the same reality-#4 discipline D1's
+  `evidenceAssembler.ts` already applies ("`eligibleToScale`'s own gates use ONLY Meta-attributed
+  metaRoas/cpa, never shopifyRoas"), extended here because at ~0.02% Shopify attribution coverage (B7) a
+  per-ad/ad-set Shopify-attributed ROAS is not a usable outcome signal, gap or no gap. A direct
+  consequence, worth stating explicitly since the brief called it out: **this module never constructs or
+  reads a `GapAware<T>` value at all** (grep confirms no import of `gapAware.ts`/`shopifyWindowAggregate.ts`
+  anywhere under `services/evidence/outcomeEvaluation.ts` or `recommendationOutcomeTask.ts`), so it never
+  needed — and never calls — `unsafeIgnoreGap`. An evaluation window overlapping the real order-data hole
+  (2025-12-14 → ~2026-07-02, widening daily) simply has no Shopify-derived figure in play to be tempted to
+  use; the hole is a non-issue for this step by construction, not by a check this step added.
+
+- **Seasonality — flagged, not silently scored, and proven both ways.** `computeRecommendationOutcome`
+  reconstructs the decision packet's own primary window as a day range (`reconstructBaselineWindow`: the
+  packet's `createdAt` → its reporting day → yesterday, per C2/D1's own "asOfDay defaults to yesterday"
+  convention → `windowEnding(primaryWindow, that day)` — a documented, at-most-one-day approximation,
+  since packets don't store an explicit day range) and calls C5's REAL, landed `seasonalityContextFor`
+  (`services/analytics/seasonality/index.ts`) twice: once with `(evaluationWindow, baselineWindow)` for
+  `spansSeasonalBoundary`, once with `(baselineWindow)` alone to capture the baseline's own labels for
+  display. The interval-vs-baseline verdict is ALWAYS computed first and stored as `rawClassification` —
+  never discarded — and `classification` is forced to a new `SEASONALLY_CONFOUNDED` taxonomy member
+  ONLY when `spansSeasonalBoundary` is true, otherwise `classification === rawClassification`. This is
+  the literal "flag, don't silently score" requirement: the flag IS the divergence between two always-
+  populated fields, not a suppressed number. **Proven both levels**: a pure test injects a fake
+  `seasonalityContextFor` returning `spansSeasonalBoundary: true` on a fixture that would otherwise score
+  a clean `SUCCESS` (roasAfter comfortably above baseline) and asserts `rawClassification: "SUCCESS"`,
+  `classification: "SEASONALLY_CONFOUNDED"`, and `roasAfter` still reported as the real, unsuppressed
+  number; the emulator test does the same against a REAL seeded `seasonalCalendarWindows` "diwali"
+  document that overlaps the evaluation window but not the reconstructed baseline window, run through the
+  real, unmodified C5 `seasonalityContextFor`, not a fake. Because this account's real order history gives
+  every seeded festival label `demandIndexSampleSize` 0 or 1 today (C5's own honesty policy), `demandIndex`
+  is `null` far more often than not on a real outcome — `seasonalContext.demandIndex` is stored as `number
+  | null` and never assumed non-null anywhere in this step's own code or tests.
+
+- **The classification shape E3 will consume (`recommendationOutcomeSchema`, additively extended —
+  every new field optional/nullable, so A2's own `schema.test.ts` fixture with none of them still parses
+  unchanged):**
+  ```
+  classification: "SUCCESS" | "NEUTRAL" | "FAILURE" | "SEASONALLY_CONFOUNDED" | null
+  rawClassification: "SUCCESS" | "NEUTRAL" | "FAILURE" | null   // pre-seasonal-override read, always kept
+  additionalSpendMinorUnits, additionalPurchases, roasAfter, baselineShrunk   // A2's original stub fields
+  roasAfterInterval: { intervalLow, intervalHigh } | null        // the interval classification was computed from
+  intervalZScore: number | null;  intervalZScoreSource: "settings" | "default" | null
+  evaluationWindow, baselineWindow: { startDay, endDay } | null  // exact reporting-day ranges, auditable
+  primaryWindow: "7d"|"14d"|"28d"|"56d" | null                    // which window's shrunk baseline this is
+  decisionUnit: EntityRef | null                                 // denormalized, no join needed
+  seasonalContext: {
+    evaluationWindowLabels: string[]; baselineWindowLabels: string[];
+    spansSeasonalBoundary: boolean; demandIndex: number | null; demandIndexSampleSize: number;
+    summaryText: string;
+  } | null
+  ```
+  **E3's calibration should filter or bucket on `classification === "SEASONALLY_CONFOUNDED"` before
+  computing a Brier score or a calibration curve** — mixing it into SUCCESS/FAILURE would be exactly the
+  "calibrating the calendar" failure mode the brief warns about; `rawClassification` is there if E3 wants
+  a sensitivity check on how much the seasonal flag is actually changing the answer. A document is
+  written to `recommendationOutcomes/{id}` **only** on `EVALUATED` — `NOT_YET_ELIGIBLE` and `SKIPPED`
+  both write nothing, so "this recommendation has no outcome doc yet" is the honest, queryable signal for
+  "still unjudged" (E3 should not treat a missing doc as any kind of failure).
+
+- **Targets (`targetRoas`/`targetCpaMinorUnits`) are not used anywhere in this step.** E2 compares
+  `roasAfter` against the recommendation's own stored `baselineShrunk` (§21.1, §15.3), never against
+  `targetRoas`/`targetCpaMinorUnits` — those are D1/D5's placeholders for the ORIGINAL scaling decision,
+  not the ongoing-evidence check this step performs. The one settings-sourced number this step DOES read
+  is `statisticalThresholds.intervalZScore` (via `resolveStatisticalThresholds(canon)`, never hardcoded,
+  reused as-is from C3), and — following D5's own `judgedAgainst.source` precedent — its source
+  (`"settings"` vs `"default"`) is recorded on every outcome (`intervalZScore`/`intervalZScoreSource`), so
+  a later correction to that z-score changes FUTURE outcomes' interval width without rewriting what a past
+  outcome was actually judged with.
+
+- **`guardrailRejections` — read from, or not, and why.** This step never queries `guardrailRejections`
+  at all. A guardrail-REJECTED recommendation already has `recommendation` forced to `INSUFFICIENT_DATA`
+  and every budget field (including `recheckConditions`) cleared to `null` by D4 — `isCandidate()` in
+  `recommendationOutcomeTask.ts` excludes it on `recheckConditions === null` alone, with no need to
+  cross-reference the rejection log. The coordinator's mid-task update that the concurrent guardrail-log
+  fix landed (`guardrailRejections` now keyed by the real `recommendationId`, the synthesized-id adapter
+  deleted) therefore changes nothing here — documented in `isCandidate`'s own comment for whoever reads
+  this next, including the "if you ever do need to query it, query the `recommendationId` FIELD, never
+  the doc id" guidance, kept as a note even though this step ended up not needing it.
+
+- **Query shape.** One `recommendations` equality query (`status == "COMPLETE"`, no composite index) plus
+  one full `recommendationOutcomes` scan per run, both read once; every other candidate filter
+  (`acceptedAt`/`recheckConditions`/`decisionUnit`/`packetId`/`recommendation`-type) happens in memory —
+  matching C1/C2/C3's own "full read pass, filter in memory" precedent at this account's small scale. Per
+  candidate: one `decisionPackets` point read, and one single-field `metaInsightsDailyNormalized`
+  `reportingDay` range query (no entity equality in the Firestore query itself — filtered to the decision
+  unit in memory inside `outcomeEvaluation.ts`), so no new composite index was needed anywhere in this
+  step.
+
+- **Emulator testing note — a real port conflict with the concurrently-running E1/reasoner agents, and how
+  it was resolved without touching either.** The default emulator ports (Firestore 8080, Auth 9099, per
+  `firebase.json`) were actively held by another agent's live emulator process for the whole session (a
+  live TCP connection observed via `netstat`, not just a stale listener) — running `npm run test:integration`
+  literally would have raced a concurrent agent's in-flight test run and, worse, this step's own
+  `beforeEach` does a full collection wipe that would have deleted THEIR seeded data mid-run. Resolved by
+  running the exact same `vitest -c vitest.emulator.config.ts` suite against a **separate, self-hosted
+  Firestore/Auth emulator pair on alternate ports** (8280/9199), via a scratch `firebase.json`-shaped
+  config file kept OUTSIDE the repo (this session's scratchpad directory, per the safety constraints —
+  `firestore.rules`/`firestore.indexes.json` referenced by absolute path, so the real rules file is still
+  what's tested), never touching the shared repo `firebase.json` or the other agents' running emulator.
+  Both this step's own new emulator test file AND the full existing `vitest.emulator.config.ts` suite (99
+  files including every other completed step's own emulator tests) were run this way and passed, proving
+  this step's schema/registry changes didn't regress anything already landed.
+
+- **Ambiguities resolved:**
+  1. **AND vs. OR between the two `recheckConditions` fields.** Resolved: AND — both the spend and
+     purchase thresholds (whichever are non-null; a `null` threshold is treated as automatically
+     satisfied for that one dimension) must be cleared before evaluation triggers. §20.1 asks for both
+     independently for a reason (spend alone can be high with pathologically few purchases; purchases
+     alone could reflect an artifact at very low spend) — requiring both is the conservative, evidence-
+     respecting reading. A degenerate `{spend: null, purchases: null}` recheckConditions (which would
+     otherwise trigger on the very first post-acceptance day with zero real evidence) is treated as
+     `SKIPPED`, not an immediate pass — D3's structured output always sets both numerically in practice,
+     so this is a defensive backstop, not an expected path.
+  2. **Where the evaluation window starts.** Resolved: the reporting day AFTER `acceptedAt`'s own
+     reporting day — a change accepted partway through a day could not have affected that day's already-
+     recorded delivery. The window ends at the FIRST day both thresholds clear (not the full range through
+     `asOfDay`), so `roasAfter`/the stored `evaluationWindow` reflect exactly the evidence the recheck
+     conditions asked for, not extra days accumulated only because the task happened to run late.
+  3. **How to reconstruct the baseline window's day range**, since decision packets store `primaryWindow`
+     (a label) but no explicit start/end days. Resolved: from the packet's own `createdAt`, using the SAME
+     "asOfDay defaults to yesterday" convention `RECOMPUTE_FEATURES` itself uses — an approximation
+     (documented in `reconstructBaselineWindow`'s own comment) accurate to within one day, which cannot
+     change which multi-day seasonal label(s) a window overlaps in any case this step's tests exercise.
+  4. **Whether `computeRecommendationOutcome` should trust its caller's filtering or re-validate.**
+     Resolved: re-validate every precondition itself (status/acceptedAt/recheckConditions/decisionUnit/
+     packetId/recommendation-type/packet-outcome/shrunk-baseline-present), independently of
+     `recommendationOutcomeTask.ts`'s own `isCandidate()` — so the pure function's own unit tests can
+     exercise every rejection path directly without needing the Firestore glue at all, and so the two
+     layers can never silently drift apart on what counts as evaluable.
+  5. **Whether to invent a second "guardrail purchase floor"-style statistical threshold for the
+     ROAS-after interval, or reuse C3's.** Resolved: reuse — `interval.ts`'s `poissonCountInterval`/
+     `scaleIntervalByCount` and `verdict.ts`'s `computeVerdict` are called exactly as C3 calls them, with
+     `baselineShrunk` standing in for C3's usual fixed target and `statisticalThresholds.intervalZScore`
+     (never a new constant) supplying the confidence level — a second, independently-tuned estimator here
+     would risk silently disagreeing with the interval discipline every other ROAS figure in this system
+     already uses, for no benefit.
 
 ---
 

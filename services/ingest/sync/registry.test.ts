@@ -36,7 +36,7 @@ describe("createTaskRegistry", () => {
 });
 
 describe("createDefaultRegistry", () => {
-  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's, C2's, C4's, C3's and D2's real task types", () => {
+  it("registers SYNC_NOOP plus B2's, B3's, B5's, B6's, B7's, B8's, C1's, C5's, C2's, C4's, C3's, D2's and E2's real task types", () => {
     const registry = createDefaultRegistry();
     expect(registry.list()).toEqual([
       SYNC_NOOP,
@@ -64,6 +64,9 @@ describe("createDefaultRegistry", () => {
       "COMPUTE_STATISTICS",
       // D2's own — §10.1's "mark all decision packets stale" step, run after RECOMPUTE_FEATURES.
       "MARK_DECISION_PACKETS_STALE",
+      // E2's own — §21.1: evaluate an accepted recommendation's outcome once its own
+      // recheckConditions are met.
+      "EVALUATE_RECOMMENDATION_OUTCOME",
     ]);
   });
 

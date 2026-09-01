@@ -11,8 +11,12 @@
 //   3. A worker failure (the reasoner call itself throwing, simulating a real Anthropic-side
 //      failure) leaves a legible FAILED state with a real errorMessage — never a doc stuck on
 //      PENDING/GENERATING — and syncRuns records the same failure independently.
-//   4. The D5 guardrail seam: a REJECTED verdict downgrades the stored recommendation to
-//      INSUFFICIENT_DATA and stamps guardrailRejection, exactly per §20.2.
+//   4. D5's real guardrail application (`applyGuardrails`): a REJECTED verdict downgrades the
+//      stored recommendation to INSUFFICIENT_DATA, stamps `guardrailRejection`, and durably logs
+//      the rejection to `guardrailRejections/{recommendationId}` — keyed by the REAL id, not a
+//      synthesized one (see generateRecommendationTask.ts's own corrective note; this was a real
+//      bug fixed post-D6, pre-Phase-E). 4b/4c prove the PRODUCTION DEFAULT — not a handler with
+//      any injected guardrail override, since none exists any more — actually enforces this.
 //   5. Duplicate delivery of the same enqueued task (Cloud Tasks' own at-least-once contract) is a
 //      no-op the second time — B1's own idempotency, reused here without D4 reinventing it.
 
@@ -29,12 +33,14 @@ import {
 } from "@shared/canon/index.ts";
 import {
   recommendationSchema,
+  guardrailRejectionLogSchema,
   metaAdSchema,
   metaAdsetSchema,
   metaCampaignSchema,
   metaInsightsDailyNormalizedSchema,
   shopifyDailyCoverageSchema,
   type Recommendation,
+  type GuardrailRejectionLog,
   type MetaAd,
   type MetaAdset,
   type MetaCampaign,
@@ -51,8 +57,10 @@ import { createInMemoryTaskQueueClient } from "../../ingest/sync/taskQueue.ts";
 import { GENERATE_RECOMMENDATION } from "../../ingest/sync/taskTypes.ts";
 import type { RawArchiveStore } from "../../ingest/sync/archiver.ts";
 import { requestRecommendation } from "./request.ts";
-import { createGenerateRecommendationHandler } from "./generateRecommendationTask.ts";
-import type { GuardrailValidator } from "./guardrailSeam.ts";
+import {
+  createGenerateRecommendationHandler,
+  type GenerateRecommendationHandlerDeps,
+} from "./generateRecommendationTask.ts";
 
 if (!process.env.FIRESTORE_EMULATOR_HOST) {
   throw new Error(
@@ -92,6 +100,7 @@ const ALL_COLLECTIONS = [
   COLLECTIONS.decisionPackets,
   COLLECTIONS.recommendations,
   COLLECTIONS.adOptimizationKnowledge,
+  COLLECTIONS.guardrailRejections,
 ];
 
 async function cleanupCollections() {
@@ -484,7 +493,7 @@ describe("GENERATE_RECOMMENDATION job pipeline — D4's own Done-when bar", () =
     expect(finalDoc.provenance).toBeNull();
   });
 
-  it("4) D5's guardrail seam: a REJECTED verdict downgrades to INSUFFICIENT_DATA and stamps guardrailRejection, with the knowledge document never in scope", async () => {
+  it("4) D5's real guardrail (applyGuardrails): a REJECTED verdict downgrades to INSUFFICIENT_DATA, stamps guardrailRejection, and durably logs a rejection keyed by the REAL recommendationId", async () => {
     await seedDeliveringAdset();
     await runFullPipeline();
 
@@ -504,29 +513,18 @@ describe("GENERATE_RECOMMENDATION job pipeline — D4's own Done-when bar", () =
         textBlock({
           ...VALID_MODEL_OUTPUT,
           recommendation: "INCREASE_BUDGET",
-          changePercent: 250, // a synthetic over-limit change, illustrating why D5 would reject it
+          changePercent: 250, // a synthetic over-limit change — the REAL guardrail default max is 20%
         }),
       ],
       usage: usage(),
     });
     const fakeClient = { beta: { messages: { create } } } as unknown as Anthropic;
 
-    // A stand-in for D5's real validator — structurally identical to what D5 will plug in:
-    // receives ONLY the model's own RecommendationOutput (see guardrailSeam.ts's own comment).
-    const rejectOverLimitChanges: GuardrailValidator = (recommendation) => {
-      if (recommendation.changePercent !== null && Math.abs(recommendation.changePercent) > 20) {
-        return {
-          verdict: "REJECTED",
-          reason: `changePercent ${recommendation.changePercent} exceeds the configured maximum of 20%`,
-        };
-      }
-      return { verdict: "ACCEPTED" };
-    };
-
-    const registry = buildTestWorkerRegistry({
-      client: fakeClient,
-      guardrailValidator: rejectOverLimitChanges,
-    });
+    // No injected guardrail behaviour of any kind — `createGenerateRecommendationHandler` has no
+    // such option any more (see generateRecommendationTask.ts's own corrective note). The ONLY
+    // override here is the Anthropic client, to avoid a live model call; `applyGuardrails` (D5's
+    // real §20.2 logic) runs unconditionally and rejects this 250% change on its own numbers.
+    const registry = buildTestWorkerRegistry({ client: fakeClient });
     const result = await dispatchEnqueuedRecommendationTask(queue.enqueued, registry);
     expect(result.status).toBe("SUCCEEDED"); // the TASK succeeded — the model's proposal was rejected, that's not a task failure
 
@@ -539,6 +537,122 @@ describe("GENERATE_RECOMMENDATION job pipeline — D4's own Done-when bar", () =
     expect(finalDoc.guardrailRejection).not.toBeNull();
     expect(finalDoc.guardrailRejection?.reason).toMatch(/exceeds the configured maximum/);
     expect(finalDoc.guardrailRejection?.rejectedAt).toBeInstanceOf(Date);
+    // The model's own reasoning stays visible on a REJECTED doc (D4's own "Ambiguities resolved"
+    // #4) — only the actionable budget fields are cleared, not the summary/reasons/risks/doNotDo.
+    expect(finalDoc.summary).toBe(VALID_MODEL_OUTPUT.summary);
+    expect(finalDoc.primaryReasons).toEqual(VALID_MODEL_OUTPUT.primaryReasons);
+
+    // THE FIX THIS STEP MAKES: `guardrailRejections/{recommendationId}` — a plain keyed lookup by
+    // the REAL id, no synthesis, no prefix scan. Before this fix, this exact `.get` would have
+    // returned null (the entry was written under a synthesized `adapter_ADSET_AS_17_<epochMillis>`
+    // id instead) — this is the join E3 (§20.2's own calibration-signal note) needs.
+    const logRepo = createRepository<GuardrailRejectionLog>(
+      db,
+      COLLECTIONS.guardrailRejections,
+      guardrailRejectionLogSchema,
+    );
+    const logged = await logRepo.get(recommendationId);
+    expect(logged).not.toBeNull();
+    expect(logged?.recommendationId).toBe(recommendationId);
+    expect(logged?.violations.some((v) => v.code === "MAX_CHANGE_PERCENT_EXCEEDED")).toBe(true);
+    expect(
+      logged?.violations.find((v) => v.code === "MAX_CHANGE_PERCENT_EXCEEDED")?.judgedAgainst,
+    ).toEqual({
+      field: "guardrailThresholds.maxChangePercent",
+      limit: 20,
+      source: "default",
+      actual: 250,
+    });
+    // The higher-fidelity fields the narrow adapter could never populate (no recommendationId in
+    // scope there means no namedEntity/accountDataVersion either, in that integration) — now real.
+    expect(logged?.namedEntity).toEqual({ type: "ADSET", id: "AS_17" });
+    expect(logged?.accountDataVersion).toBe(finalDoc.accountDataVersionAtGeneration);
+  });
+
+  it("4b) THE test this whole class of bug needed: the PRODUCTION DEFAULT (no guardrail-related override at all) actually enforces guardrails, not a passthrough", async () => {
+    // This is the regression test for the actual bug this step fixes: D4/D5 concurrently built
+    // two integration paths (a real one and a stronger one), the production wiring used the
+    // weaker one, and NOTHING in either step's own test suite caught it because every test
+    // injected its own guardrail stand-in — see generateRecommendationTask.ts's own corrective
+    // note on `generateRecommendationHandler` for the full history. There is no
+    // `guardrailValidator` (or equivalent) option on `GenerateRecommendationHandlerDeps` any
+    // more — the ONLY dependency overridden below is the Anthropic client, required to avoid a
+    // live model call (this task's own safety constraint), which is orthogonal to guardrail
+    // enforcement. Every other option — db aside, needed to point at the test project — is left
+    // at its default, exactly like the exported `generateRecommendationHandler` (which cannot be
+    // invoked directly here without a live Anthropic call via Secret Manager).
+    await seedDeliveringAdset();
+    await runFullPipeline();
+
+    const queue = createInMemoryTaskQueueClient();
+    const { recommendationId } = await requestRecommendation({
+      db,
+      queue,
+      namedEntity: { type: "ADSET", id: "AS_17" },
+    });
+
+    const create = vi.fn().mockResolvedValue({
+      id: "msg_1",
+      model: "claude-fable-5",
+      stop_reason: "end_turn",
+      stop_details: null,
+      content: [
+        textBlock({
+          ...VALID_MODEL_OUTPUT,
+          recommendation: "INCREASE_BUDGET",
+          changePercent: 999, // absurdly over-limit — if this passes, guardrails are not running
+        }),
+      ],
+      usage: usage(),
+    });
+    const fakeClient = { beta: { messages: { create } } } as unknown as Anthropic;
+
+    // `createGenerateRecommendationHandler({ db, client })` — db/client only, nothing
+    // guardrail-shaped, because there is nothing guardrail-shaped left to pass. This IS the
+    // production default's guardrail behaviour, unconditionally (see
+    // generateRecommendationTask.ts's own comment on `generateRecommendationHandler`).
+    const registry = createTaskRegistry();
+    registry.register({
+      taskType: GENERATE_RECOMMENDATION,
+      runSource: "internal",
+      syncStateTarget: null,
+      handler: createGenerateRecommendationHandler({ db, client: fakeClient }),
+    });
+
+    const result = await dispatchEnqueuedRecommendationTask(queue.enqueued, registry);
+    expect(result.status).toBe("SUCCEEDED");
+
+    const finalDoc = await getRecommendation(recommendationId);
+    // If a future change silently reintroduces a passthrough default, this is the assertion that
+    // fails: a 999% change would be persisted as COMPLETE/INCREASE_BUDGET instead.
+    expect(finalDoc.status).toBe("REJECTED");
+    expect(finalDoc.recommendation).toBe("INSUFFICIENT_DATA");
+    expect(finalDoc.changePercent).toBeNull();
+    expect(finalDoc.guardrailRejection).not.toBeNull();
+    expect(finalDoc.guardrailRejection?.reason).toMatch(/exceeds the configured maximum/);
+
+    const logRepo = createRepository<GuardrailRejectionLog>(
+      db,
+      COLLECTIONS.guardrailRejections,
+      guardrailRejectionLogSchema,
+    );
+    expect(await logRepo.get(recommendationId)).not.toBeNull();
+  });
+
+  it("4c) structural: GenerateRecommendationHandlerDeps has no guardrail-bypassing field — a future author cannot reintroduce one without a compile error", () => {
+    // GenerateRecommendationHandlerDeps is exactly {db?, client?, effort?, now?} — no
+    // `guardrailValidator` or equivalent. The object literal below only compiles because of the
+    // `@ts-expect-error` suppressing it; deleting that comment and running `npm run typecheck`
+    // reproduces `TS2353: Object literal may only specify known properties, and
+    // 'guardrailValidator' does not exist in type 'GenerateRecommendationHandlerDeps'` — the same
+    // enforcement mechanism guardrails.test.ts's own structural test uses for `GuardrailInput`.
+    const deps: GenerateRecommendationHandlerDeps = {
+      db,
+      // @ts-expect-error — no such field exists any more; see generateRecommendationTask.ts's own
+      // corrective note on `generateRecommendationHandler` for why it was removed.
+      guardrailValidator: () => ({ verdict: "ACCEPTED" }),
+    };
+    expect(deps.db).toBe(db);
   });
 
   it("5) a duplicate delivery of the same enqueued task is a no-op the second time (B1's own idempotency, reused)", async () => {

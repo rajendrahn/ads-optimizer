@@ -51,3 +51,17 @@ export {
   type GenerateAndCacheDecisionPacketResult,
   type MarkStalePacketsResult,
 } from "./decisionPacketStore.ts";
+
+// E2 — outcome evaluation (§21.1). See outcomeEvaluation.ts's own module comment for the
+// evidence-not-calendar trigger, the shrunk-baseline comparison, and the seasonal-confound flag.
+export {
+  computeRecommendationOutcome,
+  type RecommendationOutcomeComputationInput,
+  type RecommendationOutcomeComputationResult,
+  type SeasonalityContextForOutcome,
+} from "./outcomeEvaluation.ts";
+export {
+  evaluateRecommendationOutcomesHandler,
+  evaluateRecommendationOutcomesRegistration,
+  type EvaluateRecommendationOutcomesPayload,
+} from "./recommendationOutcomeTask.ts";

@@ -38,7 +38,7 @@ import type { TaskHandler } from "@services/ingest/sync/taskWrapper.ts";
 import type { TaskRegistration } from "@services/ingest/sync/registry.ts";
 import { buildDecisionPacket } from "./packetBuilder.ts";
 import { resolveScalingEvidence } from "./scalingEvidenceEngine.ts";
-import type { ScalableEntityRef } from "./types.ts";
+import type { ScalableEntityRef, ScalingEvidenceResult } from "./types.ts";
 
 /** The account's current monotonic `accountDataVersion` (§10.1) — the same
  * `accountFeatures/{accountId}` document `accountDataVersion.ts` (C2) already reads, here read
@@ -70,6 +70,19 @@ export interface GenerateAndCacheDecisionPacketResult {
    * `upsertWithVersionGuard`'s own out-of-order-write protection (§9.5), reused here so a slow
    * regeneration can never clobber a fresher one that finished first. */
   action: "written" | "rejected-kept-existing";
+  /** D1's own typed `resolveScalingEvidence` result — the SAME call whose output `buildDecisionPacket`
+   * below turned into `packet.evidence`'s untyped `Record<string, unknown>` (Firestore's own
+   * shape, JSON-round-tripped to drop `undefined`). Returned here too, still fully typed, so a
+   * caller that needs to re-validate against it (D4's job pipeline, feeding D5's
+   * `applyGuardrails`) does not have to reconstruct `ScalingEvidenceResult` from the packet's
+   * untyped blob via an unsafe cast, and does not have to re-resolve evidence a second time
+   * either — this IS the independently-computed-before-the-model-ran evidence D5's guardrail
+   * must validate against (see guardrailLog.ts's own `ApplyGuardrailsInput.evidenceResult` doc),
+   * never re-derived from anything the model said. On the `"rejected-kept-existing"` branch this
+   * is still THIS call's own fresh resolution (not the existing packet's, which may be older) —
+   * the more current of the two, and the correct one for a guardrail to judge against regardless
+   * of which packet ends up cached. */
+  evidenceResult: ScalingEvidenceResult;
 }
 
 /**
@@ -112,9 +125,9 @@ export async function generateAndCacheDecisionPacket(
       COLLECTIONS.decisionPackets,
       decisionPacketSchema,
     ).get(packet.packetId);
-    return { packet: existing ?? packet, action: "rejected-kept-existing" };
+    return { packet: existing ?? packet, action: "rejected-kept-existing", evidenceResult: result };
   }
-  return { packet: outcome.data, action: "written" };
+  return { packet: outcome.data, action: "written", evidenceResult: result };
 }
 
 export interface MarkStalePacketsResult {

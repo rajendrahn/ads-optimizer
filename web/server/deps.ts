@@ -16,9 +16,10 @@
 // Two reasoner modes, chosen by `ANTHROPIC_LIVE`:
 //   - unset (the default, and this step's own tests): a scripted fake Anthropic client
 //     (demoReasoner.ts) stands in for the model — no live API call — but the REAL D1/D2 evidence
-//     pipeline and the REAL D5 guardrail validator (`createGuardrailValidator`, imported read-only
-//     from services/reasoner/index.ts) still run, so a demo request can genuinely land on any of
-//     EVIDENCE / NOT_DELIVERING / NO_DECISION_UNIT / REJECTED / FAILED.
+//     pipeline and the REAL D5 guardrail application (`applyGuardrails`, called unconditionally
+//     inside `createGenerateRecommendationHandler` — there is no separate validator to inject any
+//     more, see generateRecommendationTask.ts's own corrective note) still run, so a demo request
+//     can genuinely land on any of EVIDENCE / NOT_DELIVERING / NO_DECISION_UNIT / REJECTED / FAILED.
 //   - "1": the real, unmodified production handler (`generateRecommendationHandler` from
 //     services/reasoner/job/generateRecommendationTask.ts) — a real Anthropic key resolved from
 //     Secret Manager, the real guardrail. For an operator who has real credentials and wants to
@@ -33,7 +34,6 @@ import {
 } from "@shared/firestore/index.ts";
 import { loadReportingCanon } from "@shared/canon/index.ts";
 import { decisionPacketSchema, type DecisionPacket } from "@shared/schema/index.ts";
-import { createGuardrailValidator } from "@services/reasoner/index.ts";
 import {
   createGenerateRecommendationHandler,
   generateRecommendationHandler,
@@ -111,11 +111,7 @@ function buildDemoRegistry(db: Firestore): TaskRegistry {
       const payload = ctx.payload as GenerateRecommendationPayload;
       currentNamedEntity = payload.namedEntity;
       try {
-        return await createGenerateRecommendationHandler({
-          db,
-          client,
-          guardrailValidator: createGuardrailValidator({ db }),
-        })(ctx);
+        return await createGenerateRecommendationHandler({ db, client })(ctx);
       } finally {
         currentNamedEntity = null;
       }

@@ -8,7 +8,7 @@
 // tests), so this is a structural cast of already-produced-by-us data, not a new external input
 // boundary needing its own zod re-validation.
 
-import { FieldPath, type Firestore } from "firebase-admin/firestore";
+import type { Firestore } from "firebase-admin/firestore";
 import { COLLECTIONS, createRepository } from "@shared/firestore/index.ts";
 import {
   decisionPacketSchema,
@@ -97,55 +97,37 @@ function projectGuardrailRejection(
 }
 
 /**
- * Looks up D5's `guardrailRejections/{id}` log for a REJECTED recommendation. **Not a plain
- * `.get(recommendationId)`** — the production guardrail wiring the coordinator confirmed
- * (`generateRecommendationHandler`'s `guardrailValidator: createGuardrailValidator()`, in
- * `services/reasoner/job/generateRecommendationTask.ts`, read but not modified here) goes through
- * `guardrailAdapter.ts`'s narrow seam, which — by that file's own module comment — does not have
- * the real `recommendationId` in scope and instead writes its log under a SYNTHESIZED id,
- * `adapter_{decisionUnit.type}_{decisionUnit.id}_{epochMillis}`. A direct keyed lookup by
- * `recommendationId` would therefore miss every real rejection today.
+ * Looks up D5's `guardrailRejections/{recommendationId}` log for a REJECTED recommendation — a
+ * plain keyed `.get`, nothing more, now that the production path
+ * (`generateRecommendationTask.ts`'s `applyGuardrails` call, called directly with the real
+ * `recommendationId` — see that file's own corrective note) writes the log under the real id.
  *
- * This tries the direct lookup first (the correct, forward-compatible path — `guardrailLog.ts`'s
- * own comment names `applyGuardrails` as the higher-fidelity integration a future change could
- * wire in, which WOULD key the log by the real id, and at that point this first branch alone
- * would already be all that is needed), then falls back to a prefix query over
- * `FieldPath.documentId()` for `adapter_{type}_{id}_` — a single-field, natively-indexed range
- * query, so it needs no new composite index — taking the most recent match. Both branches are a
- * best-effort join for display, not the guardrail's own decision — a miss here never blocks
- * rendering the REJECTED card, it only means the extra per-violation detail is unavailable (see
- * `projectGuardrailRejection`).
+ * **This used to need a fallback prefix-query.** Before that fix, production wired the guardrail
+ * through a narrower adapter (`guardrailAdapter.ts`, since deleted) that had no `recommendationId`
+ * in scope and synthesized one instead (`adapter_{type}_{id}_{epochMillis}`), so a plain keyed
+ * lookup missed every real rejection; this function used to try the direct lookup first, then fall
+ * back to a `FieldPath.documentId()` prefix-range scan for that synthesized shape. That fallback is
+ * removed here, not merely left dormant: this project has never been deployed (every phase's own
+ * "Status" notes confirm no cloud resource was ever created/modified), so there is no real
+ * production Firestore data written under the old synthesized-id scheme to stay compatible with —
+ * only test-emulator rows, which are wiped between runs. A future author who genuinely inherits a
+ * database with old `adapter_*`-keyed rows (e.g. this system having actually been deployed before
+ * this fix landed) would need to re-add a similar fallback, or a one-time migration, to backfill
+ * `recommendationId` onto them — but that is a real, currently-nonexistent scenario, not a
+ * hypothetical worth carrying speculative code for today. A miss here is a best-effort join for
+ * display, not the guardrail's own decision — it never blocks rendering the REJECTED card, it only
+ * means the extra per-violation detail is unavailable (see `projectGuardrailRejection`).
  */
 async function findGuardrailRejectionLog(
   db: Firestore,
   recommendationId: string,
-  claimedDecisionUnit: Recommendation["decisionUnit"],
 ): Promise<GuardrailRejectionLog | null> {
   const repo = createRepository<GuardrailRejectionLog>(
     db,
     COLLECTIONS.guardrailRejections,
     guardrailRejectionLogSchema,
   );
-  const direct = await repo.get(recommendationId);
-  if (direct) return direct;
-  if (!claimedDecisionUnit) return null;
-
-  // Firestore (both the emulator and the real service) rejects a descending orderBy on the
-  // document id ("does not support descending key scans") — order ascending instead and take the
-  // LAST match client-side. The id's own suffix is an epoch-millis decimal string, so ascending
-  // document-id order is also ascending chronological order for same-length suffixes (true for
-  // any two rejections within the same millisecond-precision era, which is all that matters here
-  // — picking the most recent of a handful of matches, not a durable sort guarantee for its own
-  // sake).
-  const prefix = `adapter_${claimedDecisionUnit.type}_${claimedDecisionUnit.id}_`;
-  const prefixUpperBound = prefix + String.fromCodePoint(0xf8ff);
-  const rows = await repo.query((ref) =>
-    ref
-      .where(FieldPath.documentId(), ">=", prefix)
-      .where(FieldPath.documentId(), "<", prefixUpperBound)
-      .orderBy(FieldPath.documentId(), "asc"),
-  );
-  return rows[rows.length - 1] ?? null;
+  return repo.get(recommendationId);
 }
 
 /**
@@ -172,12 +154,12 @@ export async function buildRecommendationView(
           decisionPacketSchema,
         ).get(rec.packetId)
       : Promise.resolve(null),
-    // §20.2: "every rejection logged" — D5's own durable log. Only meaningful to fetch on a
-    // REJECTED doc; see `findGuardrailRejectionLog`'s own comment for why this is not a plain
-    // keyed `.get(recommendationId)`. A lookup miss is harmless (rendered as no guardrail
+    // §20.2: "every rejection logged" — D5's own durable log, now keyed by the real
+    // `recommendationId` (see `findGuardrailRejectionLog`'s own comment for the history). Only
+    // meaningful to fetch on a REJECTED doc. A lookup miss is harmless (rendered as no guardrail
     // detail, never an error) so no extra branch is needed here.
     rec.status === "REJECTED"
-      ? findGuardrailRejectionLog(ctx.db, recommendationId, rec.decisionUnit)
+      ? findGuardrailRejectionLog(ctx.db, recommendationId)
       : Promise.resolve(null),
   ]);
 

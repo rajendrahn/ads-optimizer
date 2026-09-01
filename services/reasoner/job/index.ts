@@ -25,11 +25,6 @@ export {
 export { createReasonerWorkerRegistry } from "./workerRegistry.ts";
 export { handleReasonerTaskDispatch } from "./workerRuntime.ts";
 export {
-  passthroughGuardrailValidator,
-  type GuardrailValidator,
-  type GuardrailVerdict,
-} from "./guardrailSeam.ts";
-export {
   generateRecommendationPayloadSchema,
   recommendationRequestBodySchema,
   type GenerateRecommendationPayload,

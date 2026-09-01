@@ -5,7 +5,8 @@
 // framing, which applies equally here.
 
 import { z } from "zod";
-import { entityRef, firestoreTimestamp } from "./common.ts";
+import { entityRef, firestoreTimestamp, reportingDay } from "./common.ts";
+import { windowLabel } from "./features.ts";
 
 // ---------------------------------------------------------------------------------------
 // decisionPackets — §10.1, §14, §24 (D2)
@@ -162,8 +163,27 @@ export const recommendationSchema = z.object({
 export type Recommendation = z.infer<typeof recommendationSchema>;
 
 // ---------------------------------------------------------------------------------------
-// recommendationOutcomes/{recommendationId} — §21.1
+// recommendationOutcomes/{recommendationId} — §21.1 (E2)
 // ---------------------------------------------------------------------------------------
+
+// E2's own taxonomy — three states from A2's stub, plus one E2 adds. `SEASONALLY_CONFOUNDED` is
+// forced whenever the evaluation window and the baseline it is judged against sit in different
+// seasonal regimes (C5's own `spansSeasonalBoundary`) — the amended §21.1 requirement to "flag,
+// do not silently score" such an outcome. A plain SUCCESS/FAILURE here would credit or blame the
+// calendar rather than the decision; see services/evidence/outcomeEvaluation.ts's module comment
+// for exactly when this fires and how `rawClassification` below preserves what the plain
+// interval-vs-baseline comparison alone would have said.
+export const recommendationOutcomeClassificationSchema = z.enum([
+  "SUCCESS",
+  "NEUTRAL",
+  "FAILURE",
+  "SEASONALLY_CONFOUNDED",
+]);
+export type RecommendationOutcomeClassification = z.infer<
+  typeof recommendationOutcomeClassificationSchema
+>;
+
+const dayRangeSchema = z.object({ startDay: reportingDay, endDay: reportingDay });
 
 export const recommendationOutcomeSchema = z.object({
   recommendationId: z.string().min(1),
@@ -173,7 +193,72 @@ export const recommendationOutcomeSchema = z.object({
   additionalPurchases: z.number().int().nullable(),
   roasAfter: z.number().nullable(),
   baselineShrunk: z.number().nullable(), // §21.1/§15.3 — compared against the shrunk baseline, never raw
-  classification: z.enum(["SUCCESS", "NEUTRAL", "FAILURE"]).nullable(), // exact taxonomy is E2's call
+  classification: recommendationOutcomeClassificationSchema.nullable(),
   createdAt: firestoreTimestamp,
+
+  // ---- E2's own additive extension below — every field optional, so A2's own schema.test.ts
+  // fixture (none of these keys present) still parses unchanged. See
+  // services/evidence/outcomeEvaluation.ts for exactly how each one is computed. ----
+
+  /** The exact reporting-day range the recheck-conditions evaluation actually ran over — starts
+   * the day after `recommendations/{id}.acceptedAt`, ends the first day cumulative spend AND
+   * purchases both clear `recheckConditions`. Recorded so the classification is auditable after
+   * the fact, not just the number it produced. */
+  evaluationWindow: dayRangeSchema.nullable().optional(),
+  /** The decision unit's own primary window at the time the recommendation was GENERATED — the
+   * same days `baselineShrunk` was actually computed over. Reconstructed from the decision
+   * packet's own `createdAt`/`primaryWindow` (packets don't store an explicit day range) — see
+   * outcomeEvaluation.ts for the exact reconstruction and its documented approximation. */
+  baselineWindow: dayRangeSchema.nullable().optional(),
+  /** Which §4.2 window label `baselineShrunk` was read from
+   * (`decisionPacket.evidence.windows[primaryWindow].metaRoasShrunk` — D1's own `primaryWindow`,
+   * almost always `"28d"`). */
+  primaryWindow: windowLabel.nullable().optional(),
+  /** Denormalized off `recommendations/{id}.decisionUnit` — lets E3 query outcomes without a
+   * join back to the recommendation doc. */
+  decisionUnit: entityRef.nullable().optional(),
+  /** The Poisson-count interval (§15's own estimator, reused as-is — interval.ts) on `roasAfter`,
+   * built from `additionalPurchases`. `classification` is computed by running THIS interval
+   * through the SAME `computeVerdict` C3 uses for every other ROAS verdict in this system, with
+   * `baselineShrunk` standing in for the usual fixed target: ABOVE_TARGET / BELOW_TARGET /
+   * NOT_DISTINGUISHABLE map onto SUCCESS / FAILURE / NEUTRAL one-for-one. `null` when
+   * `additionalPurchases` is 0 — no honest ratio-based interval from zero events, matching
+   * interval.ts's own contract (this should not occur in practice, since a spend-only recheck
+   * condition with zero purchases has no honest ROAS either — see outcomeEvaluation.ts). */
+  roasAfterInterval: z
+    .object({ intervalLow: z.number().nullable(), intervalHigh: z.number().nullable() })
+    .nullable()
+    .optional(),
+  /** The z-score `roasAfterInterval` was built with, and whether it came from an operator's own
+   * `settings/{accountId}.statisticalThresholds` or this system's built-in default — reality #6,
+   * carried into the outcome record the same way `guardrailRejections.violations[].judgedAgainst`
+   * does (D5), so a later correction to the z-score changes FUTURE outcomes' interval width
+   * without rewriting what a past outcome's interval was actually judged with. */
+  intervalZScore: z.number().nullable().optional(),
+  intervalZScoreSource: z.enum(["settings", "default"]).nullable().optional(),
+  /** `classification` BEFORE any seasonal override — what the plain interval-vs-baseline
+   * comparison alone would have said. Equal to `classification` unless
+   * `seasonalContext.spansSeasonalBoundary` is true, in which case `classification` is forced to
+   * `SEASONALLY_CONFOUNDED` while this field preserves what would otherwise have been reported.
+   * This divergence between the two fields IS the "flag, don't silently score" requirement — both
+   * are always stored, never only the final answer. */
+  rawClassification: z.enum(["SUCCESS", "NEUTRAL", "FAILURE"]).nullable().optional(),
+  /** C5's own seasonal context (§21.1's amended requirement) for the evaluation window against
+   * its baseline — carried in full, never suppressed, mirroring C2/C3's own "carry the number,
+   * flag it, never suppress it" discipline. `spansSeasonalBoundary: true` is what forces
+   * `classification` to `SEASONALLY_CONFOUNDED` above; `demandIndex` is honestly `null` at this
+   * account's real history (C5's own n<2 policy) far more often than not — never treat a `null`
+   * here as "no seasonal effect". */
+  seasonalContext: z
+    .object({
+      evaluationWindowLabels: z.array(z.string()),
+      baselineWindowLabels: z.array(z.string()),
+      spansSeasonalBoundary: z.boolean(),
+      demandIndex: z.number().nullable(),
+      demandIndexSampleSize: z.number().int().nonnegative(),
+      summaryText: z.string(),
+    })
+    .nullable()
+    .optional(),
 });
 export type RecommendationOutcome = z.infer<typeof recommendationOutcomeSchema>;
