@@ -1,0 +1,20 @@
+# Build config for the reasoner worker Cloud Run image.
+#
+# Why this file exists rather than `gcloud run deploy --source .`:
+# services/reasoner/job/Dockerfile COPYs package.json, shared/, services/ and scripts/, so the
+# build CONTEXT must be the repo root — but `--source .` looks for a Dockerfile AT the root,
+# which does not exist (and putting one there purely to satisfy that would misrepresent the
+# repo's layout). An explicit `-f <path> .` gives the right Dockerfile and the right context.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - services/reasoner/job/Dockerfile
+      - -t
+      - ${_IMAGE}
+      - .
+images:
+  - ${_IMAGE}
+options:
+  logging: CLOUD_LOGGING_ONLY

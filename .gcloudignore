@@ -1,0 +1,33 @@
+# What NOT to upload as Cloud Build context.
+#
+# Without this, `gcloud builds submit` uploads the entire working tree — including node_modules
+# (hundreds of MB, and reinstalled inside the image by `npm ci` anyway) and, more importantly,
+# any local data export sitting in the repo root. Two such files have already appeared during
+# this project (a Matrixify .xlsx and _tmp_* files holding live Shopify query output), so the
+# data patterns below are deliberate, not boilerplate.
+.git/
+.gitignore
+node_modules/
+functions/node_modules/
+web/node_modules/
+functions/lib/
+dist/
+web/dist/
+coverage/
+
+# Local data exports — never ship customer data into a build context.
+*.csv
+*.xlsx
+*.xls
+Export_*
+_tmp_*
+*.scratch.*
+
+# Emulator / tooling state
+.firebase/
+*-debug.log
+
+# Not needed by the reasoner image (its Dockerfile copies only shared/, services/, scripts/)
+web/
+functions/
+test/

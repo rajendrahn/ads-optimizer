@@ -7,7 +7,8 @@
     {
       "source": "functions",
       "codebase": "default",
-      "ignore": ["node_modules", ".git", "lib", "*.log"],
+      "_comment_ignore": "DO NOT add 'lib' here. functions/lib/ holds the esbuild artifact that functions/scripts/bundle.mjs produces from the ROOT project (services/, shared/) during predeploy. Those sources live OUTSIDE functions/, so they are never uploaded and Google's own build cannot recreate lib/ in the cloud. Ignoring lib/ therefore uploads a package whose main (lib/index.js) does not exist, and the deploy fails with exactly that message. lib/ stays gitignored (build output) but MUST be uploaded.",
+      "ignore": ["node_modules", ".git", "*.log"],
       "predeploy": ["npm --prefix \"$RESOURCE_DIR\" run build"]
     }
   ],
