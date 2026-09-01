@@ -191,7 +191,17 @@ if (Should-Run "functions") {
 # ---------------------------------------------------------------------------------------
 if (Should-Run "run") {
   Write-Step "4. Cloud Run reasoner worker"
-  $image = "gcr.io/$Project/$ServiceName"
+  # Artifact Registry, not gcr.io: Container Registry is deprecated, and `gcloud run deploy
+  # --source` already created this regional repo on the first (buildpacks) attempt. Regional
+  # also means the image sits next to the service rather than in a US multi-region bucket.
+  $repo = "cloud-run-source-deploy"
+  $image = "$Region-docker.pkg.dev/$Project/$repo/$ServiceName"
+
+  if (-not (Test-NativeSucceeds { gcloud artifacts repositories describe $repo --location=$Region --project=$Project })) {
+    Invoke-Step "creating Artifact Registry repo $repo" {
+      gcloud artifacts repositories create $repo --repository-format=docker --location=$Region --project=$Project
+    }
+  }
 
   Invoke-Step "building image ($image) via Cloud Build" {
     gcloud builds submit --project=$Project --config=scripts/cloudbuild.reasoner.yaml --substitutions="_IMAGE=$image" .
