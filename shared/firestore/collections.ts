@@ -84,6 +84,14 @@ export const COLLECTIONS = {
   // services/reasoner/knowledge.ts for why this exists and how it's kept out of the live
   // recommendation path). Keyed by its own `version` string — use directly, no helper needed.
   adOptimizationKnowledge: "adOptimizationKnowledge",
+
+  // D5's own — the durable, structured guardrail-rejection log (§20.2's own "that log is itself
+  // a calibration signal [for E3]"); not one of §8's named collections. See
+  // shared/schema/guardrails.ts's module comment for why this is separate from
+  // `recommendations/{id}.guardrailRejection`. Keyed by `recommendationId` — use directly, no
+  // helper needed (one rejection event per recommendation attempt, since D4 mints a fresh
+  // `recommendationId` per attempt).
+  guardrailRejections: "guardrailRejections",
 } as const;
 
 export type CollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

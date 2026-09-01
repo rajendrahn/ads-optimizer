@@ -4500,7 +4500,18 @@ return 400, and there is no assistant prefill.
 
 ### D4 — Recommendation job pipeline
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+784/784 unit tests, up from D3's 752 — this step's own 12 new: 5 in
+`services/reasoner/job/generateRecommendationTask.emulator.test.ts` (see below), 4 in
+`apiHandler.test.ts`, 2 in `guardrailSeam.test.ts`, plus the existing `schema.test.ts` continuing
+to pass unchanged against the additively-extended `recommendationSchema`). `npm run
+test:integration` passes 282/282 against a real Firestore emulator (273 pre-D4 + this step's 5
+new emulator tests; the remaining +4 came from D5 landing concurrently — a `guardrailRejections`
+collection and its own rules test — not this step's own count). No production Firestore was
+touched (emulator only); no cloud resource was created/modified/deployed; no live Anthropic call
+was made anywhere in this step (every test uses a scripted fake Anthropic client — the pipeline
+is what this step tests, not the model, per its own "prefer a faked reasoner" instruction); no
+npm dependency was added.
 **Depends on:** D3
 **Design refs:** §16.1
 
@@ -4523,11 +4534,233 @@ recommendation; a worker failure leaves a legible error state rather than a stuc
 seconds and a Fable 5 turn can exceed that. Do not route the model call through a Hosting rewrite — if you
 add streaming later, SSE goes direct from Cloud Run.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/reasoner/job/{types,guardrailSeam,request,apiHandler,
+  generateRecommendationTask,workerRegistry,workerRuntime,apiRuntime,server,index}.ts`, plus
+  `generateRecommendationTask.emulator.test.ts` (the "Done when" proof, against a real
+  emulator), `apiHandler.test.ts` and `guardrailSeam.test.ts` (pure, no Firestore). A
+  `Dockerfile` sits alongside them for the Cloud Run image (see "provisioning" below) —
+  nothing in this step builds, runs, or pushes it. Two schema changes: `shared/schema/
+  decisions.ts` gained `recommendationProvenanceSchema` and a `provenance` field on
+  `recommendationSchema` (nullable/defaulted — A2's own `schema.test.ts` fixture, with no
+  `provenance` key, still parses unchanged); `services/ingest/sync/taskTypes.ts` gained the
+  `GENERATE_RECOMMENDATION` constant (the string itself was already in §10.2's own list, added
+  by B1 — this is just the exported handle, mirroring `SYNC_NOOP`'s own convention).
+  **`services/ingest/sync/registry.ts` was deliberately NOT touched** — see the architecture
+  note below for why.
+
+- **The job lifecycle, and every state the document can be in — D6 subscribes to this, so
+  spelled out precisely.** `recommendationStatusSchema` (already built by A2, unused until this
+  step) is `PENDING | GENERATING | COMPLETE | FAILED | REJECTED`. The real sequence, one
+  Firestore write per transition, each individually observable via `onSnapshot`:
+  1. `requestRecommendation` (request.ts) writes the doc **PENDING** with every
+     recommendation-shaped field `null`, `requestedBy`/`requestedQuestion` set from the caller,
+     then enqueues `GENERATE_RECOMMENDATION` using the **same id as the Cloud Tasks task
+     id/`runSyncTask` idempotency key** — returns immediately (proven: this write + the enqueue
+     call are the entire critical path, no model call anywhere on it).
+  2. The worker task handler (`generateRecommendationTask.ts`) transitions the doc to
+     **GENERATING** before calling D2's packet builder or D3's reasoner — proven not just
+     reachable but genuinely observed mid-flight (test 2: the scripted fake Anthropic client
+     reads the doc back from Firestore the instant it's invoked and asserts `status ===
+     "GENERATING"`).
+  3. On success: **COMPLETE**, with D3's `RecommendationOutput` fields assigned directly onto
+     the document (no remapping — see D3's own note, confirmed field-for-field here),
+     `packetId`, `accountDataVersionAtGeneration`, and the new `provenance` object all stamped,
+     `guardrailRejection: null`.
+  4. On a D5 guardrail REJECTED verdict: **REJECTED** — `recommendation` forced to
+     `INSUFFICIENT_DATA` (§20.2's own "downgraded... rather than surfaced as-is", which the
+     schema's own status-enum comment already said), every budget field (`current/
+     recommendedBudgetMinorUnits`, `changePercent`, `recheckConditions`) cleared to `null` so a
+     rejected proposal can never be read as an actionable number, `guardrailRejection: {reason,
+     rejectedAt}` stamped. The underlying Cloud Tasks task itself still reports `SUCCEEDED` — a
+     guardrail rejection is a correct outcome, not a task failure.
+  5. On any thrown error (from packet generation OR the reasoner call — both are inside the
+     same `try`): **FAILED**, `errorMessage` set to the real thrown message, `recommendation`
+     and `provenance` left `null` (no fabricated partial recommendation). The same error is
+     then rethrown so `syncRuns` (B1's own independent bookkeeping) records the failure too, and
+     Cloud Tasks' own retry policy still applies — this step deliberately does not override
+     retry classification (see "Ambiguities resolved" below).
+  6. Duplicate delivery of the same enqueued task (Cloud Tasks' at-least-once contract) is a
+     no-op after the first `SUCCEEDED`/terminal run — B1's own `runSyncTask` idempotency,
+     reused unmodified (proven in test 5: the model is called exactly once across two
+     dispatches of the same task).
+  A client watching `recommendations/{id}` therefore only ever sees one of: `PENDING` →
+  `GENERATING` → (`COMPLETE` | `REJECTED` | `FAILED`) — never a silent jump, never a doc stuck
+  on `PENDING`/`GENERATING` after the worker has actually run.
+
+- **How a genuine worker failure was proven, not simulated as a status flag.**
+  `generateRecommendationTask.emulator.test.ts`'s test 3 makes the SCRIPTED fake Anthropic
+  client's `create` call **reject with a real thrown `Error`** ("ECONNRESET: connection reset
+  by peer") — i.e. it exercises the actual uncaught-exception path a real Anthropic-side
+  network failure would take through `generateRecommendation` (D3) and up through this step's
+  own `try/catch`, not a mocked "return an error-shaped success". Asserted afterward: the
+  `syncRuns` result is `FAILED` with the real message; the `recommendations/{id}` doc is
+  `FAILED` (explicitly asserted `!== "PENDING"` and `!== "GENERATING"`) with `errorMessage`
+  matching the real thrown text; `recommendation`/`provenance` stayed `null` rather than a
+  fabricated partial result. This is the step's own "Done when" bar, and the instruction to
+  "test a genuine failure path, not only the happy one" — done via a real thrown exception, not
+  a fake status field.
+
+- **Where D5's validator plugs in, and how the knowledge document stays out of reach.**
+  `services/reasoner/job/guardrailSeam.ts` defines `GuardrailValidator = (recommendation:
+  RecommendationOutput) => GuardrailVerdict | Promise<GuardrailVerdict>` — the signature takes
+  **only** D3's own structured model output, nothing else. `createGenerateRecommendationHandler`
+  (generateRecommendationTask.ts) accepts a `guardrailValidator` option (default:
+  `passthroughGuardrailValidator`, which always accepts — there is no real guardrail logic in
+  this step, by design) and calls it with exactly `reasonerResult.recommendation` — the
+  `DecisionPacket`, the `AdOptimizationKnowledge` document, and the `ReasonerProvenance` are all
+  in scope at that call site but **none of them are passed in**. This isn't a convention D5
+  has to remember to respect — the function signature makes it structurally unreachable, the
+  same guarantee D3.1's own live injection test relied on ("a knowledge entry cannot change
+  which code path validates the output, because the validator has no reference to the
+  knowledge document at all" — D3's own notes). Proven here too: test 4 wires in a stand-in
+  validator (`rejectOverLimitChanges`, a synthetic §20.2-shaped 20%-max-change check) that
+  rejects a 250%-change proposal and confirms the downgrade to `INSUFFICIENT_DATA` — this
+  validator is written exactly to the real `GuardrailValidator` type, so D5's actual
+  implementation is a drop-in replacement at the `createGenerateRecommendationHandler()` call
+  site in `generateRecommendationTask.ts` (currently defaulted to `passthroughGuardrailValidator`
+  in the production `generateRecommendationRegistration`/`generateRecommendationHandler`
+  exports) — no other file in this step's pipeline needs to change.
+
+- **Architecture ambiguity resolved: `GENERATE_RECOMMENDATION` is deliberately NOT registered
+  into `services/ingest/sync/registry.ts`'s `createDefaultRegistry()`.** That registry backs
+  the `functions/` Cloud Functions Gen2 sync-dispatch target (§0.2: "Cloud Functions 2nd gen
+  for scheduled sync"). §16.1's entire reasoning is that the reasoner must run on Cloud Run,
+  never through a path that shares the Hosting-rewrite/Cloud-Functions 60-second-class ceiling
+  a Fable 5 turn can exceed — registering this task type into the SAME registry `functions/`
+  dispatches through would silently reopen exactly that ceiling for anyone who enqueued it via
+  the Cloud Functions target instead of the Cloud Run one. Instead, `services/reasoner/job/
+  workerRegistry.ts`'s `createReasonerWorkerRegistry()` is a second, narrower default registry
+  — built with B1's own unmodified `createTaskRegistry()`, carrying only
+  `generateRecommendationRegistration` — and `workerRuntime.ts`'s `handleReasonerTaskDispatch`
+  wires it to B1's own unmodified `handleTaskRequest`, mirroring `services/ingest/sync/
+  runtime.ts`'s exact split (real Firestore, real registry, real archiver) for a SEPARATE Cloud
+  Run deploy target. Consequence: `registry.ts`/`registry.test.ts` needed no changes at all —
+  flagging this explicitly since the orchestrator brief called out both files as a likely
+  shared touchpoint with the concurrent D5 agent, and it turned out not to be one.
+
+- **The "API" half, and its deliberately narrow scope.** `request.ts`'s `requestRecommendation`
+  is the actual "write PENDING + enqueue" logic (framework-agnostic — a plain async function).
+  `apiHandler.ts`'s `handleRecommendationRequest` is a thin, HTTP-shaped wrapper around it
+  (mirrors `services/ingest/sync/httpHandler.ts`'s own "plain request-in/response-out, no
+  framework dependency" pattern exactly), returning `202 Accepted` with the new id, or `400`
+  with a validation error. **Deliberately unauthenticated** — §17.1 ("Firestore rules deny all
+  client reads/writes; data is served through the API") and Firebase Auth are D6's own
+  deliverables ("Firebase Auth; all data served through the API"), not this step's. `apiHandler.
+  ts`'s own module comment says so explicitly: D6 must wrap this (or the `/recommendations`
+  route in `server.ts`) with real auth/session verification before it is reachable by an end
+  user. This step only proves the request-shaping and job-enqueuing logic works — not that it
+  is safe to expose publicly as-is.
+
+- **The Cloud Run entrypoint.** `server.ts` is the one file that touches Node's `http` module —
+  everything it calls (`handleReasonerTaskDispatch` for `POST /tasks/dispatch`,
+  `handleRecommendationRequest` for `POST /recommendations`) is framework-agnostic and already
+  covered by this step's own tests. Both routes are served from one process/one Cloud Run
+  service here (§17.1's own "a few lines, not a design problem" reasoning applied to
+  deployment topology too) — an operator can split the API and the worker onto separately-scaled
+  Cloud Run services later with no change to either handler, since neither assumes it shares a
+  process with the other. Deploy-time facts (queue name/location, the worker's own task URL,
+  the invoking service account) are read from environment variables in `apiRuntime.ts`
+  (`RECOMMENDATION_QUEUE_LOCATION`, `RECOMMENDATION_QUEUE_NAME`, `REASONER_WORKER_TASK_URL`,
+  `REASONER_WORKER_INVOKER_SERVICE_ACCOUNT`) rather than hardcoded in `scripts/config.ts` —
+  same precedent B1's own `taskQueue.ts` already set ("these are deploy-time facts this module
+  has no way to know on its own... not called anywhere in this step's own tests").
+
+- **Ambiguities resolved:**
+  1. **Whether `GENERATE_RECOMMENDATION` belongs in the shared `createDefaultRegistry()` or a
+     dedicated registry.** Resolved: dedicated (`createReasonerWorkerRegistry()`) — see the
+     architecture note above; the shared registry backs the Cloud Functions sync target, which
+     §16.1 is explicit the reasoner must never run through.
+  2. **Whether a thrown reasoner error should be reclassified retryable/non-retryable at the
+     job-pipeline layer.** Resolved: no special-casing — the original error (`ReasonerRefusalError`
+     or a plain `Error` from D3) is rethrown as-is and falls through to `taskWrapper.ts`'s own
+     existing default classification (retryable unless it's an `ApiError` that says otherwise),
+     exactly like every other task type in this codebase. Inventing a different rule here (e.g.
+     "a refusal is always terminal") would be a judgment call D3 itself didn't make when it chose
+     to throw a plain `Error`/`ReasonerRefusalError` rather than an `ApiError` with a `retryable`
+     flag — not this step's call to make unilaterally. An operator who wants
+     `GENERATE_RECOMMENDATION` retried fewer times than a sync task can configure that at the
+     Cloud Tasks queue level (max attempts / backoff), which is exactly the kind of deploy-time
+     decision B1's own queue-config precedent already leaves to the operator.
+  3. **Whether `generateAndCacheDecisionPacket` should be called at request time (in
+     `requestRecommendation`) or worker time (in the task handler).** Resolved: worker time —
+     `requestRecommendation`'s only job is to return immediately with an id (§16.1's whole
+     point), and while packet generation makes no live API call, it does do real Firestore
+     reads/writes D1 already treats as "on-demand" work, not something that belongs on the
+     synchronous request path when it can just as well happen inside the already-async job.
+  4. **On a REJECTED verdict, whether to clear the model's own `summary`/`primaryReasons`/
+     `risks`/`doNotDo`/`confidence` fields along with the budget fields.** Resolved: keep them —
+     only the fields that read as an actionable budget change (`current/
+     recommendedBudgetMinorUnits`, `changePercent`, `recheckConditions`) are cleared to `null`;
+     the model's own reasoning stays visible on a REJECTED doc since §20.2 frames the guardrail
+     log itself as a calibration signal (E3), and D6/an operator reviewing a rejected
+     recommendation benefits from seeing WHY the model proposed what it did, not just that it
+     was rejected.
+
+- **What real cloud provisioning/deploy is still needed before this runs for real** (none of it
+  was done here — see this step's safety constraints; extends B1's own provisioning list rather
+  than duplicating it):
+  1. **A second Cloud Tasks queue**, separate from B1's `sync-tasks` (a Fable 5 turn's own retry/
+     backoff profile is different from a sync task's — an operator will want to tune max
+     attempts/backoff independently, per "Ambiguities resolved" #2 above):
+     `gcloud tasks queues create recommendation-tasks --location=asia-south1 --project=sng-meta-ads-optimizer`
+  2. **Build and deploy the reasoner worker/API as a Cloud Run service**, using this step's own
+     `services/reasoner/job/Dockerfile`:
+     ```
+     gcloud run deploy reasoner-worker \
+       --source services/reasoner/job \
+       --region asia-south1 \
+       --project sng-meta-ads-optimizer \
+       --no-allow-unauthenticated \
+       --set-env-vars RECOMMENDATION_QUEUE_LOCATION=asia-south1,RECOMMENDATION_QUEUE_NAME=recommendation-tasks
+     ```
+     (`--source services/reasoner/job` only works once the Dockerfile's `COPY` paths are run
+     from the repo root as the build context — in practice `gcloud run deploy --source .
+     --dockerfile services/reasoner/job/Dockerfile` from the repo root, since the image needs
+     `shared/`/`scripts/` alongside `services/`, all outside the `job/` directory itself.) The
+     deployed service URL becomes `REASONER_WORKER_TASK_URL` (with `/tasks/dispatch` appended)
+     for step 4 below, and `apiRuntime.ts`'s own env var of the same purpose once the API and
+     worker are the same deployment (or a second URL if later split per this step's own
+     "operator can split them" note).
+  3. **Grant Secret Manager access** for the Anthropic API key to whichever service account the
+     Cloud Run service runs as — mirrors A0/A4's existing `sync-functions` grant pattern:
+     `gcloud secrets add-iam-policy-binding anthropic-api-key --member="serviceAccount:<reasoner-worker-sa>@sng-meta-ads-optimizer.iam.gserviceaccount.com" --role="roles/secretmanager.secretAccessor"`
+  4. **Grant Cloud Tasks enqueue + Cloud Run invoke permissions**, same shape as B1's own step
+     3: `roles/cloudtasks.enqueuer` on the queue for whatever calls `requestRecommendation`, and
+     `roles/run.invoker` scoped to the reasoner worker service for the queue's own OIDC service
+     account (`REASONER_WORKER_INVOKER_SERVICE_ACCOUNT`) so Cloud Tasks can actually call
+     `POST /tasks/dispatch`.
+  5. **Only then** does `createDefaultTaskQueueClient({location, queue: "recommendation-tasks",
+     targetUrl: "<deployed reasoner worker URL>/tasks/dispatch", serviceAccountEmail:
+     "<invoker-sa>@..."})` (already built, in `services/ingest/sync/taskQueue.ts`, reused
+     unmodified by `apiRuntime.ts`) have anything real to point at — set via the env vars in
+     step 2's deploy command. Not needed for anything in this step's own tests, exactly like B1's
+     own `CloudTasksQueueClient` — `requestRecommendation`/the worker task handler are fully
+     exercisable, as this step's own emulator tests do, using `createInMemoryTaskQueueClient()`
+     and a direct `runSyncTask` call, with no queue at all.
+  6. **D6's own work, once this lands**: wrap `POST /recommendations` (or a route calling
+     `requestRecommendation` directly) with real Firebase Auth verification before exposing it —
+     see "The API half" note above.
+
 ---
 
 ### D5 — Guardrail validator
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across both projects, lint, format,
+784/784 unit tests — this step's own 26 new tests in `services/reasoner/guardrails.test.ts`,
+pure, no Firestore/no live call). `npm run test:integration` passes 285/285 against a real
+Firestore emulator (282 pre-D5-in-this-count/273 pre-D4 + D4's own 5 + this step's own 3 new
+emulator tests in `services/reasoner/guardrailLog.emulator.test.ts`, plus a `guardrailRejections`
+collection-count bump in `shared/firestore/collections.test.ts`/`test/firestore.rules.emulator.
+test.ts`, `33 -> 34`). No production Firestore was touched (emulator only); no live Anthropic/
+Meta/Shopify call was made anywhere in this step (guardrails validate already-structured output —
+fixtures are the correct input, never a live model call); no cloud resource was created/modified/
+deployed; no npm dependency was added; `services/ingest/sync/registry.ts` was NOT touched (this
+step registers no Cloud Tasks task type — see below for why). See Notes below for every guardrail
+enforced and its limit's source, the structural guarantee against the knowledge document, the
+rejection log's exact shape, and how this step integrates with D4 (built concurrently, landed
+first, and left a narrower seam than originally assumed — read this before wiring production).
 **Depends on:** D3
 **Design refs:** §20.2
 
@@ -4551,11 +4784,256 @@ add streaming later, SSE goes direct from Cloud Run.
 **Done when.** A synthetic over-limit recommendation is rejected and logged; a recommendation naming a
 non-budget-owner is rejected.
 
+**Notes from implementation:**
+
+- **Layout as built.** `services/reasoner/{guardrails,guardrailLog,guardrailAdapter}.ts`, each
+  with a co-located test — `guardrails.test.ts` (pure, 26 tests, no Firestore, no live call) and
+  `guardrailLog.emulator.test.ts` (3 tests, real Firestore emulator; `guardrailAdapter.ts` is
+  exercised indirectly through both, since it's a thin composition of the other two). Also
+  touched: `shared/canon/{guardrailThresholds.ts (new), settings.ts, index.ts}`,
+  `shared/schema/{guardrails.ts (new), index.ts}`, `shared/firestore/{collections.ts,
+  collections.test.ts}`, `test/firestore.rules.emulator.test.ts` (count bump only). **Nothing in
+  `services/ingest/sync/{taskTypes,registry}.ts` was touched** — this step registers no Cloud
+  Tasks task type, following D1/D2's own precedent exactly: `validateGuardrails` is a
+  synchronous, in-memory function over already-computed inputs (no live call, no write of its
+  own), and even the Firestore-backed pieces (`logGuardrailRejection`, the evidence re-fetch
+  inside `guardrailAdapter.ts`) are on-demand, per-request work triggered by whoever generated a
+  recommendation — not a scheduled/queued sync unit. Flagged explicitly per §0.2's own
+  instruction to raise rather than silently diverge, though in this case there turned out to be
+  nothing to diverge on: `registry.ts`/`IMPLEMENTATION_PLAN.md` were re-read immediately before
+  every edit as instructed, and D4 (which finished first) independently confirmed the same
+  conclusion from its own side ("`registry.ts`/`registry.test.ts` needed no changes at all... it
+  turned out not to be [a shared touchpoint]" — D4's own notes above).
+
+- **Every guardrail enforced, and the source of its limit — all in `validateGuardrails`
+  (guardrails.ts), all read through `resolveGuardrailThresholds`/`resolveStatisticalThresholds`
+  (shared/canon), never inlined.**
+  1. **Max change percent** (`checkMaxChangePercent`) — `|recommendation.changePercent| >
+     guardrailThresholds.maxChangePercent` → `MAX_CHANGE_PERCENT_EXCEEDED`. Checked unconditionally
+     whenever the model supplied a non-null `changePercent`, regardless of what `recommendation`
+     type it attached the number to — the number itself carries the risk (a Meta learning-phase
+     reset), not the label. Default **20** (`DEFAULT_MAX_CHANGE_PERCENT`,
+     `shared/canon/guardrailThresholds.ts`) — pinned to the SAME value as C4's own
+     `MATERIAL_BUDGET_CHANGE_THRESHOLD_PERCENT`, the actual mechanism this guardrail protects
+     against, and coherent with D1's own `[5,15]%` candidate safe range (`SAFE_RANGE_UPPER_PERCENT
+     = 20 - 5 = 15`) — a suggestion at the very top of D1's proposed range still cannot itself trip
+     this guardrail. `shared/` cannot literally import C4's constant (`shared/` never imports from
+     `services/` anywhere in this codebase — confirmed by grep before writing this), so the two are
+     independent numbers by construction; kept in sync by
+     `guardrails.test.ts`'s own "stays pinned to C4's own material-budget-change threshold" test,
+     which asserts direct equality and fails loudly if the two are ever edited independently. This
+     is D5's own answer to the "coherent with that reasoning, not an unrelated number" instruction.
+  2. **Minimum purchases** (`checkEvidenceSufficiency`) — the primary window's actual
+     `metaRoas.purchases` (read from D1's independently-computed evidence, never the model's own
+     numbers) `< statisticalThresholds.minPurchaseFloors[primaryWindow]` →
+     `MIN_PURCHASES_NOT_MET`. Deliberately reuses C3's own purchase floor rather than inventing a
+     second "minimum purchases" concept — the same number that already forces a
+     `NOT_DISTINGUISHABLE` verdict is the number a confident recommendation is independently
+     re-checked against.
+  3. **Minimum spend** (`checkEvidenceSufficiency`) — the primary window's actual
+     `spendMinorUnits < guardrailThresholds.minSpendMinorUnits[primaryWindow]` →
+     `MIN_SPEND_NOT_MET`. A genuinely new settings field (§20.2 asks for spend AND purchases
+     independently — an entity can clear a purchase floor on very little spend if its average
+     order value happens to be high). Default per window = `minPurchaseFloors[window] ×
+     176,163` (₹1,761.63 in paise) — this account's own REAL measured 7-day account-level Meta
+     CPA (C2/C3's live reconciliation), deliberately NOT the ₹1,500 placeholder
+     `targetCpaMinorUnits` — i.e. "would clearing this window's purchase floor, at this account's
+     own real cost-per-purchase, plausibly require this much spend." 28d: ₹52,848.90. Grounded in
+     a real number, not tuned to manufacture a pass/fail rate, matching this codebase's own
+     `statisticalThresholds` precedent.
+  4. **Decision unit is the actual budget owner** (`checkDecisionUnit`) — compares
+     `recommendation.decisionUnit` (the model's claim) against D1's own independently-resolved
+     `evidenceResult`'s decision unit — `resolveScalingEvidence` was called BEFORE the model ever
+     ran, from this account's real Meta budget-ownership configuration, never from anything the
+     model or the knowledge document said. A mismatch → `DECISION_UNIT_NOT_BUDGET_OWNER`; the
+     model naming a decision unit when evidence found none at all → `NO_DECISION_UNIT`. An honest
+     `decisionUnit: null` claim (e.g. `INSUFFICIENT_DATA`) needs no check and always passes.
+  5. **Evidence-outcome guardrails, folded into the same check** (`checkEvidenceSufficiency`) —
+     D1's own `NOT_DELIVERING` (real decision unit, zero spend/impressions) and `NO_DECISION_UNIT`
+     (no budget owner at all) outcomes: any non-`INSUFFICIENT_DATA` recommendation against either
+     is rejected (`NOT_DELIVERING` / `NO_DECISION_UNIT` codes) — there is no primary window with
+     real evidence to judge spend/purchases against in either case, so this is checked first and
+     short-circuits the numeric checks for that outcome.
+  Every independently-true violation is reported at once (`violations: GuardrailViolation[]`),
+  never just the first — matches D1's own `IneligibleReasons[]` convention. All five checks and
+  their interactions are covered by 26 unit tests in `guardrails.test.ts`, including one that
+  triggers all four numeric/structural violation codes simultaneously on one recommendation.
+
+- **The structural guarantee against the knowledge document — enforced by TypeScript, not a
+  comment.** `validateGuardrails(input: GuardrailInput)` — `GuardrailInput` is exactly
+  `{recommendation: RecommendationOutput, evidenceResult: ScalingEvidenceResult, canon:
+  CanonSettings}`. There is no `knowledge`, `provenance`, or free-text parameter anywhere in this
+  function's type signature — `guardrails.ts`'s own module header states this in the same terms
+  D3.1's live injection test proved it ("the validator has no reference to the knowledge document
+  at all"), and instructs a future author never to add one, redirecting any audit need for the
+  knowledge version to the rejection LOG instead (downstream of the decision, never an input to
+  it). This is tested twice: (1) a genuine TypeScript compile error — `guardrails.test.ts`'s own
+  "no path for the knowledge document" test assigns an object literal with an extra `knowledge`
+  field to a `GuardrailInput`-typed variable, which fails `npm run typecheck` without a
+  `@ts-expect-error` suppressing it (removing that comment and re-running `npm run typecheck`
+  reproduces `TS2353: Object literal may only specify known properties`); (2) the actual
+  injection-resistance property — two recommendations differing only in a value standing in for
+  "which knowledge version (if any) produced this," fed through `validateGuardrails`, reject
+  identically, because there is no parameter through which that value could have been threaded
+  differently in the first place. A third test reproduces D3.1's own live poison payload verbatim
+  (`changePercent: 250`, the exact number the injected knowledge entry demanded) and confirms it
+  is rejected on the number alone.
+
+- **The rejection log — shape and a real example (E3's calibration signal).**
+  `guardrailRejections/{recommendationId}` (`shared/schema/guardrails.ts`'s
+  `guardrailRejectionLogSchema`, one document per recommendation attempt, never overwritten in
+  place across retries since each attempt gets a fresh `recommendationId`):
+  ```json
+  {
+    "recommendationId": "rec_over_limit_test",
+    "namedEntity": { "type": "ADSET", "id": "as_17" },
+    "decisionUnitClaimedByModel": { "type": "ADSET", "id": "as_17" },
+    "decisionUnitResolved": { "type": "ADSET", "id": "as_17" },
+    "recommendationType": "INCREASE_BUDGET",
+    "changePercent": 40,
+    "violations": [
+      {
+        "code": "MAX_CHANGE_PERCENT_EXCEEDED",
+        "message": "Recommended change of 40% exceeds the configured maximum of 20% (guardrailThresholds.maxChangePercent, source: default).",
+        "judgedAgainst": { "field": "guardrailThresholds.maxChangePercent", "limit": 20, "source": "default", "actual": 40 }
+      }
+    ],
+    "reason": "Recommended change of 40% exceeds the configured maximum of 20% (guardrailThresholds.maxChangePercent, source: default).",
+    "accountDataVersion": 42,
+    "adOptimizationKnowledgeVersion": "v1",
+    "rejectedAt": "2026-08-30T12:00:00.000Z"
+  }
+  ```
+  (Real, from `guardrailLog.emulator.test.ts`'s own "rejects and durably logs a synthetic
+  over-limit recommendation" test, read back from a real Firestore emulator round-trip — not a
+  hand-typed illustration.) `violations` carries every independently-true reason, each with its
+  own `judgedAgainst.{field,limit,source,actual}` — this is what makes a later threshold
+  correction change FUTURE outcomes without rewriting what THIS rejection says it was judged
+  against at the time (proven in `guardrails.test.ts`'s "reads the limit from settings" test: the
+  same recommendation is APPROVED under a lenient setting and REJECTED under a strict one, and the
+  strict rejection's `judgedAgainst.limit`/`.source` reflect exactly the setting active at that
+  call). `adOptimizationKnowledgeVersion` is recorded on the log ONLY — stamped after the decision
+  is already final, by the caller (`applyGuardrails`'s own parameter), never read by
+  `validateGuardrails` itself; `null` is an honest "not supplied", never a silent omission (proven
+  by the non-budget-owner test in the same file, which passes `null` explicitly). E3 can query
+  this collection directly (by `code`, by `judgedAgainst.source`, by `recommendationType`, over
+  time) without touching `recommendations/{id}` at all — the design's own §29 criterion 12 ("the
+  rate of guardrail rejections trending toward zero") is a query over this collection's own
+  `rejectedAt`/`violations[].code`.
+
+- **Confidence reduction — independent of rejection, and independent of what the model itself
+  reported** (`computeAdjustedConfidence`, only reached once a recommendation clears every
+  rejection check). Two multiplicative penalties, applied to D1's own already-computed evidence
+  fields, never to anything the model said about itself:
+  - **Very recent major edits**: `evidence.evidence.recentChanges.recentMajorChanges` (D1's own
+    boolean, `services/evidence/recentChanges.ts`'s `computeRecentMajorChanges` — the SAME
+    function D1's own `RECENT_MAJOR_CHANGE` eligibility gate uses, so the two can never silently
+    disagree about what counts as "recent") → confidence ×
+    `guardrailThresholds.confidencePenalty.recentMajorChangeMultiplier` (default **0.6**).
+  - **Composite creatives**: `evidence.evidence.creativeFatigue.applicable &&
+    .creativeType === "COMPOSITE"` (B8's own typing, only populated when the request named an AD
+    directly — an ADSET/CAMPAIGN-altitude decision pools across many creatives and this signal
+    doesn't apply there) → confidence ×
+    `guardrailThresholds.confidencePenalty.compositeCreativeMultiplier` (default **0.75**).
+  Both compound when they both hold (multiplication commutes — order doesn't matter). Both are
+  explicitly documented as heuristics (never presented as validated statistical figures),
+  matching D1's own `eligibility.ts` framing for its confidence heuristic. The adjustment only
+  ever LOWERS confidence, never raises it (a model that already reported low confidence for its
+  own reasons is left alone at or below that number) — proven in `guardrails.test.ts`. This is
+  what "never delegated to the model's own restraint" means concretely: the reduction is computed
+  here, from independently-measured evidence, regardless of whether the model already lowered its
+  own stated confidence for the same reason.
+
+- **Integration with D4 — the seam turned out narrower than the orchestrator brief assumed, and
+  D4 landed first.** D4's own `services/reasoner/job/guardrailSeam.ts` (read, never edited — that
+  directory is D4's job pipeline, out of this step's scope per its own "Out of scope" line) fixes
+  `GuardrailValidator = (recommendation: RecommendationOutput) => GuardrailVerdict |
+  Promise<GuardrailVerdict>` — deliberately **only** the model's structured output, no evidence,
+  no canon, no Firestore handle, no `recommendationId`. D4's own module comment frames this
+  narrowness as the actual guarantee and instructs whoever implements D5 to "write a function
+  matching this exact type." Two integration paths exist as a result, both sharing the same
+  decision core (`validateGuardrails`) and the same log collection:
+  1. **`applyGuardrails`** (guardrailLog.ts) — the higher-fidelity path, taking
+     `{recommendationId, namedEntity, recommendation, evidenceResult, canon, accountDataVersion,
+     adOptimizationKnowledgeVersion}` — everything `generateRecommendationTask.ts` already has in
+     scope one call frame up (the packet's own `namedEntity`/`accountDataVersion`, the reasoner
+     result's own `provenance.adOptimizationKnowledgeVersion`, and the REAL
+     `recommendationId` — no re-fetch, no synthesized id). **This is the integration D4's own
+     `generateRecommendationTask.ts` should call directly, in place of the narrow
+     `guardrailValidator(reasonerResult.recommendation)` line**, since every value it needs is
+     already in that function's own scope right there. Returns either `{outcome: "APPROVED",
+     adjustedConfidence, confidenceAdjustments}` (persist `adjustedConfidence` in place of the
+     model's own `confidence`) or `{outcome: "REJECTED", ..., recommendationPatch}` (the exact
+     field patch — `recommendation: "INSUFFICIENT_DATA"`, every budget field `null`,
+     `guardrailRejection` — matching `recommendationSchema` field-for-field, D3's own "no
+     remapping" precedent extended here).
+  2. **`createGuardrailValidator`** (guardrailAdapter.ts) — a drop-in adapter conforming EXACTLY
+     to D4's `GuardrailValidator` type, for a zero-touch swap at the CURRENT call site:
+     `createGenerateRecommendationHandler({ guardrailValidator: createGuardrailValidator() })`.
+     Internally, since the narrow seam gives it nothing but `recommendation`, it closes over
+     `db`/`canon` and RE-RESOLVES the named entity's evidence itself via
+     `resolveScalingEvidence({db, namedEntity: recommendation.decisionUnit})` on every call — this
+     is not merely tolerated by the narrow interface, it is arguably a stronger property (the
+     guardrail never trusts the packet the model actually reasoned over; it re-derives today's
+     ground truth from this account's own Firestore data fresh, every time). The honestly-stated
+     cost of integrating through this specific seam: `recommendationId` is not in scope at this
+     call site, so the log entry's id is synthesized (`adapter_{type}_{id}_{timestamp}`) rather
+     than the real one, and `namedEntity`/`adOptimizationKnowledgeVersion` are logged as `null`
+     (not available here either) — both documented in `guardrailAdapter.ts`'s own module comment,
+     which points back to path 1 as the fix.
+  Both are exported from `services/reasoner/index.ts`. **No file inside `services/reasoner/job/`
+  was created or edited by this step** — `guardrailAdapter.ts` only reads `GuardrailValidator`'s
+  TYPE from `guardrailSeam.ts` (a type-only import carries no risk of clobbering D4's work) and
+  implements a conforming function elsewhere. Wiring either path into the PRODUCTION
+  `generateRecommendationHandler`/`generateRecommendationRegistration` exports in
+  `generateRecommendationTask.ts` is a one-line change D4's own notes already anticipated
+  ("Swapping in D5's real validator is a one-line change... once it exists") — left undone here
+  since that file belongs to D4's step, not this one, per the coordinator's explicit "stay out of
+  D4's pipeline/worker code" instruction; flagged here rather than silently left unfindable.
+
+- **Ambiguities resolved:**
+  1. **What input shape `validateGuardrails` should take**, given the design only says "post-model
+     validation" without naming an interface. Resolved: the model's structured output
+     (`RecommendationOutput`) plus D1's independently-computed evidence
+     (`ScalingEvidenceResult`) plus settings (`CanonSettings`) — nothing else, and specifically
+     never the knowledge document or provenance (see the structural-guarantee note above). This
+     was settled BEFORE discovering D4's own narrower `GuardrailValidator` seam; rather than
+     narrow `validateGuardrails` itself down to match it (which would have made the max-change/
+     decision-unit/spend/purchases checks impossible to implement without a Firestore call baked
+     into the "pure" core), both were kept — the rich pure core, plus an adapter for the narrow
+     seam. See the integration note above for why.
+  2. **Whether the minimum-purchases guardrail should be a new settings field or reuse C3's own
+     purchase floor.** Resolved: reuse — `statisticalThresholds.minPurchaseFloors` already exists,
+     already means exactly "not enough volume to trust a number," and a second independently-tuned
+     "guardrail purchase floor" would risk drifting from the floor that already governs
+     `NOT_DISTINGUISHABLE`, silently producing a recommendation whose own evidence already flagged
+     it as statistically unreliable.
+  3. **Whether the minimum-spend default should be derived from the ₹1,500 placeholder
+     `targetCpaMinorUnits` or a real measured number.** Resolved: the real one — this account's
+     own live-measured ₹1,761.63 account-level CPA (C2/C3's own reconciliation), explicitly NOT
+     the placeholder target, per the orchestrator brief's own instruction that the placeholder
+     "is not the user's real business target."
+  4. **Whether an evidence-outcome mismatch (`NOT_DELIVERING`/`NO_DECISION_UNIT`) should be its
+     own guardrail category or folded into "minimum spend/purchases."** Resolved: given its own
+     violation codes (`NOT_DELIVERING`, `NO_DECISION_UNIT`) rather than silently reported as
+     `MIN_SPEND_NOT_MET`/`MIN_PURCHASES_NOT_MET` with a zero — the rejection log's whole point is
+     to let E3 tell these apart (a genuinely dead entity vs. a low-but-real-volume one), and
+     collapsing them into one code would erase that distinction from the calibration signal.
+  5. **Whether confidence reduction should be able to RAISE confidence** (e.g. if neither penalty
+     applies and the model under-reported). Resolved: no — `computeAdjustedConfidence` only ever
+     multiplies by a factor `<= 1`; a model's own confidence, once past the rejection checks, is
+     never second-guessed upward. Guardrails constrain risk, they don't grade the model's
+     calibration (that is E3's job, on outcomes, not on confidence itself).
+
 ---
 
 ### D6 — Web application
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck, lint, lint:web, format:check, `test`
+784→**797/797**, `test:web` **12/12**, new); `npm run test:integration` passes **296/296** across 32
+files (up from prior 32 files/unchanged rules test, now 139 rules-deny assertions — `firestore.rules`
+itself is byte-for-byte unmodified). See Notes below for the onSnapshot-vs-§17.1 resolution, the D5
+integration seam this step had to work around, and how to run this locally.
 **Depends on:** D4
 **Design refs:** §17.1, §24
 
@@ -4577,6 +5055,201 @@ non-budget-owner is rejected.
 
 **Done when.** A question asked in the UI produces a card without a page reload; an escalated answer states
 what it escalated from and why; no ROAS renders without a sample size.
+
+**Notes from implementation:**
+
+- **Layout as built.** `/web/server` (Node/ESM, part of the ROOT TS project — added to
+  `tsconfig.json`'s `include`, `vitest.config.ts`/`vitest.emulator.config.ts`'s `include`, and
+  root `eslint.config.js` lints it like every other `services/`/`shared/` file) is the API
+  gateway: `types.ts` (wire view types), `auth.ts` (Firebase Auth token verification),
+  `viewModel.ts` (joins `recommendations`+`decisionPackets`+`guardrailRejections` into one
+  response), `deps.ts` (runtime wiring — demo vs. live reasoner), `demoReasoner.ts` +
+  `demoFixtures.ts` (local-only, never touching `services/reasoner/`), `handlers.ts` (framework-
+  agnostic request handlers, D4's own pattern), `sse.ts` (the live-status stream), `server.ts`
+  (the one file touching `node:http`), `seedDemo.ts` (operator seed script). `/web/src` is a
+  separate Vite/React app with its OWN `tsconfig.json` (DOM+JSX), its own `eslint.config.js`
+  (`npm run lint:web`), and its own vitest config (`vitest.web.config.ts` at repo root, jsdom
+  environment, `npm run test:web`) — deliberately NOT part of the root TS/eslint/vitest configs,
+  which have no DOM lib and would otherwise need one just for this one app. Root `eslint.config.js`'s
+  pre-existing `web/**` ignore (A1's placeholder, anticipating this step) was narrowed to
+  `web/src/**`+`web/dist/**` only — `web/server` is linted by the SAME root config as every other
+  service directory, exactly as A1's own note anticipated ("scoping it down... is exactly the
+  right call" territory). New root scripts: `lint:web`, `test:web`, `test:integration` now starts
+  `firestore,auth` (was `firestore` only — D6's own auth tests need the Auth emulator too),
+  `seed:web-demo`, `dev:api`, `dev:web`, `build:web`.
+
+- **New root dependencies** (all justified, none speculative): `react`/`react-dom` (the app),
+  `firebase` (client SDK — Auth only, see below), `vite`+`@vitejs/plugin-react` (pinned to
+  `vite@^5.4.21` / `@vitejs/plugin-react@^4.7.0`, NOT the newest majors — `vitest@2.1.9`'s own
+  `@vitest/mocker` peer-depends on `vite@^5`, and the newest `@vitejs/plugin-react@6.x` requires
+  `vite@^8`; this combination is what actually resolves without `--legacy-peer-deps`),
+  `@testing-library/react`+`@testing-library/jest-dom`+`jsdom` (component tests),
+  `eslint-plugin-react-hooks`+`eslint-plugin-react-refresh` (web/eslint.config.js only). No
+  component library, no state manager — plain CSS, plain `useState`/`useEffect`.
+
+- **⚠️ The onSnapshot-vs-§17.1 contradiction — resolved as (a), rules unchanged, full write-up
+  lives in `web/server/server.ts`'s own module comment (read it there — this is a summary).**
+  §17.1 says "all data served through the API, never direct client Firestore reads," full stop;
+  §16.1's architecture diagram shows the client using `onSnapshot`. Those conflict, and A2's
+  `firestore.rules` (unchanged blanket deny, proved by `test/firestore.rules.emulator.test.ts`)
+  would simply deny a client `onSnapshot` today. **Resolved: `firestore.rules` is byte-for-byte
+  what A2 wrote — this step made zero changes to it, and `test/firestore.rules.emulator.test.ts`
+  runs unmodified and passes (139 assertions now, up from 99, purely from collections other steps
+  added since — `guardrailRejections` included).** Live status instead comes from a **server-owned
+  SSE stream**, `GET /api/recommendations/:id/stream` (`web/server/sse.ts`): the Admin SDK's own
+  `onSnapshot` (server-side, never subject to `firestore.rules`) drives a listener INSIDE this
+  process, and each snapshot is joined into the same `RecommendationView` shape the plain GET route
+  returns and written as one `data: {...}\n\n` frame. The browser never holds a Firestore
+  credential and never imports `firebase/firestore` — only `firebase/app`+`firebase/auth`
+  (`web/src/firebase.ts`), enforced STRUCTURALLY by a `no-restricted-imports` rule in
+  `web/eslint.config.js` blocking `@shared/*`/`@services/*`/`firebase/firestore`/`firebase-admin*`
+  from `web/src`, not just documented as a convention. Chosen over option (b) — narrowing
+  `firestore.rules` to let an authenticated user read their own `recommendations/{id}` — for three
+  reasons spelled out in full in `server.ts`: §17.1's own sentence is unconditional and §16.1
+  ALREADY names SSE-from-Cloud-Run as the sanctioned way to bypass the Hosting-rewrite ceiling for
+  exactly this shape of problem (a value that changes over a request's lifetime); loosening a
+  boundary A2 spent 99 (now 139) tests proving is a one-way ratchet future authors must remember
+  exists; and it is not necessary — SSE delivers the identical "progress states for free" UX with
+  strictly less new surface area. **Security posture:** every response the browser ever receives —
+  list/get/create/accept/reject/stream — passes through `web/server/auth.ts`'s `verifyAuthHeader`
+  first (valid unexpired Firebase ID token or 401, uniformly), then through this process's own
+  Admin SDK. A client, authenticated or not, still cannot read or write anything directly.
+
+- **The SSE client is `fetch`+`ReadableStream`, not `EventSource`** (`web/src/api/client.ts`) —
+  `EventSource` cannot set custom headers, so it cannot carry a bearer token; this way the token
+  never has to go in the URL (a real leak risk via logs/proxies) and stays in the
+  `Authorization` header like every other call.
+
+- **⚠️ A real integration gap this step had to work around, not caused by this step: D5's guardrail
+  log is keyed by a SYNTHESIZED id, not the real `recommendationId`.** The coordinator confirmed
+  `generateRecommendationHandler` now uses `createGuardrailValidator()` (D5's adapter,
+  `services/reasoner/guardrailAdapter.ts` — read, never modified). That adapter's own module
+  comment says plainly it does not have the real `recommendationId` in scope at its call site and
+  instead writes `guardrailRejections/{id}` under `adapter_{decisionUnit.type}_{decisionUnit.id}_
+  {epochMillis}`. A plain `.get(recommendationId)` therefore misses every real rejection.
+  `web/server/viewModel.ts`'s `findGuardrailRejectionLog` tries the direct keyed lookup first (the
+  correct, forward-compatible path if a future change wires in `applyGuardrails`'s higher-fidelity
+  integration instead, per that file's own comment), then falls back to a `FieldPath.documentId()`
+  prefix-range query for `adapter_{type}_{id}_` (needs no new composite index — a single-field
+  range) and takes the most recent match. **Two Firestore quirks surfaced and fixed while building
+  this:** (1) Firestore rejects a descending `orderBy` on the document id ("does not support
+  descending key scans") — ordered ascending instead and took the last element client-side; (2) a
+  literal U+F8FF character got mis-transcribed into a `new_string` mid-edit by this agent and
+  silently corrupted one line without the edit tool reporting an error visibly — caught by a
+  `String.fromCodePoint` rewrite and a byte-level `codePointAt` scan of the file before trusting it
+  again. This is a documented, load-bearing bridge, not a guess — proven against the REAL D5
+  validator end to end in `webApi.emulator.test.ts`'s REJECTED case (asserts a real
+  `MAX_CHANGE_PERCENT_EXCEEDED` violation with `judgedAgainst: {limit: 20, actual: 250}`).
+
+- **Structural proof that no ROAS can render without its sample size — not a convention.**
+  `MetricSnapshot.purchases` (both `web/server/types.ts` and `web/src/api/types.ts`) is a
+  REQUIRED, non-optional `number` field, mirroring D1's own `MetricSnapshot` exactly. `RoasMetric`
+  (`web/src/components/RoasMetric.tsx`) is the ONLY component in the app allowed to format a
+  ROAS/CPA figure — no other file calls `formatRatio`/currency-formats a ratio value. Its `source`
+  prop (`"meta" | "shopify"`) is likewise required, so Meta- and Shopify-attributed figures can
+  never render unlabelled or merged (§6.2/§6.3) — `WindowEvidenceBlock.tsx` always renders BOTH as
+  two separate `<RoasMetric>` calls on two distinct object fields. `RoasMetric.test.tsx` proves
+  both halves: a `@ts-expect-error`-guarded assignment proves omitting `purchases` fails
+  `tsc`/`lint:web` before any test runs, and a runtime case smuggles `purchases: undefined as
+  unknown as number` past the type system and asserts the component still refuses to print a bare
+  number ("sample size unavailable" instead). `webApi.emulator.test.ts`'s EVIDENCE test walks every
+  REAL window a live pipeline run produced and asserts `purchases` is a finite number on every one.
+
+- **How the three D1 outcomes + guardrail-rejected + failed states render — all first-class
+  cards, proven against a REAL pipeline run, not fixtures alone.** `RecommendationCard.tsx`
+  dispatches on `status` first (PENDING/GENERATING → progress, FAILED → the real `errorMessage`,
+  never a spinner forever), then on `packet.outcome` (EVIDENCE/NOT_DELIVERING/NO_DECISION_UNIT —
+  the D1 discriminated union preserved end to end, never flattened into one shape with nulled
+  fields) and `status === "REJECTED"` (renders `GuardrailBanner` — which guardrail, its message,
+  and `judgedAgainst.{field,limit,source,actual}` — while still showing the model's own reasoning
+  below it, per D4's own "keep them visible, the rejection log is itself a calibration signal"
+  choice). `web/server/demoFixtures.ts` seeds six synthetic scenarios exercising every one of
+  these for real: `AS_17` (healthy → EVIDENCE/INCREASE_BUDGET), `AS_dead` (zero delivery →
+  NOT_DELIVERING), `cmp_orphan` (no budget, no ad sets → NO_DECISION_UNIT), `ad_lowvol` (escalates
+  to `AS_17`, `SAMPLE_TOO_SMALL`), `AS_faildemo` (the demo client throws → FAILED),
+  `AS_overlimit` (a scripted 250% change → the REAL D5 guardrail rejects it → REJECTED, not a
+  simulated one). All six are proven end to end in `webApi.emulator.test.ts` (11 tests) against
+  the real Firestore+Auth emulators, the real unmodified D1/D2 pipeline, and the real D5 validator.
+
+- **The demo reasoner — what it fakes and what it doesn't.** Live Anthropic calls are unnecessary
+  per this step's own constraints. `web/server/deps.ts` chooses between two registries: unset
+  `ANTHROPIC_LIVE` (default) wires `createGenerateRecommendationHandler({client: <scripted fake>,
+  guardrailValidator: createGuardrailValidator()})` — ONLY the Anthropic client is fake (same
+  `{beta:{messages:{create}}}` shape D3/D4's own emulator tests already use); D1's evidence
+  engine, D2's packet builder, and D5's real guardrail all run unmodified. `ANTHROPIC_LIVE=1` swaps
+  in the real, completely unmodified `generateRecommendationHandler` (real Secret-Manager-resolved
+  key, real guardrail) for an operator who wants to run this locally against the live model without
+  deploying Cloud Run. Neither path touches `services/reasoner/`/`services/reasoner/job/` — both
+  only ever IMPORT from them.
+
+- **⚠️ A genuine concurrency bug found and fixed while writing the emulator tests — worth knowing
+  before anyone else calls `dispatchLatest()` more than once.** This step's own local dispatcher
+  (no real Cloud Tasks queue, per the no-cloud-resources constraint) runs
+  `GENERATE_RECOMMENDATION` in-process. `createRecommendationHandler` fires this as fire-and-forget
+  (§16.1's whole point — don't block the request). The first test draft ALSO awaited
+  `dispatchLatest()` explicitly afterward "to force-wait for completion" — this actually started a
+  SECOND concurrent run of the SAME task, since `runSyncTask`'s own idempotency only skips an
+  ALREADY-SUCCEEDED task, not two runs that are BOTH still in flight. The two concurrent
+  invocations raced the demo registry's `currentNamedEntity` closure (used to look up the right
+  packet for the scripted client — see `deps.ts`) and each other's version-guarded Firestore
+  writes, producing "a concurrent writer raced this document" errors and a demo model call that
+  couldn't find its own packet. **Fixed structurally, not by removing the redundant test call**:
+  `deps.ts`'s `dispatch()` is now single-flight per taskId (`Map<string, Promise<void>>`) — a
+  second call for a taskId already in flight returns the SAME promise instead of starting a new
+  run, making `dispatchLatest()` safe (and useful — a real "wait for this to finish" primitive) to
+  call more than once. This is a real, load-bearing fix, not test-only scaffolding: it also
+  protects the create route itself against a hypothetical double-fire.
+
+- **What an operator runs to serve this locally** (no cloud resources, matching this step's
+  constraints):
+  1. `npm run emulators` (Firestore + Auth + Functions emulators) — separate terminal, stays up.
+  2. `npm run seed:web-demo` — seeds a synthetic account (six scenarios above) and one Auth
+     emulator user (`rajendrahn38@gmail.com` / `demo-password-local-only`) into a FRESH emulator
+     pair it starts and stops itself (`firebase emulators:exec`) — run this once, or after
+     clearing emulator state, NOT against the long-running `npm run emulators` instance from step 1
+     (they'd be two separate emulator processes/ports otherwise unless step 1's emulator is instead
+     targeted directly — simplest is: stop step 1, run this, then `FIRESTORE_EMULATOR_HOST=
+     127.0.0.1:8080 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 npm run emulators` won't reseed; the
+     cleanest local flow is `firebase emulators:start --only firestore,auth,functions` in one
+     terminal, then in another, with those two env vars set, `npx tsx web/server/seedDemo.ts`
+     directly, then `npm run dev:api`, THEN `npm run dev:web` — the `seed:web-demo` script as
+     written is for a one-shot, self-contained seed+verify, not for pointing at an already-running
+     emulator instance).
+  3. With `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080` and `FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099`
+     set in that shell: `npm run dev:api` (the API gateway, port 8081 by default).
+  4. `npm run dev:web` (Vite dev server, port 5173, proxies `/api` to step 3) — needs
+     `web/.env.local` with at least `VITE_USE_AUTH_EMULATOR=1` for the browser's own Firebase Auth
+     SDK to talk to the Auth emulator instead of a real project.
+  5. Open `http://localhost:5173`, sign in with the seeded demo user, ask about `AS_17` / `AS_dead`
+     / `cmp_orphan` / `ad_lowvol` / `AS_faildemo` / `AS_overlimit` (types ADSET/ADSET/CAMPAIGN/
+     AD/ADSET/ADSET respectively).
+  For production: `npm run build:web` produces `web/dist` for Firebase Hosting; `web/server`
+  deploys as its own Cloud Run service (no Dockerfile was written for it — out of this step's own
+  safety constraints, same as D4 left its own Cloud Run deploy commands documented-but-unexecuted);
+  an operator wiring it for real also sets `ANTHROPIC_LIVE=1` and points `firebase.json`'s
+  (not-yet-added) Hosting rewrite at that service.
+
+- **Ambiguities resolved, beyond the two flagged above:**
+  1. **`recommendations/{id}` had no field for "what was originally asked about"** — D4's own
+     `Recommendation` type has `decisionUnit` (what the answer ended up being about, post-
+     escalation) but nothing for the ORIGINAL named entity, which the UI needs for the escalation
+     banner and history list. Resolved by an additive extension to `shared/schema/decisions.ts`'s
+     `recommendationSchema` (`namedEntity: entityRef.nullable().optional()` — deliberately
+     `.optional()`, NOT `.default(null)`, because a defaulted field is REQUIRED in zod's inferred
+     OUTPUT type, which would have broken `services/reasoner/job/request.ts`'s existing object
+     literal, a file this step may not modify). `web/server/handlers.ts`'s create route patches it
+     on via a targeted `.update({namedEntity})` immediately after `requestRecommendation` returns
+     and BEFORE the dispatch fires (ordering matters — see the single-flight note above for why the
+     race this could otherwise create is closed).
+  2. **Accept/reject eligibility** — not specified beyond "persisted." Resolved: only a `COMPLETE`
+     card with `action !== "INSUFFICIENT_DATA"` can be accepted (nothing actionable in an
+     insufficient-data answer); any `COMPLETE` card can be rejected (dismissing an
+     insufficient-data or already-unappealing card is legitimate); neither is available on
+     PENDING/GENERATING/FAILED/REJECTED; a second accept/reject after the first is a 409, not a
+     silent overwrite — `web/server/handlers.ts`'s `validateActionable`.
+  3. **Who can accept/reject** — §17.1's "one account, a small user set" reasoning applied directly:
+     any authenticated user may act on any recommendation (no per-recommendation ownership check),
+     matching the same reasoning A2/D4 already used for not building per-user Firestore rules.
 
 ---
 

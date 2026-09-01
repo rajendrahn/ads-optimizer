@@ -18,6 +18,7 @@ _tmp_*
 # Build output / tooling caches
 functions/lib/
 dist/
+web/dist/
 coverage/
 
 # Firebase local emulator / CLI state

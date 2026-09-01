@@ -59,6 +59,9 @@ describe("COLLECTIONS", () => {
       // D3.1's own — the versioned, operator-refreshed ad-optimization knowledge playbook, see
       // services/reasoner/knowledge.ts's module comment.
       "adOptimizationKnowledge",
+      // D5's own — the durable guardrail-rejection log, see
+      // shared/schema/guardrails.ts's module comment.
+      "guardrailRejections",
     ] as const;
     expect(Object.keys(COLLECTIONS).sort()).toEqual([...names].sort());
     for (const name of names) {

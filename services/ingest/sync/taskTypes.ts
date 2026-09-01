@@ -92,3 +92,14 @@ export type KnownTaskType = (typeof SYNC_TASK_TYPES)[number];
  * external API. Registered by `createDefaultRegistry()` in registry.ts. Also useful in
  * production as an ops health check ("is the dispatch path alive") independent of any sync. */
 export const SYNC_NOOP = "SYNC_NOOP";
+
+/** D4's own — §10.2/§16.1's job pipeline: runs D2's packet builder + D3's reasoner for one
+ * named entity and writes the result back onto `recommendations/{id}`. Already named in
+ * §10.2's own list above; this constant is D4's registration handle for it (mirroring
+ * `SYNC_NOOP`'s own convention) — see services/reasoner/job/generateRecommendationTask.ts. This
+ * is the one task type in this registry that deliberately does NOT run on the `functions/`
+ * Cloud Functions dispatch target (§16.1: a Fable 5 turn can exceed a Hosting rewrite's 60s
+ * ceiling, and Cloud Functions is reserved for scheduled sync per §0.2) — it is dispatched by a
+ * separate Cloud Run "reasoner worker" instead, via the SAME `runSyncTask`/`handleTaskRequest`
+ * framework (see services/reasoner/job/workerRuntime.ts). */
+export const GENERATE_RECOMMENDATION = "GENERATE_RECOMMENDATION";

@@ -18,6 +18,12 @@
       "@services/*": ["services/*"]
     }
   },
-  "include": ["scripts/**/*.ts", "shared/**/*.ts", "services/**/*.ts", "test/**/*.ts"],
-  "exclude": ["node_modules", "functions"]
+  "include": [
+    "scripts/**/*.ts",
+    "shared/**/*.ts",
+    "services/**/*.ts",
+    "test/**/*.ts",
+    "web/server/**/*.ts"
+  ],
+  "exclude": ["node_modules", "functions", "web/src", "web/dist"]
 }

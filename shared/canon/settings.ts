@@ -14,6 +14,7 @@
 import { z } from "zod";
 import { reportingCanonSettingsSchema } from "../schema/settings.ts";
 import { statisticalThresholdsSchema } from "./statisticalThresholds.ts";
+import { guardrailThresholdsSchema } from "./guardrailThresholds.ts";
 
 /**
  * §19.2's model-selection block, verbatim in field names and values. `effort` is left as a
@@ -45,5 +46,8 @@ export const canonSettingsSchema = reportingCanonSettingsSchema.extend({
   // §15.1 — optional (see statisticalThresholds.ts for why), resolved via
   // `resolveStatisticalThresholds()`, never read directly.
   statisticalThresholds: statisticalThresholdsSchema.optional(),
+  // §20.2 (D5) — optional for the same reason: resolved via `resolveGuardrailThresholds()`,
+  // never read directly. See guardrailThresholds.ts's own module comment.
+  guardrailThresholds: guardrailThresholdsSchema.optional(),
 });
 export type CanonSettings = z.infer<typeof canonSettingsSchema>;

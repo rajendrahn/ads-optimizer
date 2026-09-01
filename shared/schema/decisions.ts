@@ -84,10 +84,53 @@ export const recommendationTypeSchema = z.enum([
 ]);
 export type RecommendationType = z.infer<typeof recommendationTypeSchema>;
 
+// D4's own extension — §19.4 provenance, stamped by D3's `buildProvenance` and persisted
+// verbatim (field-for-field, no remapping — see D3's own "Notes for D4/D5") by the
+// GENERATE_RECOMMENDATION worker. Not all of §19.4's fields had a home on `recommendationSchema`
+// before this step (D3's own note: "D4 should extend it via `.extend(...)`, per this codebase's
+// own established pattern"). Nullable/defaulted so A2/D3's own fixtures (no `provenance` key)
+// still parse unchanged — a PENDING/GENERATING doc legitimately has none yet.
+export const recommendationProvenanceSchema = z.object({
+  model: z.string().min(1),
+  provider: z.literal("anthropic"),
+  promptVersion: z.string().min(1),
+  decisionEngineVersion: z.string().min(1),
+  featureVersion: z.number().int().nonnegative(),
+  dataVersion: z.number().int().nonnegative(),
+  generatedAt: z.string().min(1), // ISO instant
+  dataFreshThrough: z.string().min(1), // ISO instant
+  adOptimizationKnowledgeVersion: z.string().nullable(),
+  stopReason: z.string().min(1),
+  usage: z.object({
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cacheCreationInputTokens: z.number().int().nonnegative().nullable(),
+    cacheReadInputTokens: z.number().int().nonnegative().nullable(),
+  }),
+});
+export type RecommendationProvenance = z.infer<typeof recommendationProvenanceSchema>;
+
+// D6's own additive extension — same pattern as A3/D2/D4's own `.extend`-shaped additions to
+// this file (see the module-level comments above `recommendationProvenanceSchema`). D4's own
+// `request.ts` (out of scope for D6 to modify) writes the PENDING doc without this field.
+// Deliberately `.optional()`, NOT `.default(null)` — a defaulted field is REQUIRED in
+// `z.infer`'s output type (zod guarantees a default fills every parse), which would make
+// `Recommendation` require a `namedEntity` key and break `request.ts`'s existing object literal
+// (a file D6 is not allowed to touch). `.optional()` keeps the key optional in both directions,
+// so that literal keeps typechecking unmodified. D6's own create-recommendation route patches
+// this field onto the doc immediately after `requestRecommendation` returns (a targeted
+// `.update({namedEntity})`, not a full overwrite — see web/server/handlers.ts), sequenced before
+// the local worker dispatch even begins (deps.ts), so there is no read-before-write race. Because
+// it is now part of `recommendationSchema` itself, once written it survives every later PENDING ->
+// GENERATING -> terminal read-modify-write cycle in generateRecommendationTask.ts (whose `current`
+// is read through this same schema) rather than being silently dropped by the next transition
+// write. What was actually asked about — distinct from `decisionUnit` below, which is what the
+// answer ended up being ABOUT after D1's own escalation (§4.1), once one exists.
 export const recommendationSchema = z.object({
   recommendationId: z.string().min(1),
   status: recommendationStatusSchema,
   packetId: z.string().nullable(),
+  namedEntity: entityRef.nullable().optional(),
   decisionUnit: entityRef.nullable(),
   recommendation: recommendationTypeSchema.nullable(),
   currentBudgetMinorUnits: z.number().int().nullable(),
@@ -110,6 +153,7 @@ export const recommendationSchema = z.object({
   requestedBy: z.string().nullable(),
   requestedQuestion: z.string().nullable(),
   errorMessage: z.string().nullable(), // §D4: failure states recorded, not swallowed
+  provenance: recommendationProvenanceSchema.nullable().default(null), // D4's own addition — §19.4
   createdAt: firestoreTimestamp,
   updatedAt: firestoreTimestamp,
   acceptedAt: firestoreTimestamp.nullable(), // user's accept — §24

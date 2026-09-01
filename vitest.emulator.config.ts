@@ -18,8 +18,9 @@ export default defineConfig({
       "test/**/*.emulator.test.ts",
       "services/**/*.emulator.test.ts",
       "shared/**/*.emulator.test.ts",
+      "web/server/**/*.emulator.test.ts",
     ],
-    exclude: ["node_modules/**", "functions/**"],
+    exclude: ["node_modules/**", "functions/**", "web/src/**", "web/dist/**"],
     // Emulator integration tests share one Firestore instance; running them in parallel
     // worker processes makes cross-test document collisions likelier for no real speed win
     // at this test count.

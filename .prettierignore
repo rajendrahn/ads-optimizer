@@ -1,6 +1,7 @@
 node_modules
 functions/lib
 functions/node_modules
+web/dist
 coverage
 package-lock.json
 *.csv
