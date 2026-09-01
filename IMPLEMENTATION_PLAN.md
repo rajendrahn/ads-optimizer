@@ -5883,7 +5883,18 @@ a recommendation that never accumulates enough evidence to judge should stay unj
 
 ### E3 — Confidence calibration
 
-**Status:** Not started
+**Status:** Done — `npm run check` passes clean (typecheck across all three tsconfig projects, lint,
+lint:web, format:check, 881/881 unit tests — up from 843 pre-E3, this step's own 38 new tests across
+`services/calibration/*.test.ts`; 12/12 web tests unchanged). `npm run test:integration` passes
+306/306 against a real Firestore emulator (up from 304 pre-E3 — this step's own 2 new emulator tests
+in `services/calibration/collect.emulator.test.ts`). The operator-facing script itself
+(`scripts/generateCalibrationReport.ts`) was actually run twice against a real Firestore emulator —
+once against a genuinely empty one (today's real state) and once against emulator-seeded SYNTHETIC
+data — and both runs produced a correct HTML/JSON report; see Notes below for exactly what was and
+was not run against anything real. No production Firestore was touched (emulator only, or a
+read-only code path that happens to be safe against production too — see Notes); no live
+Anthropic/Meta/Shopify call was made anywhere in this step; no cloud resource was created, modified
+or deployed; no npm dependency was added; `package.json`/`package-lock.json` were not touched.
 **Depends on:** E1, E2
 **Design refs:** §29
 
@@ -5900,6 +5911,214 @@ a recommendation that never accumulates enough evidence to judge should stay unj
 **Out of scope.** Automatically adjusting model confidence. Observe first.
 
 **Done when.** Calibration reports over backtest and live outcomes together.
+
+**Notes from implementation:**
+
+- **Layout as built.** `services/calibration/{types,brier,calibrationCurve,rejectionRate,collect,
+  report,dashboardHtml,index}.ts`, each with a co-located `*.test.ts` (pure — no Firestore, no live
+  call) except `collect.ts`, which additionally has `collect.emulator.test.ts` (real Firestore
+  emulator, seeds synthetic docs and round-trips the full pipeline). `testSupport.ts` is a
+  test-only helper (`must`, a `no-non-null-assertion`-compliant narrowing helper — this repo's
+  eslint config forbids `x!`), not itself a test file, mirroring `services/backtest/testFixtures.ts`'s
+  own convention. `scripts/generateCalibrationReport.ts` is the operator entry point — **not** wired
+  into `package.json`'s `scripts` (this step's own safety constraint forbids touching
+  `package.json`/`package-lock.json`; `tsx` is already a devDependency, so it runs directly via
+  `npx tsx scripts/generateCalibrationReport.ts`, mirroring `scripts/verify-b8-creative-identity.ts`'s
+  own precedent for an unregistered script). `.gitignore` gained one new entry, `/reports/` — the
+  script's own output directory, regenerated on demand, never a source artifact (same reasoning as
+  the existing `functions/lib/`/`dist/` entries). No existing file outside this list was modified —
+  `services/reasoner/`, `services/backtest/`, `services/evidence/` and every prior phase's schema
+  files were read, never edited.
+
+- **Which confidence the curve is built from, and why — the single most consequential judgment call
+  in this step.** Every live calibration point is built from `recommendations/{id}.confidence` **as
+  actually persisted**, which — since the orchestrator's corrective fix to D4/D5 immediately before
+  this step began (see D4/D5's own "Corrective update" notes above) — is D5's `adjustedConfidence`
+  for a COMPLETE recommendation: the model's own stated confidence multiplicatively reduced for a
+  very recent major edit (×0.6) or a composite creative (×0.75), never the model's raw self-report.
+  This is deliberate: the adjusted number is what an operator (or D6's UI) actually saw and acted on
+  — calibrating the model's raw self-report would score a number nobody was ever shown, and would
+  silently credit or blame D5's own guardrail heuristic for however the raw number would have scored
+  on its own. **There is currently no way to recover the model's pre-adjustment confidence from
+  stored data** — `recommendationSchema` has exactly one `confidence` field, and D4/D5's fix means
+  the raw value is gone by the time this report reads the document (a REJECTED recommendation's
+  `confidence` field is the one exception — it stores the model's raw number, per
+  `generateRecommendationTask.ts`'s REJECTED branch — but a REJECTED recommendation can never reach
+  E2's outcome evaluation at all, since D4 clears `recheckConditions` to `null` on rejection, so this
+  raw-confidence case is structurally excluded from calibration regardless). Recording both going
+  forward would require a schema change to `recommendations` and is out of E3's own scope (E3
+  calibrates outcomes; it does not touch the job pipeline's write shape) — flagged here as the clear
+  extension point for whoever wants a raw-vs-adjusted comparison once real data exists to compare.
+  This choice, and the reasoning above, is written out in full in `services/calibration/report.ts`'s
+  own module comment, not just here.
+
+- **How insufficient-n is handled, at every layer, rather than emitting a misleading number.**
+  - **Brier score**: `n` is always reported alongside `meanBrier`; `meanBrier` is `null` (never `0`
+    or `NaN`, both of which would misread as "perfectly calibrated") when `n === 0`
+    (`services/calibration/brier.ts`'s `aggregateBrier`). There is deliberately no minimum-n floor
+    on the Brier score itself — the brief's "refuse... rather than drawing one from two points"
+    instruction is specifically about the calibration CURVE (a rate estimated per bucket, which is
+    far more fragile at low n than a single pooled mean), and the report's own `dataProvenance`
+    section makes `n` impossible to miss regardless.
+  - **Calibration curve**: `MIN_CALIBRATION_BUCKET_SIZE = 10` (`calibrationCurve.ts`) — a bucket
+    with fewer judged points than this reports its real `n` (never hidden) but `null` for both
+    `meanPredictedConfidence` and `observedSuccessRate`, never a rate computed from too few points.
+    This is a documented, adjustable placeholder constant, deliberately in the same spirit as C5's
+    `MIN_SAMPLE_SIZE_FOR_INDEX = 2` (`services/analytics/seasonality/demandIndex.ts`) — not a value
+    derived from this account's data, since there is currently none to derive it from.
+    `dashboardHtml.ts` renders a below-floor bucket as a small hollow tick on the reliability
+    diagram's x-axis, labelled with its real `n`, rather than a plotted point — visible (a report
+    with ten empty-looking rows would itself read as "there's nothing here" when in fact there might
+    be real-but-thin data) but never faked into a coordinate.
+  - **Guardrail rejection rate**: an empty period is simply absent from `overTime`, never present
+    with a fabricated `rate: 0`; the overall rate is `null` at `attempts === 0`.
+  - Every one of these is proven with a dedicated test, not just described — see
+    `calibrationCurve.test.ts`'s own test named exactly for the brief's own "refuses... from the
+    brief" requirement, and `report.test.ts`'s "honesty on empty input" describe block.
+
+- **How confounded and unjudged outcomes are treated — both excluded from every tally, for different
+  and explicitly distinguished reasons** (`services/calibration/report.ts`):
+  1. **`SEASONALLY_CONFOUNDED`** (E2's flag) is counted (`live.seasonallyConfoundedCount`) but never
+     scored — folding it in as either a success or a failure would calibrate the calendar, exactly
+     what E2's own brief and this step's brief both warn against. `rawClassification` (E2's own
+     pre-override field) is available on the raw doc for a sensitivity check but is never read by
+     this report's own tallies, matching E2's own instruction that E3 should filter/bucket on
+     `classification`, not silently prefer `rawClassification`.
+  2. **`NEUTRAL`** (E2's `NOT_DISTINGUISHABLE`-mapped classification — evidence too thin to call
+     success or failure, not "50/50") is likewise counted (`live.neutralCount`) but never scored, for
+     the same underlying principle the brief states for unjudged recommendations: the system being
+     appropriately cautious about a small sample must not read as a strike against it.
+     ⚠️ **This is a deliberate divergence from E1's own convention** — `services/backtest/outcome.ts`'s
+     `scaledSuccessfully` maps a `NOT_DISTINGUISHABLE` verdict to `false` (an unsuccessful outcome),
+     not to "excluded". E3 does not silently harmonize the two: `backtest.systemBrier` reads E1's own
+     FROZEN `brierScoreComponent` values exactly as stored (never recomputed under E3's own
+     NEUTRAL-excluding rule — the same "read the frozen number, don't re-derive it" discipline this
+     codebase applies to D5's `judgedAgainst` and E2's `baselineShrunk`), while live NEUTRAL outcomes
+     are excluded under E3's own rule. `combinedBrier` pools both streams on the identical
+     `(confidence − actual)²` scale — numerically sound, since the formula is identical — but the two
+     streams do not define "actual" identically at the statistical-ambiguity margin. This is stated
+     explicitly in the report's own `dataProvenance.notes` (rendered on the HTML page itself, not
+     just in code comments) rather than silently blended away.
+  3. **Unjudged** — a COMPLETE, accepted recommendation with `recheckConditions` still set but no
+     `recommendationOutcomes/{id}` document at all (E2's own `NOT_YET_ELIGIBLE`/`SKIPPED`, both
+     no-write outcomes) is counted in `unjudged.acceptedNoOutcomeYet` and **never** enters the
+     success/failure tally, the Brier score, or the calibration curve — an absent outcome document
+     means "still waiting for enough evidence," not a failure. The predicate used
+     (`services/calibration/report.ts`'s local `isCandidate`) intentionally mirrors
+     `services/evidence/recommendationOutcomeTask.ts`'s own `isCandidate` field-for-field, duplicated
+     rather than importing a non-exported function from E2's file, per this codebase's convention of
+     not reaching into another step's internals. `unjudged.completeNotAccepted` (never accepted at
+     all) and `unjudged.guardrailRejected` (D5-rejected, structurally excluded from E2) are reported
+     alongside it for completeness, each clearly distinct from "unjudged".
+  All three are proven with dedicated tests in `report.test.ts` and, together, end to end in
+  `collect.emulator.test.ts`'s single large synthetic scenario (12 SUCCESS-eligible +
+  1 SEASONALLY_CONFOUNDED + 1 NEUTRAL + 1 accepted-unjudged + 1 guardrail-REJECTED, all seeded into a
+  real Firestore emulator and read back through the real schema round-trip).
+
+- **The guardrail rejection log, as a calibration signal in its own right (§20.2/§29 criterion 12).**
+  `services/calibration/rejectionRate.ts` computes two separate things over two separate collections:
+  (a) the rate itself, over time, from `recommendations` alone (`status` COMPLETE/REJECTED, bucketed
+  by `createdAt`'s reporting day/month via `toReportingDay` — a PENDING/GENERATING doc never reached
+  a verdict and a FAILED one errored out before D5 ever ran, so neither belongs in the denominator);
+  (b) a breakdown of the richer `guardrailRejections` log by violation code, by whether each
+  violation's `judgedAgainst.source` was `"settings"` or `"default"`, and by field — surfacing which
+  LIMIT a rejection was judged against, not just that one occurred. Per the brief's own instruction:
+  `JudgedAgainstFieldSummary` reports the MOST RECENT `judgedAgainst.limit` seen for each field (by
+  `rejectedAt`), so a stale placeholder that has since been corrected does not masquerade as the
+  current one — proven in `rejectionRate.test.ts`'s own test asserting a later `"settings"`-sourced
+  correction wins over an earlier `"default"` one for the same field. The dashboard visibly flags a
+  `"default"`-sourced limit as a "placeholder" pill, with an explicit note that a cluster of
+  rejections against one is a signal about the LIMIT (e.g. D5's own ₹1,500 `targetCpa` default
+  against a measured real ₹1,761.63 account CPA), not necessarily about the model — directly acting
+  on the brief's fourth numbered point.
+
+- **What this has, and has not, been run against.** Built properly and proven on synthetic data at
+  three levels, exactly per this step's own "build the machinery properly and prove it on synthetic
+  outcomes" instruction — never presented as a real result:
+  1. Pure unit tests (`brier.test.ts`, `calibrationCurve.test.ts`, `rejectionRate.test.ts`,
+     `report.test.ts`, `dashboardHtml.test.ts`) — 35 tests over hand-built synthetic fixtures, no
+     Firestore.
+  2. `collect.emulator.test.ts` — two tests against a REAL Firestore emulator: one confirms
+     `collectCalibrationInputs` returns honest empty arrays (not an error) against a genuinely empty
+     emulator — **which is also this system's actual real state today**, confirmed directly: E1's own
+     notes already established the real `gs://sng-meta-ads-optimizer-archive` bucket is empty and no
+     production sync has ever run; this step adds that the four Firestore collections a calibration
+     report reads from (`recommendations`, `recommendationOutcomes`, `backtestRuns`,
+     `guardrailRejections`) are correspondingly empty in the real (non-emulator) project too, since
+     nothing has ever written to them outside a test run. The second test seeds 16 SYNTHETIC
+     recommendations across every classification/exclusion case above into the emulator and
+     round-trips the full `collect → buildCalibrationReport → renderCalibrationDashboard` pipeline
+     through real schema validation on both write and read.
+  3. **The actual deliverable script, `scripts/generateCalibrationReport.ts`, was run twice — for
+     real, not just described** (via `npx firebase emulators:exec --only firestore "npx tsx
+     scripts/generateCalibrationReport.ts"`, so this never touched production and never made a live
+     API call):
+     - **Run 1, against a genuinely empty emulator** (i.e., today's real state): the script correctly
+       reported `hasAnyJudgedData: false`, printed the honest "no judged data" warning, and still
+       produced a structurally complete, correctly-rendered `reports/calibration-report.html`/`.json`
+       — proving the "no data yet" path is not just handled in a unit test but actually runs.
+       `loadReportingCanon()` threw exactly as A3 designed (no `settings/{accountId}` document
+       exists) — this step's own fallback (UTC, for guardrail-rejection-rate month labels only, with
+       a loud console warning) was exercised for real, not hypothetically. Neither the Brier score
+       nor the calibration curve reads a timezone at all, so this fallback never touches either.
+     - **Run 2, against the same emulator seeded with 16 synthetic docs** (12 SUCCESS-leaning +
+       3 FAILURE at 0.8 confidence, 1 backtest SYSTEM row, 1 guardrail rejection): produced
+       `Live Brier: n=15 mean=0.160`, `Backtest Brier: n=1 mean=0.0625`, `Combined Brier: n=16
+       mean≈0.154`, `Guardrail rejection rate: 1/16 (6.3%)` — all hand-verified against the seeded
+       inputs before this run (12/15 = 80% success at stated confidence 0.8 is, by construction, a
+       textbook example of good calibration, and the report's own reliability diagram correctly
+       plotted it as a single point sitting almost exactly on the diagonal, with the lone backtest
+       point at 0.75 confidence correctly rendered as a below-floor tick rather than a fabricated
+       second point). The seeding script and both runs' output were scratch-only (this session's
+       scratchpad directory, synthetic ids throughout, no real customer/account identifiers) and were
+       deleted afterward, along with the locally generated `reports/` directory, before this step
+       ended — nothing from either run was left in the repository.
+  4. **What this step explicitly has NOT been run against: production Firestore, or any real
+     recommendation/outcome/backtest data — because none exists.** This is not a gap in this step's
+     own verification; it is the honest state of the whole system, already established by A0/E1's own
+     notes and reconfirmed directly here. `scripts/generateCalibrationReport.ts`'s own read path is
+     safe to point at a real project (it performs zero writes — `collectCalibrationInputs` has no
+     write call in it at all, so the "do NOT write to production Firestore" constraint holds
+     structurally, not by discipline), but doing so today would return the same empty-collections
+     result Run 1 already demonstrated against the emulator, so there was nothing additional to prove
+     by spending a real ADC-authenticated read against production for this step.
+
+- **Ambiguities resolved:**
+  1. **Whether the "small internal dashboard" should be a live web page (à la D6) or a static
+     generated artifact.** Resolved: static HTML, generated on demand by an operator script, never
+     deployed, never wired into `web/server`'s live API — D6's app is for end users asking about a
+     specific entity; this report is a point-in-time operator snapshot over the whole account's
+     calibration state, a fundamentally different shape of tool. No charting library, per this step's
+     own safety constraint — the reliability diagram is hand-rolled inline SVG
+     (`dashboardHtml.ts`'s `renderReliabilitySvg`), proven not to throw and to render real point
+     coordinates in `dashboardHtml.test.ts` and the live script runs above.
+  2. **Where the generated report should live.** Resolved: `reports/` at the repo root, gitignored
+     (new `.gitignore` entry) — an operator-run, point-in-time artifact that may contain real account
+     figures once live data exists, never a source artifact, matching this repo's existing treatment
+     of `functions/lib/`/`dist/`/`web/dist/`.
+  3. **Whether backtest NAIVE rows belong in the Brier score at all.** Resolved: no, matching E1's own
+     documented design — NAIVE never states a confidence (`brierScoreComponent` is always `null` for
+     it, by E1's own construction), so it has no probability claim to calibrate. `backtest.
+     naiveScaledSuccessRate` is reported instead, exactly as E1's own notes prescribe ("treat NAIVE's
+     `scaledSuccessfully` rate as the comparison baseline instead").
+  4. **Whether to add a field to `recommendations` to start persisting the model's raw
+     pre-adjustment confidence alongside the adjusted one.** Resolved: not in this step — it would
+     touch D4/D5's already-reviewed job-pipeline write shape, which is out of E3's own scope ("E3
+     calibrates outcomes; it does not touch the job pipeline"), and there is no historical data to
+     backfill it against regardless (see the "what this has not been run against" point above).
+     Flagged explicitly as the extension point for a future step, in both this note and
+     `report.ts`'s own module comment.
+
+- **What a future operator needs to know to interpret the report, in one place (also stated on the
+  HTML page itself, not only here):** every headline number carries its own `n`, and this step's own
+  live runs prove the report reads that honestly whether `n` is 0 or 16. `hasAnyJudgedData: false` is
+  not a bug state — it is the correct, expected output until this system has actually run in
+  production and accumulated real accepted recommendations with evaluated outcomes. Once real data
+  exists, re-run `npx tsx scripts/generateCalibrationReport.ts` (against the real project — no
+  emulator flag needed, since it is read-only) to regenerate `reports/calibration-report.html`. The
+  calibration curve's `MIN_CALIBRATION_BUCKET_SIZE = 10` and the Brier/curve's implicit trust in
+  `recommendations.confidence` being the D5-adjusted value are the two constants/assumptions most
+  worth revisiting once real volume exists to tune against.
 
 ---
 

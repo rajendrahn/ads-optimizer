@@ -27,3 +27,8 @@ firebase-debug.log
 firestore-debug.log
 ui-debug.log
 *-debug.log
+
+# E3's generated calibration report/dashboard (scripts/generateCalibrationReport.ts) — a
+# point-in-time snapshot of live account data once any exists, regenerated on demand, never a
+# source artifact.
+/reports/
