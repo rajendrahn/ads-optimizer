@@ -56,15 +56,35 @@ export const DEFAULT_MAX_CHANGE_PERCENT = 20;
  * reconfirmed in C3/D2's own notes) — deliberately NOT `targetCpaMinorUnits`, which C3's own notes
  * document as a placeholder business input an operator has not yet set for this account.
  */
-const REAL_MEASURED_ACCOUNT_CPA_MINOR_UNITS = 176_163;
-
-export const DEFAULT_MIN_SPEND_MINOR_UNITS: Readonly<Record<WindowLabel, number>> =
-  Object.fromEntries(
-    Object.entries(DEFAULT_MIN_PURCHASE_FLOORS).map(([window, floor]) => [
-      window,
-      floor * REAL_MEASURED_ACCOUNT_CPA_MINOR_UNITS,
-    ]),
-  ) as Record<WindowLabel, number>;
+// ⚠️ CORRECTED after the first real production recommendation was rejected by this guardrail.
+//
+// The original derivation was `minPurchaseFloors[window] * REAL_MEASURED_ACCOUNT_CPA` (₹1,761,
+// the account-wide figure measured during the build). Its reasoning — "clearing the purchase
+// floor at this account's real CPA would need about this much spend" — is backwards in the case
+// that matters: an EFFICIENT entity reaches the purchase floor on LESS spend, and so fails the
+// floor precisely because it is performing well.
+//
+// Observed live: ad set 120239462136610171 reached 44 purchases (above the 30 floor) at a CPA of
+// ₹586, spending ₹25,764 — and was rejected for not having spent ₹52,849. The guardrail
+// disqualified it for being roughly 3x more cost-efficient than the account average.
+//
+// Sample adequacy is ALREADY enforced, by C3's `minPurchaseFloors` — that is what "is there
+// enough evidence" means here, and it is measured in purchases, not rupees. The only job left
+// for a spend floor (§20.2 lists both) is to stop the system acting where the money is trivial:
+// a 5-15% budget change on a near-zero spend is not a decision worth making or evaluating.
+//
+// So this is now an absolute, deliberately LOW materiality bar, scaled by window length rather
+// than derived from any CPA. At this account's real scale (~₹700k per 28d across ~46 delivering
+// ad sets, so ~₹15k each) these include ordinary ad sets and exclude only genuinely negligible
+// ones. They are defaults: an operator who wants a different bar sets
+// `settings/{accountId}.guardrailThresholds.minSpendMinorUnits` explicitly, and
+// `resolveGuardrailThresholds` reports which source was used.
+export const DEFAULT_MIN_SPEND_MINOR_UNITS: Readonly<Record<WindowLabel, number>> = {
+  "7d": 250_000, // INR 2,500
+  "14d": 500_000, // INR 5,000
+  "28d": 1_000_000, // INR 10,000
+  "56d": 2_000_000, // INR 20,000
+};
 
 /**
  * §20.2's "confidence reduced after very recent major edits, and for composite creatives" — a

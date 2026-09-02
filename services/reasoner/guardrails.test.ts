@@ -436,6 +436,34 @@ describe("validateGuardrails — minimum spend and purchases", () => {
     expect(v?.judgedAgainst?.actual).toBe(1_000);
   });
 
+  // Regression test for a real production rejection. The spend floor used to be derived as
+  // minPurchaseFloors[window] * the account's measured CPA (INR 1,761), which meant an
+  // EFFICIENT entity failed it precisely BECAUSE it performed well: ad set 120239462136610171
+  // reached 44 purchases (floor 30) at a CPA of INR 586, spending INR 25,764, and was rejected
+  // for not spending INR 52,849. Sample adequacy is minPurchaseFloors' job, measured in
+  // purchases; the spend floor is only a materiality bar. These are that ad set's real numbers.
+  it("does NOT reject an efficient entity that clears the purchase floor on modest spend", () => {
+    const decision = validateGuardrails(
+      input({
+        evidenceResult: evidenceResult({
+          evidence: {
+            windows: {
+              "28d": windowEvidence({
+                spendMinorUnits: 2_576_384, // INR 25,764 — real
+                metaRoas: metricSnapshot({ purchases: 44 }), // above the 30 floor — real
+              }),
+            },
+          } as never,
+        }),
+      }),
+    );
+    const spendViolation =
+      decision.outcome === "REJECTED"
+        ? decision.violations.find((x) => x.code === "MIN_SPEND_NOT_MET")
+        : undefined;
+    expect(spendViolation).toBeUndefined();
+  });
+
   it("rejects an actionable recommendation when the decision unit is NOT_DELIVERING", () => {
     const decision = validateGuardrails(
       input({

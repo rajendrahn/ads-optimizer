@@ -21,6 +21,7 @@ import { initializeApp, applicationDefault, getApps } from "firebase-admin/app";
 import {
   canonSettingsSchema,
   DEFAULT_STATISTICAL_THRESHOLDS,
+  DEFAULT_GUARDRAIL_THRESHOLDS,
   type CanonSettings,
 } from "@shared/canon/index.ts";
 import { GCP_PROJECT_ID, META_AD_ACCOUNT_ID, ANTHROPIC_MODEL } from "./config.ts";
@@ -75,6 +76,12 @@ const settings: CanonSettings = {
         ? Math.round(targetCpaRupeesArg * 100)
         : DEFAULT_STATISTICAL_THRESHOLDS.targetCpaMinorUnits,
   },
+  // Written EXPLICITLY rather than left to fall back on code defaults. `resolveGuardrailThresholds`
+  // reports which source a limit came from, and a rejection that says `source: "default"` gives an
+  // operator no idea whether anyone ever chose the number. Persisting them makes every guardrail
+  // rejection traceable to a stored, editable value - which matters because the first real
+  // production recommendation was rejected by a spend floor nobody had chosen.
+  guardrailThresholds: { ...DEFAULT_GUARDRAIL_THRESHOLDS },
 };
 
 async function main() {
