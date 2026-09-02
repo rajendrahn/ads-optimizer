@@ -6,7 +6,7 @@
 // unlike Shopify/insights, whose writes can arrive out of order). Raw pages are archived
 // verbatim, before normalization, for replay per §23.
 //
-// --- Defect fix: resumable, page-at-a-time, across invocations -------------------------
+// --- Defect fix #1: resumable, page-at-a-time, across invocations ----------------------
 //
 // B2's original handler called one `fetchAllMetaEntities(meta)` that paged every entity type
 // to exhaustion in memory, and wrote to Firestore only once everything had been fetched. On
@@ -19,8 +19,7 @@
 // The fix follows B3's `metaInsightsReportJobs`/`pollAsyncReport.ts` precedent exactly:
 // progress lives in a Firestore doc (`metaEntitySyncJobs/{runId}`, keyed by this task's own
 // runId — see shared/schema/meta.ts's module comment on `metaEntitySyncJobSchema` for the
-// full phase-machine rationale, including why campaign/ad-set/ad/creative can't simply be
-// four independent per-page-writable loops). Each invocation advances the job by up to
+// full phase-machine rationale). Each invocation advances the job by up to
 // `maxPagesPerInvocation` bounded units, saving the job doc (and flushing every Firestore
 // write via `BulkWriter#flush()`, so it's durable) after each one, BEFORE attempting the
 // next Meta call. When the budget runs out with work still remaining, or when Meta itself
@@ -31,6 +30,49 @@
 // doc. The next invocation resumes from the saved cursor rather than starting over. Nothing
 // is ever lost: the only work "at risk" when an error is thrown is the one page/chunk in
 // flight, which was never counted as done in the first place.
+//
+// --- Defect fix #2: CREATIVES narrowed to referenced ids only (this session) -----------
+//
+// Measured live, on this account, via the X-Business-Use-Case-Usage header:
+//   call_count      :   5%
+//   total_cputime   : 113%   <- over the limit, the actual binding constraint
+//   total_time      :  87%
+//   estimated_time_to_regain_access: 36 min
+//   ads_api_access_tier: development_access
+// Call count was nowhere near the limit; CPU time was. Root cause: the CREATIVES phase paged
+// EVERY creative the account has ever had (4,000+ and rising, far past B2's original ~800
+// estimate) through `/adcreatives` at page size 25, each page assembling
+// `object_story_spec`/`asset_feed_spec` — the two expensive nested objects — for 25 creatives
+// at once, while only ~47 ad-days/day actually deliver (B3's own measurement). The
+// overwhelming majority of those 4,000+ creatives belong to ads that haven't run in a long
+// time; fetching them on every sync is pure waste against a CPU-time budget, not a call-count
+// one.
+//
+// Fix: `AD_FIELDS` already requests `creative{id}` on every ad (fetch.ts), so the set of
+// creative ids this account's ads actually reference is knowable exactly, for free, once ads
+// are fetched — no extra Meta call needed to discover it. CREATIVES now runs AFTER ads
+// (former order: CREATIVES, CAMPAIGNS, ADSETS, CAMPAIGNS_RESOLVE, ADS; new order: CAMPAIGNS,
+// ADSETS, CAMPAIGNS_RESOLVE, ADS, CREATIVES, ADS_RESOLVE) and fetches ONLY the referenced ids,
+// batched via `fetchCreativesByIds`'s `?ids=a,b,c&fields=...` multi-get (fetch.ts) instead of
+// listing every creative on the account. `asset_feed_spec` is still requested in full — B8
+// needs it to type composite/dynamic creatives (`eligibleForFamilyFatigueScore: false`, §7.3)
+// — the saving is exclusively from fetching FEWER creatives, never fewer fields.
+//
+// Because an ad's `destinationUrl` is derived from its creative's `linkUrl` (normalize.ts),
+// inverting the order means ads can no longer write to Firestore the instant they're fetched:
+// the ADS phase now only fetches and BUFFERS raw ad rows (`pendingAds`) plus the deduplicated
+// set of creative ids they reference (`referencedCreativeIds`); a new terminal phase,
+// ADS_RESOLVE, writes every buffered ad once CREATIVES has populated `creativeLinkUrlById` for
+// every referenced id — the same buffer-then-resolve shape CAMPAIGNS_RESOLVE already used for
+// the minority of campaigns needing their ad sets first, applied here to the ads phase in
+// full (every ad's destinationUrl now genuinely depends on a not-yet-fetched creative, not
+// just a minority). See shared/schema/meta.ts's module comment on `metaEntitySyncJobSchema`
+// for the complete phase-by-phase rationale, the schema-compatibility decision for a job doc
+// persisted under the OLD phase order (refused outright, not reinterpreted — see
+// entitySyncJobStore.ts's `StaleMetaEntitySyncJobError`), and the consequence for B8 (a
+// creative referenced by no ad is simply never fetched; existing `metaCreatives` docs from the
+// old full-account fetch remain valid, just go stale if unreferenced — same trade-off
+// `activeOnly` already documents for campaigns/ad sets/ads).
 //
 // What "replaces each collection's docs wholesale" now means, spread across invocations:
 // it still describes the *complete, converged* state a fully-DONE run leaves behind — every
@@ -67,19 +109,22 @@ import {
   fetchAdsPage,
   fetchAdsetsPage,
   fetchCampaignsPage,
-  fetchCreativesPage,
+  fetchCreativesByIds,
 } from "./fetch.ts";
 import {
   normalizeAd,
   normalizeAdset,
   normalizeCampaign,
   normalizeCreative,
+  type RawMetaAd,
   type RawMetaCampaign,
 } from "./normalize.ts";
 import {
   createFirestoreEntitySyncJobStore,
+  StaleMetaEntitySyncJobError,
   type EntitySyncJobStore,
 } from "./entitySyncJobStore.ts";
+import { ApiError } from "../../http/errors.ts";
 
 export interface MetaSyncEntitiesPayload {
   /** Restrict every paged fetch (campaigns, ad sets, ads) to Meta's own
@@ -92,23 +137,37 @@ export interface MetaSyncEntitiesPayload {
    * Trade-off, stated plainly: an active-only sync is cheap and covers everything that is
    * actually delivering right now, but a paused/archived entity's Firestore doc simply isn't
    * re-fetched or re-written by an active-only run — it goes stale (frozen at whatever its
-   * last full sync wrote) until a subsequent full (`activeOnly: false`) sync runs. Creatives
-   * are always fetched in full either way — Meta's `/adcreatives` edge has no
-   * `effective_status` of its own (see fetch.ts's `fetchCreativesPage`). Budget-ownership
-   * resolution for a campaign whose children include paused ad sets can also be affected:
-   * an active-only ADSETS phase only sees that campaign's *active* children, so a campaign
-   * whose only budget-owning ad set happens to be paused would resolve to `UNKNOWN` instead
-   * of `ADSET` under `activeOnly: true` — another instance of the same staleness trade-off,
-   * not a separate bug. */
+   * last full sync wrote) until a subsequent full (`activeOnly: false`) sync runs. Budget-
+   * ownership resolution for a campaign whose children include paused ad sets can also be
+   * affected: an active-only ADSETS phase only sees that campaign's *active* children, so a
+   * campaign whose only budget-owning ad set happens to be paused would resolve to `UNKNOWN`
+   * instead of `ADSET` under `activeOnly: true` — another instance of the same staleness
+   * trade-off, not a separate bug.
+   *
+   * Composes automatically with the creative-narrowing fix below: creatives no longer have
+   * their own `effective_status` filter (Meta's `/adcreatives` edge has none of its own — a
+   * creative isn't active/paused, the ads that use it are), but under `activeOnly: true` the
+   * ADS phase only ever sees active ads in the first place, so `referencedCreativeIds` — and
+   * therefore the CREATIVES phase's fetch — is automatically narrowed to whatever those
+   * active ads actually reference. No separate flag needed for creatives. */
   activeOnly?: boolean;
-  /** Page-equivalent units of work (one fetched-and-written page, or one CAMPAIGNS_RESOLVE
-   * chunk) processed per invocation before saving progress and yielding back to the task
-   * framework — default 5, mirroring B3's `pollAsyncReport.ts`'s `maxPagesPerInvocation`. */
+  /** Page-equivalent units of work (one fetched page, one CAMPAIGNS_RESOLVE chunk, one
+   * CREATIVES id-batch, or one ADS_RESOLVE chunk) processed per invocation before saving
+   * progress and yielding back to the task framework — default 5, mirroring B3's
+   * `pollAsyncReport.ts`'s `maxPagesPerInvocation`. */
   maxPagesPerInvocation?: number;
   /** Pending campaigns (ones whose budget ownership needed their ad sets — see
-   * shared/schema/meta.ts's module comment) resolved per invocation "unit" during the
-   * CAMPAIGNS_RESOLVE phase — default 200. */
+   * shared/schema/meta.ts's module comment) resolved per invocation "unit" during
+   * CAMPAIGNS_RESOLVE, and pending ads (every ad, now that destinationUrl universally depends
+   * on the CREATIVES phase — see module comment) resolved per unit during ADS_RESOLVE — both
+   * phases share this one chunk size. Default 200. */
   resolveChunkSize?: number;
+  /** Referenced creative ids resolved per Meta call (one `?ids=a,b,c&fields=...` multi-get)
+   * during the CREATIVES phase — default 25, matching this account's already-confirmed-safe
+   * `/adcreatives` page limit for the identical heavy field list (see fetch.ts's module
+   * comment); the id-batch endpoint's own limit hasn't been separately verified live, per this
+   * session's no-live-Meta-calls constraint. */
+  creativeIdsBatchSize?: number;
 }
 
 function parsePayload(raw: unknown): MetaSyncEntitiesPayload {
@@ -142,13 +201,19 @@ function newJob(
     accountId,
     activeOnly,
     currency: null,
-    phase: "CREATIVES",
-    cursors: { creatives: null, campaigns: null, adsets: null, ads: null },
+    // CAMPAIGNS first now, not CREATIVES: creatives are fetched by referenced id after ADS
+    // has told us which ones any ad actually uses.
+    phase: "CAMPAIGNS",
+    cursors: { campaigns: null, adsets: null, ads: null },
+    referencedCreativeIds: [],
+    creativesResolveIndex: 0,
     creativeLinkUrlById: {},
     campaignOwnsBudgetById: {},
     pendingCampaigns: [],
     pendingCampaignAgg: {},
-    resolveIndex: 0,
+    campaignsResolveIndex: 0,
+    pendingAds: [],
+    adsResolveIndex: 0,
     counts: { creatives: 0, campaigns: 0, adsets: 0, ads: 0 },
     lastError: null,
     createdAt: now,
@@ -164,6 +229,7 @@ async function advanceJob(
   today: string,
   maxPagesPerInvocation: number,
   resolveChunkSize: number,
+  creativeIdsBatchSize: number,
 ): Promise<MetaEntitySyncJob> {
   const db = getDb();
   const meta = await ctx.getMetaClient();
@@ -182,28 +248,45 @@ async function advanceJob(
   try {
     while (job.phase !== "DONE" && unitsUsed < maxPagesPerInvocation) {
       if (job.phase === "CREATIVES") {
-        const page = await fetchCreativesPage(meta, job.cursors.creatives);
+        // Resolve only the creatives this run's ads actually reference, one batch per unit,
+        // instead of paging every creative the account has ever had. That listing was the
+        // measured cause of the CPU-time blowout (call_count 5% / total_cputime 113% on a
+        // development_access account) - the field list is unchanged and still includes
+        // asset_feed_spec, which B8 needs to type composite creatives.
+        const batch = job.referencedCreativeIds.slice(
+          job.creativesResolveIndex,
+          job.creativesResolveIndex + creativeIdsBatchSize,
+        );
+        if (batch.length === 0) {
+          // No ad referenced any creative - a free transition, no Meta call, no unit spent.
+          job = { ...job, phase: "ADS_RESOLVE", updatedAt: new Date() };
+          await jobStore.set(ctx.runId, job);
+          continue;
+        }
+        const result = await fetchCreativesByIds(meta, batch);
         unitsUsed++;
         await ctx.archiver.archive({
           source: "meta",
           day: today,
           resource: "creatives",
           runId: ctx.runId,
-          payload: page.page,
+          payload: result.page,
         });
         const creativeLinkUrlById = { ...job.creativeLinkUrlById };
-        for (const raw of page.rows) {
+        for (const raw of result.rows) {
           const doc = normalizeCreative(raw, { accountId: normalizeCtx.accountId, syncedAt });
           bulkWriter.set(creativesRef.doc(doc.creativeId), doc);
           creativeLinkUrlById[doc.creativeId] = doc.linkUrl;
         }
         await bulkWriter.flush();
+        const creativesResolveIndex = job.creativesResolveIndex + batch.length;
         job = {
           ...job,
-          cursors: { ...job.cursors, creatives: page.nextAfter },
+          creativesResolveIndex,
           creativeLinkUrlById,
-          counts: { ...job.counts, creatives: job.counts.creatives + page.rows.length },
-          phase: page.nextAfter ? "CREATIVES" : "CAMPAIGNS",
+          counts: { ...job.counts, creatives: job.counts.creatives + result.rows.length },
+          phase:
+            creativesResolveIndex >= job.referencedCreativeIds.length ? "ADS_RESOLVE" : "CREATIVES",
           updatedAt: new Date(),
         };
         await jobStore.set(ctx.runId, job);
@@ -292,8 +375,8 @@ async function advanceJob(
 
       if (job.phase === "CAMPAIGNS_RESOLVE") {
         const chunk = job.pendingCampaigns.slice(
-          job.resolveIndex,
-          job.resolveIndex + resolveChunkSize,
+          job.campaignsResolveIndex,
+          job.campaignsResolveIndex + resolveChunkSize,
         );
         if (chunk.length === 0) {
           // No pending campaigns at all (every campaign owned its own budget) — a free
@@ -311,11 +394,48 @@ async function advanceJob(
         }
         await bulkWriter.flush();
         unitsUsed++;
-        const resolveIndex = job.resolveIndex + chunk.length;
+        const campaignsResolveIndex = job.campaignsResolveIndex + chunk.length;
         job = {
           ...job,
-          resolveIndex,
-          phase: resolveIndex >= job.pendingCampaigns.length ? "ADS" : "CAMPAIGNS_RESOLVE",
+          campaignsResolveIndex,
+          phase: campaignsResolveIndex >= job.pendingCampaigns.length ? "ADS" : "CAMPAIGNS_RESOLVE",
+          updatedAt: new Date(),
+        };
+        await jobStore.set(ctx.runId, job);
+        continue;
+      }
+
+      if (job.phase === "ADS_RESOLVE") {
+        // Terminal phase: write the ads buffered during ADS, now that CREATIVES has resolved
+        // creativeLinkUrlById for every id they reference. Chunked and index-tracked exactly
+        // like CAMPAIGNS_RESOLVE, so a budget exhaustion or throttle mid-write resumes here
+        // rather than rewriting from the start of the buffer.
+        const chunk = job.pendingAds.slice(
+          job.adsResolveIndex,
+          job.adsResolveIndex + resolveChunkSize,
+        );
+        if (chunk.length === 0) {
+          // No ads at all on the account - a free transition, no Meta call, no unit spent.
+          job = { ...job, phase: "DONE", updatedAt: new Date() };
+          await jobStore.set(ctx.runId, job);
+          continue;
+        }
+        const creativeLinkUrlById = new Map(Object.entries(job.creativeLinkUrlById));
+        for (const rawUnknown of chunk) {
+          const doc = normalizeAd(rawUnknown as unknown as RawMetaAd, {
+            accountId: normalizeCtx.accountId,
+            syncedAt,
+            creativeLinkUrlById,
+          });
+          bulkWriter.set(adsRef.doc(doc.adId), doc);
+        }
+        await bulkWriter.flush();
+        unitsUsed++;
+        const adsResolveIndex = job.adsResolveIndex + chunk.length;
+        job = {
+          ...job,
+          adsResolveIndex,
+          phase: adsResolveIndex >= job.pendingAds.length ? "DONE" : "ADS_RESOLVE",
           updatedAt: new Date(),
         };
         await jobStore.set(ctx.runId, job);
@@ -332,21 +452,25 @@ async function advanceJob(
         runId: ctx.runId,
         payload: page.page,
       });
-      const creativeLinkUrlById = new Map(Object.entries(job.creativeLinkUrlById));
+      // BUFFER, do not write. An ad's destinationUrl comes from its creative's linkUrl
+      // (normalize.ts), and creatives are now fetched AFTER ads - so writing an ad here would
+      // persist it with a null destinationUrl that nothing later corrects. Buffer the raw rows
+      // and collect the creative ids they reference; ADS_RESOLVE writes them once CREATIVES has
+      // populated creativeLinkUrlById.
+      const pendingAds = [...job.pendingAds];
+      const referencedCreativeIds = new Set(job.referencedCreativeIds);
       for (const raw of page.rows) {
-        const doc = normalizeAd(raw, {
-          accountId: normalizeCtx.accountId,
-          syncedAt,
-          creativeLinkUrlById,
-        });
-        bulkWriter.set(adsRef.doc(doc.adId), doc);
+        pendingAds.push(raw as unknown as Record<string, unknown>);
+        const creativeId = (raw as { creative?: { id?: string } }).creative?.id;
+        if (creativeId) referencedCreativeIds.add(creativeId);
       }
-      await bulkWriter.flush();
       job = {
         ...job,
         cursors: { ...job.cursors, ads: page.nextAfter },
+        pendingAds,
+        referencedCreativeIds: [...referencedCreativeIds],
         counts: { ...job.counts, ads: job.counts.ads + page.rows.length },
-        phase: page.nextAfter ? "ADS" : "DONE",
+        phase: page.nextAfter ? "ADS" : "CREATIVES",
         updatedAt: new Date(),
       };
       await jobStore.set(ctx.runId, job);
@@ -374,6 +498,8 @@ export const metaSyncEntitiesHandler: TaskHandler = async (ctx) => {
   const payload = parsePayload(ctx.payload);
   const maxPagesPerInvocation = payload.maxPagesPerInvocation ?? 5;
   const resolveChunkSize = payload.resolveChunkSize ?? 200;
+  // 25 matches the page limit B2 already proved safe for this identical heavy field list.
+  const creativeIdsBatchSize = payload.creativeIdsBatchSize ?? 25;
 
   const canon = await loadReportingCanon();
   const today = toReportingDay(new Date(), canon.reportingTimezone);
@@ -381,7 +507,21 @@ export const metaSyncEntitiesHandler: TaskHandler = async (ctx) => {
   const db = getDb();
   const jobStore = createFirestoreEntitySyncJobStore(db);
 
-  let job = await jobStore.get(ctx.runId);
+  let job: MetaEntitySyncJob | null = null;
+  try {
+    job = await jobStore.get(ctx.runId);
+  } catch (err) {
+    // A job doc written under the OLD phase order cannot be resumed (its saved phase means
+    // something different now), so the store refuses it. Convert that refusal into a TERMINAL
+    // failure: taskWrapper treats a plain Error as retryable, which here would mean retrying
+    // forever against a document that can never parse - burning the Meta rate-limit budget on
+    // every attempt for a condition no retry can fix. The message already tells the operator
+    // to start a fresh runId.
+    if (err instanceof StaleMetaEntitySyncJobError) {
+      throw new ApiError(err.message, { kind: "client_error", retryable: false, raw: err.cause });
+    }
+    throw err;
+  }
   if (!job) {
     job = newJob(ctx.runId, canon.accountId, payload.activeOnly ?? false, new Date());
     await jobStore.set(ctx.runId, job);
@@ -417,6 +557,7 @@ export const metaSyncEntitiesHandler: TaskHandler = async (ctx) => {
     today,
     maxPagesPerInvocation,
     resolveChunkSize,
+    creativeIdsBatchSize,
   );
 
   if (job.phase !== "DONE") {

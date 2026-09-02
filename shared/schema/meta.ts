@@ -109,35 +109,67 @@ export type MetaCreative = z.infer<typeof metaCreativeSchema>;
 // key. Wholesale-overwritten like metaInsightsReportJobs/syncRuns — process state, not a
 // measurement, no version guard, no source `updated_at` to compare against.
 //
-// Phase order, and why it isn't simply "campaigns, ad sets, ads, creatives" in fetch order:
-// budget ownership (services/ingest/meta/entities/budgetOwnership.ts) is genuinely
-// cross-entity — a campaign reporting no budget of its own cannot be finally normalized
-// until ALL of its child ad sets are known (to tell "an ad set owns it" apart from
-// "genuinely nobody does, UNKNOWN"), and an ad's `destinationUrl` depends on its assigned
-// creative already being fetched. So:
-//   CREATIVES          -> writes immediately, no cross-entity dependency; also builds
-//                          creativeLinkUrlById for the ADS phase.
-//   CAMPAIGNS          -> a campaign with its OWN daily/lifetime budget writes immediately
-//                          (no dependency); one reporting none is buffered into
-//                          pendingCampaigns (its full raw record) rather than guessed at.
-//                          campaignOwnsBudgetById is populated for every campaign seen (the
-//                          own-budget flag only) — needed by ADSETS next.
-//   ADSETS             -> writes immediately (only needs its own parent's own-budget flag,
-//                          already known from CAMPAIGNS above); also accumulates
-//                          pendingCampaignAgg, a {count, anyOwnsBudget} aggregate per
-//                          PENDING campaign only — all determineCampaignBudgetGivenChildren
-//                          actually needs, not the full child list.
-//   CAMPAIGNS_RESOLVE  -> now that every ad set is known, finally writes the (on this
-//                          account, small) set of campaigns that couldn't be resolved during
-//                          CAMPAIGNS, chunked like any other phase.
-//   ADS                -> writes immediately (creativeLinkUrlById already complete).
+// --- Second defect fix: CREATIVES narrowed to referenced ids only (this session) ----------
+//
+// Measured live (X-Business-Use-Case-Usage header) on this account: the CREATIVES phase alone
+// was the binding constraint — `total_cputime: 113%` (over budget) against `call_count: 5%`
+// (nowhere near it). Root cause: the original CREATIVES phase paged Meta's `/adcreatives` edge
+// to fetch EVERY creative the account has EVER had (4,000+ and rising — far past B2's original
+// ~800 estimate) at page size 25 (this account's own confirmed-safe limit for this heavy field
+// list — see fetch.ts), each page assembling `object_story_spec`/`asset_feed_spec` for 25
+// creatives at once. Only a small fraction of those 4,000+ creatives are attached to any ad
+// this account still runs (B3 measured ~47 active ad-days/day of real delivery) — the rest are
+// years of accumulated history nobody needs fetched again on every sync.
+//
+// Fix: since `fetchAllAds`/`fetchAdsPage` already requests `creative{id}` on every ad (see
+// fetch.ts's AD_FIELDS), the set of creative ids this account's ads actually reference is
+// knowable exactly, for free, as a byproduct of the ADS phase — no separate Meta call needed
+// to discover it. So CREATIVES now runs AFTER ads are known, and fetches ONLY those referenced
+// ids, batched via Meta's `?ids=a,b,c&fields=...` multi-get syntax (fetchCreativesByIds in
+// fetch.ts) instead of listing every creative on the account. `asset_feed_spec` is still
+// requested — B8 needs it to type composite/dynamic creatives — the saving is exclusively from
+// fetching FEWER creatives, not fewer fields per creative.
+//
+// This inverts the old CREATIVES-first ordering and, because an ad's `destinationUrl` is
+// derived from its creative's `linkUrl` (see normalize.ts's `normalizeAd`), it also means ads
+// can no longer write to Firestore the moment they're fetched — the ADS phase now only fetches
+// and buffers raw ad rows (`pendingAds`) plus the set of creative ids they reference
+// (`referencedCreativeIds`); a new terminal phase, ADS_RESOLVE, writes them once CREATIVES has
+// populated `creativeLinkUrlById` for every referenced id. This is the same buffer-then-resolve
+// shape CAMPAIGNS_RESOLVE already used for the minority of campaigns that needed their ad sets
+// first — here it applies to the ads phase in full, because under the new order EVERY ad's
+// destinationUrl genuinely depends on a not-yet-fetched creative, not just a minority.
+//
+// New phase order (was CREATIVES, CAMPAIGNS, ADSETS, CAMPAIGNS_RESOLVE, ADS, DONE):
+//   CAMPAIGNS          -> unchanged: a campaign with its OWN daily/lifetime budget writes
+//                          immediately; one reporting none is buffered into pendingCampaigns.
+//   ADSETS             -> unchanged: writes immediately; accumulates pendingCampaignAgg.
+//   CAMPAIGNS_RESOLVE  -> unchanged: writes the (small) set of campaigns needing their ad sets.
+//   ADS                -> fetches and BUFFERS every raw ad row into `pendingAds` (no Firestore
+//                          write yet — see above) and accumulates `referencedCreativeIds`
+//                          (deduplicated `creative.id` across every ad seen).
+//   CREATIVES          -> resolves `referencedCreativeIds` in batches (fetchCreativesByIds,
+//                          one Meta call per batch, NOT a Meta cursor — `creativesResolveIndex`
+//                          is an index into the array), writes each fetched creative
+//                          immediately (no cross-entity dependency of its own) and builds
+//                          `creativeLinkUrlById`.
+//   ADS_RESOLVE        -> now that creativeLinkUrlById is complete, finally writes every
+//                          buffered ad with its real destinationUrl, chunked like any other
+//                          phase (no Meta call — pure Firestore write from already-fetched data).
 //   DONE               -> terminal; a redelivered/duplicate invocation after this is a no-op.
+//
+// Existing-job compatibility, deliberately NOT preserved: this schema's shape changed enough
+// (renamed/new required fields, `cursors.creatives` removed entirely) that a job doc written
+// under the OLD phase order fails `metaEntitySyncJobSchema.parse()` outright when read back —
+// see entitySyncJobStore.ts's `StaleMetaEntitySyncJobError`. This is deliberate: a job doc
+// persisted mid-run under the old order (phase `CREATIVES` meant "page every creative on the
+// account", not "resolve this run's referenced ids") would be actively wrong to reinterpret
+// under the new phase's meaning — refusing it with a clear, terminal error and asking the
+// operator to start a new run (new runId) is the honest choice, not a silent guess.
 //
 // On the real account most campaigns (B2 measured 369/410 live) own their budget directly
 // and so write during the CAMPAIGNS phase itself — CAMPAIGNS_RESOLVE only ever revisits the
-// minority (B2: 37 ad-set-owned + 4 UNKNOWN) that need their children first. "Write each
-// page as it is fetched" holds for the overwhelming majority of entities; a small, bounded
-// remainder is deferred out of genuine necessity, not convenience.
+// minority (B2: 37 ad-set-owned + 4 UNKNOWN) that need their children first.
 //
 // Known, accepted limitation (shared with B3's own long-running paged job, not new here):
 // Meta's cursor-based pagination has no snapshot-token guarantee against concurrent
@@ -145,14 +177,24 @@ export type MetaCreative = z.infer<typeof metaCreativeSchema>;
 // shift a cursor across invocations spanning real wall-clock time. Low-probability at this
 // account's real churn rate; not solvable without a fundamentally different (and Meta does
 // not offer one) pagination primitive.
+//
+// Consequence for B8 (creative identity, services/ingest/meta/creative/): a creative referenced
+// by NO ad is simply never fetched/refreshed by this task any more — B8's `creativeFamilies`
+// are built from `metaCreatives`, which is what an ad's `creativeId` actually resolves against,
+// so this doesn't weaken the family-building §11.1 cares about. `metaCreatives` docs already
+// written under the old full-account fetch (including this account's 4,000+ from the mid-run
+// job this fix predates) remain valid — same fields, same normalizeCreative — they simply stop
+// being refreshed if nothing currently references them, going stale exactly like a
+// paused/archived campaign under `activeOnly: true` already does; not a new kind of gap.
 // ---------------------------------------------------------------------------------------
 
 export const metaEntitySyncPhaseSchema = z.enum([
-  "CREATIVES",
   "CAMPAIGNS",
   "ADSETS",
   "CAMPAIGNS_RESOLVE",
   "ADS",
+  "CREATIVES",
+  "ADS_RESOLVE",
   "DONE",
 ]);
 export type MetaEntitySyncPhase = z.infer<typeof metaEntitySyncPhaseSchema>;
@@ -167,11 +209,20 @@ export const metaEntitySyncJobSchema = z.object({
   currency: z.string().length(3).nullable(), // fetched once, cached (first invocation only)
   phase: metaEntitySyncPhaseSchema,
   cursors: z.object({
-    creatives: z.string().nullable(),
     campaigns: z.string().nullable(),
     adsets: z.string().nullable(),
     ads: z.string().nullable(),
+    // Deliberately no `creatives` cursor — CREATIVES no longer pages a Meta cursor; it
+    // resolves `referencedCreativeIds` by index (`creativesResolveIndex` below). Its absence
+    // here is also what makes a pre-fix job doc (which HAS `cursors.creatives`, being an
+    // extra/unknown key zod silently drops) fail to parse: this field's REMOVAL isn't what
+    // rejects an old doc, the new REQUIRED fields below are — see module comment.
   }),
+  // Creative ids referenced by at least one fetched ad (raw `creative.id`), deduplicated,
+  // accumulated across every ADS page. What makes CREATIVES fetch only what this run's ads
+  // actually need instead of every creative the account has ever had.
+  referencedCreativeIds: z.array(z.string()),
+  creativesResolveIndex: z.number().int().nonnegative(), // cursor into referencedCreativeIds
   creativeLinkUrlById: z.record(z.string(), z.string().nullable()),
   campaignOwnsBudgetById: z.record(z.string(), z.boolean()),
   // Full raw campaign records that couldn't be resolved during CAMPAIGNS — this schema
@@ -182,10 +233,16 @@ export const metaEntitySyncJobSchema = z.object({
     z.string(),
     z.object({ count: z.number().int().nonnegative(), anyOwnsBudget: z.boolean() }),
   ),
-  resolveIndex: z.number().int().nonnegative(), // cursor into pendingCampaigns
+  campaignsResolveIndex: z.number().int().nonnegative(), // cursor into pendingCampaigns (was `resolveIndex`)
+  // Full raw ad rows fetched during ADS, buffered (opaque here, same reasoning as
+  // pendingCampaigns above — cast to RawMetaAd at the call site) until CREATIVES resolves
+  // creativeLinkUrlById for every id they reference, then written in ADS_RESOLVE.
+  pendingAds: z.array(z.record(z.string(), z.unknown())),
+  adsResolveIndex: z.number().int().nonnegative(), // cursor into pendingAds
   // Cumulative rows FETCHED per entity type across every invocation so far — not necessarily
   // all written yet (a pending campaign is fetched during CAMPAIGNS but written later, during
-  // CAMPAIGNS_RESOLVE); see entitySync.ts for the write-count distinction.
+  // CAMPAIGNS_RESOLVE; every ad is fetched during ADS but written later, during ADS_RESOLVE);
+  // see entitySync.ts for the write-count distinction.
   counts: z.object({
     creatives: z.number().int().nonnegative(),
     campaigns: z.number().int().nonnegative(),

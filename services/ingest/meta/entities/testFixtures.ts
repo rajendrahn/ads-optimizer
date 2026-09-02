@@ -66,7 +66,13 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
     callCounts.set(edge, n);
     return n === 1;
   }
-  return vi.fn(async (url: string | URL | Request) => {
+  // Every creative id the code under test actually asked Meta for. Exposed on the returned
+  // mock so a test can assert the CREATIVES phase requests ONLY referenced ids - the whole
+  // point of the narrowing fix, and not otherwise observable from Firestore state alone
+  // (an unreferenced creative that is never fetched and one that is fetched but writes the
+  // same doc are indistinguishable after the fact).
+  const requestedCreativeIds: string[] = [];
+  const impl = vi.fn(async (url: string | URL | Request) => {
     const u = new URL(url as string);
     if (u.pathname.endsWith(`/${META_AD_ACCOUNT_ID}`)) return jsonResponse({ currency: "INR" });
     if (u.pathname.endsWith("/campaigns")) {
@@ -194,6 +200,48 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
         ],
       });
     }
+    // Multi-get by id: `?ids=a,b,c&fields=...` addresses objects at the bare API-version root
+    // rather than under /{account}/adcreatives, which is why this lands on "/v21.0" with no
+    // resource segment. This is the path the CREATIVES phase now uses, fetching only the
+    // creative ids the run's ads actually reference instead of listing the whole account.
+    // Meta returns an OBJECT keyed by id (not a `data` array), and silently omits any id it
+    // has nothing for - both reproduced here.
+    const idsParam = u.searchParams.get("ids");
+    if (idsParam) {
+      if (shouldInjectFailure("adcreatives")) return rateLimitedResponse();
+      const known: Record<string, unknown> = {
+        cr_standard: {
+          id: "cr_standard",
+          name: "Standard creative",
+          image_hash: "hash1",
+          object_story_spec: {
+            link_data: {
+              link: "https://sparkleandglow.co.in/?utm_content=ad_standard",
+              message: "body text",
+              name: "headline",
+            },
+          },
+        },
+        cr_composite: {
+          id: "cr_composite",
+          name: "Composite creative",
+          asset_feed_spec: { images: [{ hash: "a1" }, { hash: "b2" }] },
+          object_story_spec: {
+            link_data: { link: "https://sparkleandglow.co.in/?utm_content=ad_composite" },
+          },
+        },
+      };
+      const body: Record<string, unknown> = {};
+      for (const id of idsParam.split(",")) {
+        const hit = known[id];
+        // An unknown id is simply absent from the response, matching Meta's documented
+        // multi-get behaviour - never an error, and never a fabricated placeholder.
+        if (hit) body[id] = hit;
+        requestedCreativeIds.push(id);
+      }
+      return jsonResponse(body);
+    }
     throw new Error(`unexpected path in test fixture: ${u.pathname}`);
   });
+  return Object.assign(impl, { requestedCreativeIds });
 }

@@ -8,6 +8,21 @@
 // requested returns an HTTP 500 ("Please reduce the amount of data you're asking for") at
 // limit=100 on this account, but succeeds at limit=25. Campaigns/ad sets/ads use only
 // shallow fields and page cleanly at 100-200.
+//
+// --- Creative-narrowing fix (this session) --------------------------------------------------
+// Meta's `X-Business-Use-Case-Usage` header, measured live on this account, showed the binding
+// constraint on META_SYNC_ENTITIES was CPU time (`total_cputime: 113%`, over budget), not call
+// count (`call_count: 5%`) — root-caused to `fetchAllCreatives`/the old CREATIVES phase paging
+// EVERY creative the account has ever had (4,000+, still growing) through `/adcreatives`, each
+// page assembling `object_story_spec`/`asset_feed_spec` for 25 creatives at once. Most of those
+// creatives belong to ads nobody runs any more. `fetchCreativesByIds` below fetches only
+// creatives actually referenced by this run's ads (known from `AD_FIELDS`'s `creative{id}` —
+// see entitySync.ts's ADS/CREATIVES phases for how the referenced-id set is collected and
+// consumed), via Meta's `?ids=a,b,c&fields=...` multi-get syntax — one call per batch instead
+// of one call per 25-creative page of the ENTIRE account. `fetchAllCreatives` (unchanged,
+// still used by `fetchAllMetaEntities`/`configSnapshot.ts` — deliberately out of scope for this
+// session, see IMPLEMENTATION_PLAN.md B2 notes) still fetches every creative; only
+// META_SYNC_ENTITIES's own CREATIVES phase was switched to the narrower fetch.
 
 import { META_AD_ACCOUNT_ID } from "../../../../scripts/config.ts";
 import type { MetaClient } from "../client.ts";
@@ -134,15 +149,50 @@ export function fetchAdsPage(
   );
 }
 
-/** One page of creatives, resumable via `after`. No `activeOnly` parameter at all (rather
- * than a silently-ignored one) — Meta's /adcreatives edge has no `effective_status` concept
- * of its own (a creative isn't active/paused; the ads that use it are), so there is nothing
- * for the flag to do here. */
-export function fetchCreativesPage(
+export interface CreativeIdsBatchFetchResult {
+  rows: RawMetaCreative[];
+  /** The raw multi-get response body — archived verbatim by the caller (§23). `null` when
+   * `ids` was empty (no call made). */
+  page: unknown;
+}
+
+/** Fetch a batch of creatives by id in ONE request, via Meta's `?ids=a,b,c&fields=...`
+ * multi-get syntax at the bare API-version root (ids are globally addressable Graph API
+ * object ids, not scoped under `/{account}/adcreatives` — no cursor pagination applies here,
+ * this is a single request for exactly the ids given). This is what replaces "page every
+ * creative on the account" with "fetch only the ones this run's ads reference" — see this
+ * file's module comment and IMPLEMENTATION_PLAN.md B2's creative-narrowing notes for the
+ * measured CPU-time defect this fixes. `entitySync.ts`'s CREATIVES phase chunks the full
+ * referenced-id set and calls this once per chunk, treating each call as one bounded unit of
+ * work, same as any other phase.
+ *
+ * An id Meta doesn't return anything for (deleted/inaccessible) is simply absent from the
+ * response object and therefore from `rows` — not surfaced as a per-id error here, matching
+ * Meta's own documented multi-get behaviour (a missing id is silently omitted).
+ *
+ * Batch size is the caller's concern (`entitySync.ts`'s `creativeIdsBatchSize`, default 25) —
+ * chosen to match this account's already-confirmed-safe `/adcreatives` page limit for this
+ * identical heavy field list (see this file's module comment); not independently verified live
+ * for the `?ids=` endpoint specifically, since this session's safety constraints forbid any
+ * live Meta call. If a real run ever hits the same "reduce the amount of data" error at 25 via
+ * this endpoint, lower `creativeIdsBatchSize` the same way B2 originally found 25 for the
+ * cursor-paginated edge — the fetch primitive itself needs no change. */
+export async function fetchCreativesByIds(
   meta: MetaClient,
-  after: string | null,
-): Promise<MetaPageFetchResult<RawMetaCreative>> {
-  return fetchOnePage(meta, `/${META_AD_ACCOUNT_ID}/adcreatives`, CREATIVE_FIELDS, 25, after);
+  ids: string[],
+): Promise<CreativeIdsBatchFetchResult> {
+  if (ids.length === 0) return { rows: [], page: null };
+  const { data } = await meta.get<Record<string, unknown>>("", {
+    ids: ids.join(","),
+    fields: CREATIVE_FIELDS,
+  });
+  const rows: RawMetaCreative[] = [];
+  for (const value of Object.values(data)) {
+    if (value && typeof value === "object" && "id" in value) {
+      rows.push(value as RawMetaCreative);
+    }
+  }
+  return { rows, page: data };
 }
 
 /** One minimal live call: the ad account's own billing currency, authoritative for

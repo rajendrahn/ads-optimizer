@@ -60,6 +60,35 @@ afterAll(async () => {
   await cleanupCollections();
 });
 
+/**
+ * Drives a run to DONE, re-invoking with the SAME runId the way Cloud Tasks redelivery does.
+ *
+ * A complete sync no longer fits one invocation: the phase machine is
+ * CAMPAIGNS -> ADSETS -> CAMPAIGNS_RESOLVE -> ADS -> CREATIVES -> ADS_RESOLVE, which is six
+ * bounded units against a default `maxPagesPerInvocation` of 5, so the handler correctly
+ * yields with "more work remaining" before finishing. That is the resumable design working,
+ * not a regression - so a test asserting the FINAL state has to drive the run to completion
+ * rather than assume one call does it.
+ */
+async function driveToCompletion(
+  runId: string,
+  client: MetaClient,
+  payload: unknown = {},
+  maxInvocations = 20,
+) {
+  let last: Awaited<ReturnType<typeof metaSyncEntitiesHandler>> | undefined;
+  for (let i = 0; i < maxInvocations; i++) {
+    try {
+      last = await metaSyncEntitiesHandler(makeCtx(runId, client, payload));
+      return last;
+    } catch (err) {
+      // "more work remaining" is the documented yield; anything else is a real failure.
+      if (!/more work remaining/i.test(err instanceof Error ? err.message : String(err))) throw err;
+    }
+  }
+  throw new Error(`run ${runId} did not reach DONE within ${maxInvocations} invocations`);
+}
+
 function makeCtx(runId: string, client: MetaClient, payload: unknown = {}) {
   return {
     runId,
@@ -96,7 +125,7 @@ async function countAllEntityDocs(): Promise<number> {
 
 describe("metaSyncEntitiesHandler (emulator)", () => {
   it("populates all four collections with correctly normalized data, budget ownership included", async () => {
-    const result = await metaSyncEntitiesHandler(makeCtx("run_1", newTestClient()));
+    const result = await driveToCompletion("run_1", newTestClient());
 
     expect(result.newRowCount).toBe(3 + 2 + 3 + 2); // campaigns + adsets + ads + creatives
     expect(result.summary).toEqual({ campaigns: 3, adsets: 2, ads: 3, creatives: 2 });
@@ -146,8 +175,8 @@ describe("metaSyncEntitiesHandler (emulator)", () => {
   });
 
   it("re-running produces no duplicates — the same Meta IDs are simply overwritten", async () => {
-    await metaSyncEntitiesHandler(makeCtx("run_1", newTestClient()));
-    await metaSyncEntitiesHandler(makeCtx("run_2", newTestClient()));
+    await driveToCompletion("run_1", newTestClient());
+    await driveToCompletion("run_2", newTestClient());
 
     const campaignDocs = await db.collection(COLLECTIONS.metaCampaigns).listDocuments();
     expect(campaignDocs).toHaveLength(3); // not 6 — same 3 IDs, overwritten in place
@@ -157,6 +186,31 @@ describe("metaSyncEntitiesHandler (emulator)", () => {
     expect(adDocs).toHaveLength(3);
     const creativeDocs = await db.collection(COLLECTIONS.metaCreatives).listDocuments();
     expect(creativeDocs).toHaveLength(2);
+  });
+
+  // The point of the creative-narrowing fix, and NOT observable from Firestore state alone:
+  // a creative that is never fetched and one that is fetched but writes an identical doc look
+  // the same afterwards. Only the request log distinguishes them, which is why the fixture
+  // records every requested id.
+  it("fetches ONLY the creative ids referenced by ads, never the whole account", async () => {
+    const fetchImpl = buildTestFetchImpl();
+    const client = new MetaClient({
+      accessToken: "tok",
+      fetchImpl,
+      sleepImpl: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await driveToCompletion("run_narrow", client);
+
+    const requested = [...new Set(fetchImpl.requestedCreativeIds)].sort();
+    // The fixture's ads reference exactly these two; ad_no_creative references none.
+    expect(requested).toEqual(["cr_composite", "cr_standard"]);
+    // And the account listing endpoint - the expensive one that assembled
+    // object_story_spec/asset_feed_spec for every creative ever - is never called at all.
+    const listingCalls = fetchImpl.mock.calls.filter(([url]) =>
+      String(url).includes("/adcreatives"),
+    );
+    expect(listingCalls).toHaveLength(0);
   });
 });
 
@@ -244,7 +298,7 @@ describe("metaSyncEntitiesHandler (emulator) — convergence across retries (def
     const client = newTestClient();
     const runId = "run_done_twice";
 
-    const first = await metaSyncEntitiesHandler(makeCtx(runId, client));
+    const first = await driveToCompletion(runId, client);
     expect(first.newRowCount).toBe(10);
     const countAfterFirst = await countAllEntityDocs();
     expect(countAfterFirst).toBe(10);
