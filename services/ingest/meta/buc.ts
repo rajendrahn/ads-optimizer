@@ -38,6 +38,15 @@ export interface BucUsageEntry {
   totalTime: number;
   /** Minutes; >0 means Meta is already throttling this key. */
   estimatedTimeToRegainAccess: number;
+  /** Meta's own `ads_api_access_tier`, e.g. "development_access" | "standard_access".
+   *
+   * Worth capturing because it reframes a throttle from "we called too much" to "the ceiling
+   * is low and no client-side backoff will raise it". This account reports
+   * `development_access`, which is why repeated 80004s appeared during the build and on the
+   * first production sync despite pre-emptive throttling working correctly. Raising it needs
+   * Advanced Access to the Marketing API (App Review + Business Verification) — an
+   * out-of-band, human process, not a code change. */
+  adsApiAccessTier?: string;
 }
 
 export interface ParsedBucUsage {
@@ -86,6 +95,8 @@ export function parseBucHeader(headerValue: string | null | undefined): ParsedBu
         totalCpuTime: toFiniteNumber(rec.total_cputime),
         totalTime: toFiniteNumber(rec.total_time),
         estimatedTimeToRegainAccess: toFiniteNumber(rec.estimated_time_to_regain_access),
+        adsApiAccessTier:
+          typeof rec.ads_api_access_tier === "string" ? rec.ads_api_access_tier : undefined,
       });
     }
   }
@@ -139,10 +150,15 @@ export function decideBucBackoff(
   // for hours.
   if (usage.maxEstimatedMinutesToRegainAccess > 0) {
     const waitMs = Math.min(usage.maxEstimatedMinutesToRegainAccess * 60_000, 15 * 60_000);
+    // Name the tier in the reason when Meta gives it: on development_access the ceiling itself
+    // is the problem, and an operator reading this log should know that waiting longer is not
+    // the fix.
+    const tier = usage.entries.find((e) => e.adsApiAccessTier)?.adsApiAccessTier;
+    const tierNote = tier ? ` (ads_api_access_tier=${tier})` : "";
     return {
       shouldThrottle: true,
       waitMs,
-      reason: `Meta reports active throttling; estimated_time_to_regain_access=${usage.maxEstimatedMinutesToRegainAccess}min`,
+      reason: `Meta reports active throttling; estimated_time_to_regain_access=${usage.maxEstimatedMinutesToRegainAccess}min${tierNote}`,
     };
   }
 
