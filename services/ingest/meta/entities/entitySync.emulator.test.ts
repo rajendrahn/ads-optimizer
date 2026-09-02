@@ -41,6 +41,7 @@ async function cleanupCollections() {
     COLLECTIONS.metaAdsets,
     COLLECTIONS.metaAds,
     COLLECTIONS.metaCreatives,
+    COLLECTIONS.metaEntitySyncJobs,
     COLLECTIONS.settings,
   ]) {
     const snaps = await db.collection(name).listDocuments();
@@ -59,11 +60,11 @@ afterAll(async () => {
   await cleanupCollections();
 });
 
-function makeCtx(runId: string, client: MetaClient) {
+function makeCtx(runId: string, client: MetaClient, payload: unknown = {}) {
   return {
     runId,
     taskType: "META_SYNC_ENTITIES",
-    payload: {},
+    payload,
     archiver: dummyArchiver,
     getMetaClient: async () => client,
     getShopifyClient: async () => {
@@ -73,12 +74,24 @@ function makeCtx(runId: string, client: MetaClient) {
   };
 }
 
-function newTestClient(): MetaClient {
+function newTestClient(options: Parameters<typeof buildTestFetchImpl>[0] = {}): MetaClient {
   return new MetaClient({
     accessToken: "tok",
-    fetchImpl: buildTestFetchImpl(),
+    fetchImpl: buildTestFetchImpl(options),
     sleepImpl: vi.fn().mockResolvedValue(undefined),
   });
+}
+
+async function countAllEntityDocs(): Promise<number> {
+  const counts = await Promise.all(
+    [
+      COLLECTIONS.metaCampaigns,
+      COLLECTIONS.metaAdsets,
+      COLLECTIONS.metaAds,
+      COLLECTIONS.metaCreatives,
+    ].map(async (name) => (await db.collection(name).listDocuments()).length),
+  );
+  return counts.reduce((a, b) => a + b, 0);
 }
 
 describe("metaSyncEntitiesHandler (emulator)", () => {
@@ -144,5 +157,102 @@ describe("metaSyncEntitiesHandler (emulator)", () => {
     expect(adDocs).toHaveLength(3);
     const creativeDocs = await db.collection(COLLECTIONS.metaCreatives).listDocuments();
     expect(creativeDocs).toHaveLength(2);
+  });
+});
+
+describe("metaSyncEntitiesHandler (emulator) — convergence across retries (defect fix)", () => {
+  it("makes forward progress every invocation under a tight per-invocation page budget, and resumes past a mid-run rate limit, ending with every entity present", async () => {
+    // maxPagesPerInvocation:1 forces the run to span many invocations even though this small
+    // fixture's every entity type fits in a single Meta page — CREATIVES, CAMPAIGNS, ADSETS,
+    // CAMPAIGNS_RESOLVE and ADS are each their own bounded unit of work. `failFirstCallTo:
+    // "adsets"` makes the FIRST live attempt at the /adsets edge return Meta's real
+    // production error (code 80004, a retryable ApiError per classifyMetaError's whole-
+    // 80000-family fix) instead of data; every later attempt at that edge succeeds normally
+    // — proving the handler saves progress and resumes rather than restarting from page one.
+    const client = newTestClient({ failFirstCallTo: "adsets" });
+    const runId = "run_converge";
+    const payload = { maxPagesPerInvocation: 1 };
+
+    const docCountsAfterEachInvocation: number[] = [];
+    const outcomes: ("threw" | "succeeded")[] = [];
+    let finalResult: Awaited<ReturnType<typeof metaSyncEntitiesHandler>> | undefined;
+
+    for (let invocation = 0; invocation < 20 && !finalResult; invocation++) {
+      try {
+        finalResult = await metaSyncEntitiesHandler(makeCtx(runId, client, payload));
+        outcomes.push("succeeded");
+      } catch {
+        // Expected for every non-final invocation — B3's own "more work remains" pattern
+        // (see entitySync.ts's module comment): the handler throws a plain retryable Error
+        // (or, on the injected-failure invocation, propagates the rate-limited ApiError)
+        // whenever the job isn't fully DONE yet. taskWrapper.ts is what actually turns this
+        // into a redelivery in production; this test drives the handler directly, in a loop,
+        // to prove the SAME thing taskWrapper's redelivery would.
+        outcomes.push("threw");
+      }
+      docCountsAfterEachInvocation.push(await countAllEntityDocs());
+    }
+
+    expect(finalResult).toBeDefined();
+    // Every invocation before the last one threw (mirrors pollAsyncReport.ts's "more pages
+    // remain" pattern) — including the one where the injected rate limit hit. The run still
+    // converged despite that.
+    expect(outcomes.slice(0, -1).every((o) => o === "threw")).toBe(true);
+    expect(outcomes.at(-1)).toBe("succeeded");
+
+    // The core convergence claim: never zero after the first invocation that actually wrote
+    // anything, and never decreasing — including across the invocation that hit the injected
+    // rate limit (that invocation's fetch failed before writing anything new, so its count
+    // legitimately repeats the previous one rather than growing, but it must never regress).
+    for (let i = 1; i < docCountsAfterEachInvocation.length; i++) {
+      expect(docCountsAfterEachInvocation[i]).toBeGreaterThanOrEqual(
+        docCountsAfterEachInvocation[i - 1],
+      );
+    }
+    expect(docCountsAfterEachInvocation[0]).toBeGreaterThan(0); // first invocation already wrote something
+    expect(docCountsAfterEachInvocation.at(-1)).toBe(10); // 3 campaigns + 2 adsets + 3 ads + 2 creatives
+    // Strictly increasing across the invocations that actually advance the job (i.e.
+    // excluding the one that repeated a count because the injected rate limit hit before any
+    // write) — proves real forward progress happened at every genuine step, not just at the
+    // very end.
+    const advancingCounts = [...new Set(docCountsAfterEachInvocation)];
+    expect(advancingCounts).toEqual([...advancingCounts].sort((a, b) => a - b));
+    expect(advancingCounts.length).toBeGreaterThan(1);
+
+    // Final state: every entity present, correctly normalized — same assertions as the
+    // single-invocation "Done when" test above, now proven reachable via many invocations.
+    const campaignsRepo = createRepository(db, COLLECTIONS.metaCampaigns, metaCampaignSchema);
+    expect((await campaignsRepo.get("cmp_cbo"))?.budget?.ownerLevel).toBe("CAMPAIGN");
+    expect(await campaignsRepo.get("cmp_abo")).not.toBeNull();
+    expect((await campaignsRepo.get("cmp_abo"))?.budget).toBeNull();
+    expect((await campaignsRepo.get("cmp_orphan"))?.budget?.ownerLevel).toBe("UNKNOWN");
+    const adsetsRepo = createRepository(db, COLLECTIONS.metaAdsets, metaAdsetSchema);
+    expect(await adsetsRepo.get("as_under_cbo")).not.toBeNull();
+    expect(await adsetsRepo.get("as_under_abo")).not.toBeNull();
+    const adsRepo = createRepository(db, COLLECTIONS.metaAds, metaAdSchema);
+    expect(await adsRepo.get("ad_standard")).not.toBeNull();
+    expect(await adsRepo.get("ad_composite")).not.toBeNull();
+    expect(await adsRepo.get("ad_no_creative")).not.toBeNull();
+    const creativesRepo = createRepository(db, COLLECTIONS.metaCreatives, metaCreativeSchema);
+    expect(await creativesRepo.get("cr_standard")).not.toBeNull();
+    expect(await creativesRepo.get("cr_composite")).not.toBeNull();
+
+    expect(finalResult?.newRowCount).toBe(10);
+  });
+
+  it("is idempotent: re-invoking an already-DONE run (same runId) is a safe no-op", async () => {
+    const client = newTestClient();
+    const runId = "run_done_twice";
+
+    const first = await metaSyncEntitiesHandler(makeCtx(runId, client));
+    expect(first.newRowCount).toBe(10);
+    const countAfterFirst = await countAllEntityDocs();
+    expect(countAfterFirst).toBe(10);
+
+    // Same runId, already DONE — the job-doc short-circuit (mirrors B3's DONE-phase no-op).
+    const second = await metaSyncEntitiesHandler(makeCtx(runId, client));
+    expect(second.newRowCount).toBe(0);
+    expect(second.summary).toMatchObject({ phase: "DONE" });
+    expect(await countAllEntityDocs()).toBe(countAfterFirst); // unchanged, nothing duplicated
   });
 });

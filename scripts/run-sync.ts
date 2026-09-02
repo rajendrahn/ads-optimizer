@@ -23,6 +23,7 @@
 // WRITES TO PRODUCTION. Every write goes through A2's monotonic version guard, so re-running
 // is safe and cannot move a record backwards - but it is real data in a real database.
 
+import { randomUUID } from "node:crypto";
 import { initializeApp, applicationDefault, getApps } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { handleSyncTaskDispatch } from "@services/ingest/sync/runtime.ts";
@@ -79,8 +80,22 @@ async function main() {
     `retry       : ${noRetry ? "disabled" : `up to ${maxAttempts} attempts / ${maxHours}h`}`,
   );
 
+  // ONE taskId for the whole retry loop, not one per attempt.
+  //
+  // This is load-bearing, not tidiness. taskWrapper derives `runId = opts.taskId ?? randomUUID()`,
+  // and a resumable task keys its progress by that runId (META_SYNC_ENTITIES stores its phase and
+  // paging cursors in metaEntitySyncJobs/{runId}). Omitting taskId therefore mints a fresh runId
+  // per attempt, which means a brand-new empty job document, which means every retry restarts
+  // from page one - exactly the non-convergence this retry loop exists to fix. Passing a stable
+  // id makes a retry RESUME: taskWrapper short-circuits an already-SUCCEEDED taskId and
+  // re-attempts a RUNNING/FAILED one.
+  const taskId = flagValue("--task-id") ?? randomUUID();
+  console.log(`taskId      : ${taskId}`);
+  console.log(`              (re-run later with --task-id ${taskId} to resume this same job)`);
+
   const deadline = Date.now() + maxHours * 3_600_000;
   let attempt = 0;
+  let progressYields = 0;
 
   for (;;) {
     attempt += 1;
@@ -88,7 +103,7 @@ async function main() {
     console.log(`--- attempt ${attempt}${noRetry ? "" : ` of ${maxAttempts}`} ---`);
 
     const startedAt = Date.now();
-    const result = await handleSyncTaskDispatch({ taskType, payload });
+    const result = await handleSyncTaskDispatch({ taskType, payload, taskId });
     const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
 
     console.log(`HTTP status : ${result.status}`);
@@ -110,7 +125,7 @@ async function main() {
 
     if (result.body.status === "SUCCEEDED") {
       console.log("");
-      console.log(`SUCCEEDED after ${attempt} attempt(s).`);
+      console.log(`SUCCEEDED after ${attempt} attempt(s), ${progressYields} resumed chunk(s).`);
       return;
     }
 
@@ -126,6 +141,22 @@ async function main() {
       console.log("read the error above (auth, payload or a genuine bug).");
       process.exitCode = 1;
       return;
+    }
+
+    // A resumable task yields between chunks by throwing a retryable error that says so — this
+    // is NORMAL PROGRESS, not a failure. Treating it like one would apply the same exponential
+    // backoff used for a throttle, so a sync needing ~10 chunked invocations would crawl for
+    // hours instead of finishing in minutes. Continue almost immediately, and do not let these
+    // consume the failure budget, which exists for things that are actually going wrong.
+    const isProgressYield = /more work remaining|will resume on retry/i.test(
+      result.body.error ?? "",
+    );
+    if (isProgressYield && !noRetry && Date.now() < deadline) {
+      progressYields += 1;
+      attempt -= 1; // does not count against maxAttempts
+      console.log(`  -> partial progress saved; continuing (chunk ${progressYields})`);
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      continue;
     }
 
     if (noRetry) {

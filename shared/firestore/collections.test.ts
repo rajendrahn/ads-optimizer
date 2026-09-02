@@ -26,6 +26,10 @@ describe("COLLECTIONS", () => {
       // Not one of §8's named collections — B3's own async-report-job bookkeeping, see
       // shared/schema/meta.ts's module comment on metaInsightsReportJobSchema.
       "metaInsightsReportJobs",
+      // Not one of §8's named collections either — the post-B2 defect fix's resumable-paging
+      // bookkeeping for META_SYNC_ENTITIES, see shared/schema/meta.ts's module comment on
+      // metaEntitySyncJobSchema.
+      "metaEntitySyncJobs",
       // Not one of §8's named collections either — B7's AUDIT_AD_URL_TAGS output, see
       // shared/schema/meta.ts's module comment on adUrlTagAuditSchema.
       "adUrlTagAudits",

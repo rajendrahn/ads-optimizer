@@ -38,15 +38,39 @@ export interface TestFetchImplOptions {
   cmpCboDailyBudget?: string;
   /** cmp_cbo's `status` — parameterized so B4's tests can simulate a status edit the same way. */
   cmpCboStatus?: string;
+  /** Post-B2 defect-fix tests: the FIRST call to this edge returns a Meta rate-limit error
+   * (code 80004, the exact production error — classifyMetaError's whole 80000 family is
+   * retryable) instead of the real fixture data; every subsequent call to that same edge
+   * (a resumed/retried invocation) succeeds normally. Lets a test prove
+   * `metaSyncEntitiesHandler` saves progress and resumes past a mid-run rate limit rather
+   * than restarting. */
+  failFirstCallTo?: "campaigns" | "adsets" | "ads" | "adcreatives";
+}
+
+function rateLimitedResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      error: { code: 80004, message: "User request limit reached", type: "OAuthException" },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  );
 }
 
 export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
   const cmpCboDailyBudget = options.cmpCboDailyBudget ?? "50000";
   const cmpCboStatus = options.cmpCboStatus ?? "ACTIVE";
+  const callCounts = new Map<string, number>();
+  function shouldInjectFailure(edge: TestFetchImplOptions["failFirstCallTo"]): boolean {
+    if (!options.failFirstCallTo || options.failFirstCallTo !== edge) return false;
+    const n = (callCounts.get(edge) ?? 0) + 1;
+    callCounts.set(edge, n);
+    return n === 1;
+  }
   return vi.fn(async (url: string | URL | Request) => {
     const u = new URL(url as string);
     if (u.pathname.endsWith(`/${META_AD_ACCOUNT_ID}`)) return jsonResponse({ currency: "INR" });
     if (u.pathname.endsWith("/campaigns")) {
+      if (shouldInjectFailure("campaigns")) return rateLimitedResponse();
       return jsonResponse({
         data: [
           {
@@ -80,6 +104,7 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
       });
     }
     if (u.pathname.endsWith("/adsets")) {
+      if (shouldInjectFailure("adsets")) return rateLimitedResponse();
       return jsonResponse({
         data: [
           {
@@ -106,6 +131,7 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
       });
     }
     if (u.pathname.endsWith("/ads")) {
+      if (shouldInjectFailure("ads")) return rateLimitedResponse();
       return jsonResponse({
         data: [
           {
@@ -142,6 +168,7 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
       });
     }
     if (u.pathname.endsWith("/adcreatives")) {
+      if (shouldInjectFailure("adcreatives")) return rateLimitedResponse();
       return jsonResponse({
         data: [
           {

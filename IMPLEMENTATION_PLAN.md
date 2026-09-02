@@ -1013,6 +1013,18 @@ Meta API calls were made against the real ad account during planning and verific
 write/mutating call of any kind); see Notes for what the real account structure turned out to
 be — materially bigger than §7.1's "under 100 ads" assumption. No live/production Firestore
 was touched; no cloud resource was created, modified or deployed.
+
+**Post-B2 update (this session): a real production defect in `META_SYNC_ENTITIES` was found
+and fixed** — the handler was all-or-nothing (fetch everything, write nothing until every page
+of every entity type had landed), which cannot converge under this account's actual
+development-access-tier call budget; four consecutive production runs wrote zero documents.
+Fixed by making the handler resumable across invocations, following B3's
+`metaInsightsReportJobs` precedent. `npm run check` and `npm run test:integration` both still
+pass in full after the fix (892/892 unit tests across 104 files, 312/312 integration tests
+across 36 files, as of this session — see the dedicated note below for what's new specifically).
+No live Meta call was made verifying this fix — fakes and the Firestore emulator only, per this
+session's explicit safety constraints. See "Post-B2 defect fix" note below for the full
+account.
 **Depends on:** B1, A3
 **Design refs:** §7.1, §9.1, §9.2
 
@@ -1203,6 +1215,144 @@ it does not know.
   move, or delete it (out of scope, and deleting someone else's in-progress file without
   being asked is not this step's call) — flagging it so whoever owns B5/SETUP.md's PII
   handling notices before it's accidentally committed.
+
+- **Post-B2 defect fix (later session): `META_SYNC_ENTITIES` could not converge in
+  production, and now does.**
+
+  **The defect, as observed live.** `ads_api_access_tier` in this account's own BUC header
+  confirmed `development_access` (a much tighter call budget than `standard_access`), and B2's
+  own live measurement above already recorded the real account at 410 campaigns/534 ad
+  sets/1,139 ads — an order of magnitude past §7.1's sizing assumption. The original handler
+  called one `fetchAllMetaEntities(meta)` that paged every entity type to exhaustion in memory
+  and wrote to Firestore only once everything had been fetched (`entitySync.ts`'s original
+  body: a loop over `fetched.campaigns.pages`/`.adsets.pages`/`.ads.pages`/`.creatives.pages`
+  for archiving, then one `BulkWriter` pass over every normalized row, all after the full
+  fetch). Under this account's real budget, the fetch itself hits Meta's error 80004
+  (Business-Use-Case throttle) partway through every time. Because nothing had been written
+  yet when that happened, a retry restarted from page one and died at the same wall — four
+  consecutive production runs left `syncRuns` with four correctly-recorded FAILED entries and
+  zero documents in `metaCampaigns`/`metaAdsets`/`metaAds`/`metaCreatives`. `classifyMetaError`
+  was also fixed just before this session to treat the whole 80000 code family as retryable
+  (previously some of that family fell through to the terminal `client_error` branch — see
+  `services/ingest/meta/errors.ts`'s own comment on this), which is a precondition for any
+  retry-based fix working at all; that fix is not itself part of this note.
+
+  **The fix — follows B3's `metaInsightsReportJobs`/`pollAsyncReport.ts` shape exactly, per
+  this session's explicit instruction to reuse it rather than invent a new pattern.** Progress
+  now lives in a new Firestore doc per run, `metaEntitySyncJobs/{runId}` (keyed by the task's
+  own `runId` — B1's own idempotency key, stable across a Cloud Tasks redelivery of the same
+  task, unlike B3's job doc which is keyed by Meta's own `report_run_id` since insights has no
+  equivalent of its own). Each invocation advances the job through a phase machine —
+  `CREATIVES → CAMPAIGNS → ADSETS → CAMPAIGNS_RESOLVE → ADS → DONE` — by up to
+  `payload.maxPagesPerInvocation` (default 5, mirroring B3) bounded units of work, saving the
+  job doc (and flushing every Firestore write via `BulkWriter#flush()`, so it's durable) after
+  each one, **before** attempting the next Meta call. When the budget runs out with work still
+  remaining, or Meta itself rate-limits (a retryable `ApiError` per the 80000-family fix above),
+  the handler throws — a plain `Error` for "budget exhausted" (literally B3's own pattern), or
+  the original `ApiError` unchanged for "Meta said no" (simpler than B3's case: B3 manufactures
+  a throw for an in-band non-error condition, "still polling"; ours is already a genuine thrown
+  exception, already correctly classified retryable, so it's just left to propagate after a
+  `lastError` observability marker is saved to the job doc) — and `taskWrapper.ts`'s
+  `runSyncTask` classifies either as retryable, redelivering the same task id onto the same
+  `syncRuns` doc. The next invocation resumes from the saved cursor. Full design rationale,
+  including exactly why the phase order isn't simply "campaigns, ad sets, ads, creatives" in
+  fetch order, is in `shared/schema/meta.ts`'s module comment on `metaEntitySyncJobSchema` and
+  `services/ingest/meta/entities/entitySync.ts`'s own module comment — summarized:
+
+  - **Why four phases instead of one loop per entity type.** Budget ownership
+    (`budgetOwnership.ts`) is genuinely cross-entity: a campaign reporting no budget of its own
+    cannot be finally normalized until ALL of its child ad sets are known (to tell "an ad set
+    owns it" apart from "genuinely nobody does, UNKNOWN" — exactly the distinction B2's own
+    notes above required D1 to be able to see). An ad's `destinationUrl` similarly depends on
+    its creative already being fetched (unchanged from B2). So creatives write immediately (no
+    dependency); a campaign with its own budget writes immediately; a campaign with none is
+    buffered (its full raw record, plus a `{count, anyOwnsBudget}` aggregate per pending
+    campaign built while paging ad sets — not the full child ad-set list, which is never
+    buffered) and finally resolved in `CAMPAIGNS_RESOLVE`, once every ad set is known; ads write
+    immediately once creatives are done. On the real account (B2's own live numbers: 369/410
+    campaigns own budget outright), the overwhelming majority of entities still write on their
+    very first page — `CAMPAIGNS_RESOLVE` only ever revisits the minority that generically
+    cannot be resolved without their children. "Write each page as it is fetched" (this
+    session's requirement) holds for that majority; the small remainder is a genuine, bounded,
+    documented exception, not an evasion of the requirement.
+  - **Idempotency, unchanged from B2's own design.** Every write is still keyed directly by
+    Meta's own entity ID and still not version-guarded (`shared/schema/meta.ts`'s existing
+    module comment on why: Meta is the source of truth for current config state) — re-writing a
+    page, whether from a genuine retry or a duplicate redelivery, is naturally idempotent. A
+    job already in phase `DONE` short-circuits to a no-op on a redelivered/duplicate invocation
+    (mirrors B3's own `DONE`-phase handling), covered by a dedicated emulator test.
+  - **What "a successful run replaces each collection's docs wholesale" now means, spread
+    across invocations (this session's explicit question to answer).** It still describes the
+    *complete, converged* end state a fully-`DONE` run leaves behind — every entity Meta
+    returned gets its Firestore doc written at least once. What it no longer means is
+    "atomically, at one instant": a long-running job (under a tight budget, potentially over
+    many invocations and real wall-clock time) writes different entities at different moments,
+    so mid-run the collections are a mix of this run's freshest fetch and the previous run's
+    stale-but-present state for anything not yet reached. This was already true in spirit
+    before this fix — a single-invocation run still took nonzero time to fetch ~2,600+
+    documents, and the writes were never one atomic Firestore transaction either — this fix
+    just widens that pre-existing window from seconds to potentially much longer; it does not
+    change what "wholesale replace" was ever actually guaranteeing.
+  - **Entities that vanish from Meta between (partial) runs (this session's other explicit
+    question).** Unchanged by this fix, either direction. Neither the original handler nor this
+    one ever deletes a Firestore doc for an entity Meta stops returning — both only ever
+    upsert whatever the current fetch actually returns. B4's own notes above already document
+    this exact gap for change-event derivation ("an entity that disappears entirely from Meta's
+    fetch between two runs ... produces no removed event"). This fix does not add to, remove,
+    or paper over that gap; it is simply orthogonal to it — spreading the fetch across
+    invocations doesn't make a vanished entity any more or less detectable than it already
+    wasn't.
+
+  **The second lever — an opt-in `activeOnly` payload flag.** `payload.activeOnly` (default
+  `false`, i.e. unchanged full/historical behaviour) restricts the CAMPAIGNS/ADSETS/ADS pages
+  to Meta's own `effective_status=["ACTIVE"]` filter — confirmed live during B2's original
+  planning to work identically on all three of those edges (creatives have no
+  `effective_status` of their own; always fetched in full). B3 separately measured this
+  account's *real delivery* at only ~47 active ad-days/day, so an active-only sync is cheap
+  and covers everything that is actually generating data right now — the trade-off, stated in
+  `entitySync.ts`'s own payload doc comment: a paused/archived entity's Firestore doc is simply
+  never re-fetched or re-written by an active-only run, and goes stale (frozen at whatever its
+  last full sync wrote) until a subsequent full (`activeOnly: false`) sync runs; budget-
+  ownership resolution for a campaign whose only budget-owning ad set happens to be paused is
+  affected the same way (resolves to `UNKNOWN` instead of `ADSET` under `activeOnly: true`,
+  since that ad set is invisible to an active-only ADSETS phase) — not a separate bug, the same
+  staleness trade-off applied consistently. An operator opts in per-invocation via the task
+  payload (`{ activeOnly: true }`); nothing defaults to it.
+
+  **Verification (this session; live Meta calls were explicitly out of scope — fakes and the
+  Firestore emulator only).** New: `services/ingest/meta/entities/entitySyncJobStore.ts` (mirrors
+  `reportJobStore.ts`), `metaEntitySyncJobSchema`/`metaEntitySyncPhaseSchema`
+  (`shared/schema/meta.ts`), the `metaEntitySyncJobs` collection
+  (`shared/firestore/collections.ts`, collection count 34 → 35, `collections.test.ts` and
+  `test/firestore.rules.emulator.test.ts` updated to match), and single-page fetch primitives
+  `fetchCampaignsPage`/`fetchAdsetsPage`/`fetchAdsPage`/`fetchCreativesPage` alongside the
+  existing fetch-everything helpers in `fetch.ts` (unchanged, still used by
+  `META_SNAPSHOT_CONFIG` — see below). `entitySync.emulator.test.ts` gained two new tests
+  against a real Firestore emulator (4 total in that file now, up from B2's original 2): a
+  convergence test — a fake Meta client (`testFixtures.ts`'s `buildTestFetchImpl` gained a
+  `failFirstCallTo` option returning Meta's real error 80004 on the first call to one chosen
+  edge, succeeding on every later call) driving the handler in a loop under
+  `maxPagesPerInvocation: 1`, asserting every invocation but the last throws, the live
+  Firestore document count across all four collections never decreases and is never zero after
+  the first invocation, strictly increases across every invocation that actually advances the
+  job (5 distinct values: 2 → 3 → 5 → 7 → 10, the rate-limited invocation legitimately
+  repeating rather than growing), and the final state exactly matches B2's original
+  "Done when" assertions (all entities present, budget ownership including the UNKNOWN case
+  still correct) — and a same-`runId`-after-`DONE` idempotency test proving a duplicate
+  invocation of a completed run is a safe no-op (`newRowCount: 0`, doc counts unchanged). Full
+  results this session: `npm run check` clean (typecheck both projects + web, lint, lint:web,
+  format:check, 892/892 unit tests across 104 files, 12/12 web tests across 2 files) and
+  `npm run test:integration` 312/312 across 36 files, including the new convergence/idempotency
+  tests. No live Meta call was made verifying any of this.
+
+  **`META_SNAPSHOT_CONFIG` was deliberately NOT touched — it has the same shape of exposure and
+  is not fixed here.** It still calls the original `fetchAllMetaEntities` (unchanged, still used
+  by `configSnapshot.ts`) and so is still capable of the same all-or-nothing budget-exhaustion
+  failure this note just fixed for `META_SYNC_ENTITIES`. This session's task was scoped
+  explicitly to `META_SYNC_ENTITIES`; `META_SNAPSHOT_CONFIG` (and, by extension, B4's change-
+  event derivation, which runs inside it) is flagged here for whoever picks it up next, the
+  same way B2's own notes above flag things for later steps rather than silently leaving them
+  for someone to rediscover.
 
 ---
 

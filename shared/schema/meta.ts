@@ -93,6 +93,116 @@ export const metaCreativeSchema = z.object({
 export type MetaCreative = z.infer<typeof metaCreativeSchema>;
 
 // ---------------------------------------------------------------------------------------
+// metaEntitySyncJobs/{runId} — resumable-paging bookkeeping for META_SYNC_ENTITIES (defect
+// fix landed after B2: production is on Meta's development-access tier and this account is
+// 410 campaigns/534 ad sets/1,139 ads, far past §7.1's "under 100 ads" assumption — a full
+// paginate-and-normalize pass exhausted the account's call budget partway through every
+// time, and the original handler bought no progress across retries at all: every invocation
+// re-fetched page one of every entity type and died at the same budget wall (Meta error
+// 80004). Mirrors B3's metaInsightsReportJobs pattern exactly — advance by exactly one
+// bounded chunk of work per invocation, save BEFORE the next Meta call, throw a plain
+// retryable Error when more work remains so the task framework redelivers the SAME task id
+// onto the SAME syncRuns doc and the next invocation resumes from the saved cursor — except
+// keyed by the task's OWN runId (not a Meta-minted id): entity sync has no external async
+// job the way an insights report does, so `runId` (== the syncRuns doc id, stable across a
+// redelivery of the same task per taskWrapper.ts's own idempotency contract) is the natural
+// key. Wholesale-overwritten like metaInsightsReportJobs/syncRuns — process state, not a
+// measurement, no version guard, no source `updated_at` to compare against.
+//
+// Phase order, and why it isn't simply "campaigns, ad sets, ads, creatives" in fetch order:
+// budget ownership (services/ingest/meta/entities/budgetOwnership.ts) is genuinely
+// cross-entity — a campaign reporting no budget of its own cannot be finally normalized
+// until ALL of its child ad sets are known (to tell "an ad set owns it" apart from
+// "genuinely nobody does, UNKNOWN"), and an ad's `destinationUrl` depends on its assigned
+// creative already being fetched. So:
+//   CREATIVES          -> writes immediately, no cross-entity dependency; also builds
+//                          creativeLinkUrlById for the ADS phase.
+//   CAMPAIGNS          -> a campaign with its OWN daily/lifetime budget writes immediately
+//                          (no dependency); one reporting none is buffered into
+//                          pendingCampaigns (its full raw record) rather than guessed at.
+//                          campaignOwnsBudgetById is populated for every campaign seen (the
+//                          own-budget flag only) — needed by ADSETS next.
+//   ADSETS             -> writes immediately (only needs its own parent's own-budget flag,
+//                          already known from CAMPAIGNS above); also accumulates
+//                          pendingCampaignAgg, a {count, anyOwnsBudget} aggregate per
+//                          PENDING campaign only — all determineCampaignBudgetGivenChildren
+//                          actually needs, not the full child list.
+//   CAMPAIGNS_RESOLVE  -> now that every ad set is known, finally writes the (on this
+//                          account, small) set of campaigns that couldn't be resolved during
+//                          CAMPAIGNS, chunked like any other phase.
+//   ADS                -> writes immediately (creativeLinkUrlById already complete).
+//   DONE               -> terminal; a redelivered/duplicate invocation after this is a no-op.
+//
+// On the real account most campaigns (B2 measured 369/410 live) own their budget directly
+// and so write during the CAMPAIGNS phase itself — CAMPAIGNS_RESOLVE only ever revisits the
+// minority (B2: 37 ad-set-owned + 4 UNKNOWN) that need their children first. "Write each
+// page as it is fetched" holds for the overwhelming majority of entities; a small, bounded
+// remainder is deferred out of genuine necessity, not convenience.
+//
+// Known, accepted limitation (shared with B3's own long-running paged job, not new here):
+// Meta's cursor-based pagination has no snapshot-token guarantee against concurrent
+// mutation of the underlying listing — an entity created/deleted mid-run could in principle
+// shift a cursor across invocations spanning real wall-clock time. Low-probability at this
+// account's real churn rate; not solvable without a fundamentally different (and Meta does
+// not offer one) pagination primitive.
+// ---------------------------------------------------------------------------------------
+
+export const metaEntitySyncPhaseSchema = z.enum([
+  "CREATIVES",
+  "CAMPAIGNS",
+  "ADSETS",
+  "CAMPAIGNS_RESOLVE",
+  "ADS",
+  "DONE",
+]);
+export type MetaEntitySyncPhase = z.infer<typeof metaEntitySyncPhaseSchema>;
+
+export const metaEntitySyncJobSchema = z.object({
+  runId: z.string().min(1), // = the syncRuns id that owns this job — see module comment
+  accountId: z.string().min(1),
+  // This fix's own addition (payload.activeOnly) — restrict every paged entity fetch to
+  // Meta's effective_status=["ACTIVE"]. See entitySync.ts's payload comment for the
+  // operator-facing trade-off (cheap, covers what delivers; leaves paused/archived stale).
+  activeOnly: z.boolean(),
+  currency: z.string().length(3).nullable(), // fetched once, cached (first invocation only)
+  phase: metaEntitySyncPhaseSchema,
+  cursors: z.object({
+    creatives: z.string().nullable(),
+    campaigns: z.string().nullable(),
+    adsets: z.string().nullable(),
+    ads: z.string().nullable(),
+  }),
+  creativeLinkUrlById: z.record(z.string(), z.string().nullable()),
+  campaignOwnsBudgetById: z.record(z.string(), z.boolean()),
+  // Full raw campaign records that couldn't be resolved during CAMPAIGNS — this schema
+  // doesn't know Meta's wire shape (that's services/ingest/meta/entities/normalize.ts's
+  // RawMetaCampaign), so it's opaque here; cast at the call site.
+  pendingCampaigns: z.array(z.record(z.string(), z.unknown())),
+  pendingCampaignAgg: z.record(
+    z.string(),
+    z.object({ count: z.number().int().nonnegative(), anyOwnsBudget: z.boolean() }),
+  ),
+  resolveIndex: z.number().int().nonnegative(), // cursor into pendingCampaigns
+  // Cumulative rows FETCHED per entity type across every invocation so far — not necessarily
+  // all written yet (a pending campaign is fetched during CAMPAIGNS but written later, during
+  // CAMPAIGNS_RESOLVE); see entitySync.ts for the write-count distinction.
+  counts: z.object({
+    creatives: z.number().int().nonnegative(),
+    campaigns: z.number().int().nonnegative(),
+    adsets: z.number().int().nonnegative(),
+    ads: z.number().int().nonnegative(),
+  }),
+  // Observability only, never branched on — the last error (e.g. a rate-limit ApiError's
+  // message) that interrupted an invocation, if any. Progress itself is never at risk from
+  // this: every field above is saved after a unit of work completes, before the next Meta
+  // call is attempted, so an error here never rolls back already-completed work.
+  lastError: z.string().nullable(),
+  createdAt: firestoreTimestamp,
+  updatedAt: firestoreTimestamp,
+});
+export type MetaEntitySyncJob = z.infer<typeof metaEntitySyncJobSchema>;
+
+// ---------------------------------------------------------------------------------------
 // metaInsightsDaily/{adId}_{date} — §9.5's given example key. Version-guarded (B3): see
 // shared/firestore/versionGuard.ts. `sourceUpdatedAt` here is the *fetch/reconciliation
 // timestamp*, not a per-row field Meta provides — see that module's comment for why.

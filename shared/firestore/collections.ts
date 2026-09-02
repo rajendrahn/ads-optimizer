@@ -37,6 +37,10 @@ export const COLLECTIONS = {
   // B3's async-report-job bookkeeping — not one of §8's named collections; see
   // shared/schema/meta.ts's module comment on metaInsightsReportJobSchema for why.
   metaInsightsReportJobs: "metaInsightsReportJobs",
+  // Post-B2 defect fix's own resumable-paging bookkeeping for META_SYNC_ENTITIES — same
+  // category as metaInsightsReportJobs above; see shared/schema/meta.ts's module comment on
+  // metaEntitySyncJobSchema for why.
+  metaEntitySyncJobs: "metaEntitySyncJobs",
   // B7's AUDIT_AD_URL_TAGS output — also not one of §8's named collections; see
   // shared/schema/meta.ts's module comment on adUrlTagAuditSchema for why.
   adUrlTagAudits: "adUrlTagAudits",
@@ -116,7 +120,9 @@ function assertValidIdSegment(segment: string, label: string): string {
 // metaCampaigns/{campaignId}, metaAdsets/{adsetId}, metaAds/{adId}, metaCreatives/{creativeId},
 // metaInsightsReportJobs/{reportRunId} (Meta's own async report job id — naturally idempotent:
 // re-submitting the same window twice cannot collide since Meta mints a fresh id per submission,
-// and every phase transition of one job writes to the same doc keyed by its own id)
+// and every phase transition of one job writes to the same doc keyed by its own id), and
+// metaEntitySyncJobs/{runId} (the task's own runId, not a Meta id — see
+// shared/schema/meta.ts's module comment on metaEntitySyncJobSchema).
 // ---------------------------------------------------------------------------------------
 
 /** metaInsightsDaily/{adId}_{date} — §9.5's given example. `date` is a reportingDay string. */
