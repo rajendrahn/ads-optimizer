@@ -13,6 +13,10 @@
 // what it doesn't yet know, rather than hardcoding a URL that doesn't exist.
 
 import { getSecret, SECRET_NAMES } from "@shared/secrets/index.ts";
+import {
+  SYNC_TASK_DISPATCH_URL,
+  SYNC_TASKS_SERVICE_ACCOUNT_EMAIL,
+} from "../../../../scripts/config.ts";
 import { createDefaultTaskQueueClient, type TaskQueueClient } from "../../sync/taskQueue.ts";
 import {
   handleShopifyWebhookRequest,
@@ -27,8 +31,14 @@ import {
 // documented provisioning example.
 const QUEUE_LOCATION = process.env.SYNC_TASKS_QUEUE_LOCATION ?? "asia-south1";
 const QUEUE_NAME = process.env.SYNC_TASKS_QUEUE_NAME ?? "sync-tasks";
-const TASK_DISPATCH_URL = process.env.SYNC_TASK_DISPATCH_URL;
-const TASK_SERVICE_ACCOUNT_EMAIL = process.env.SYNC_TASKS_SERVICE_ACCOUNT_EMAIL;
+// Env var first (so another environment can override), falling back to the committed
+// deployment identifier. The fallback exists because `firebase deploy --only functions` manages
+// this service's environment and drops variables set by hand with `gcloud run services update` —
+// without it, a routine redeploy silently reverts the receiver to throwing on every webhook,
+// with no code change to point at. See scripts/config.ts's own comment.
+const TASK_DISPATCH_URL = process.env.SYNC_TASK_DISPATCH_URL ?? SYNC_TASK_DISPATCH_URL;
+const TASK_SERVICE_ACCOUNT_EMAIL =
+  process.env.SYNC_TASKS_SERVICE_ACCOUNT_EMAIL ?? SYNC_TASKS_SERVICE_ACCOUNT_EMAIL;
 
 let cachedDeps: HandleShopifyWebhookDeps | undefined;
 

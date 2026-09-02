@@ -15,6 +15,20 @@ export const ANTHROPIC_MODEL = "claude-fable-5";
 // (asia-south1), IAM-only access — never the client-facing default Firebase Storage bucket.
 export const RAW_ARCHIVE_BUCKET = "sng-meta-ads-optimizer-archive";
 
+// The deployed `syncTaskDispatch` Cloud Function's HTTPS URL — the Cloud Tasks target the
+// Shopify webhook receiver enqueues onto (B6's `SYNC_TASK_DISPATCH_URL`).
+//
+// Kept HERE, in source control, rather than only as a deployed env var. Setting it by hand with
+// `gcloud run services update` works exactly until the next `firebase deploy --only functions`,
+// which manages that service's environment and silently drops anything it does not know about —
+// so the webhook receiver would start throwing again with no code change to explain it. It is a
+// non-secret deployment identifier, the same category as the bucket and ad-account id above.
+// An env var of the same name still wins where one is set (see webhooks/runtime.ts), so a
+// second environment can override it without editing this file.
+export const SYNC_TASK_DISPATCH_URL = "https://synctaskdispatch-tferenuybq-el.a.run.app";
+export const SYNC_TASKS_SERVICE_ACCOUNT_EMAIL =
+  "sync-functions@sng-meta-ads-optimizer.iam.gserviceaccount.com";
+
 // B5: the restricted bucket holding the one-time Matrixify order-history export(s) — never
 // the general raw archive bucket above (SETUP.md §3: this file carries customer identifiers,
 // so it gets its own IAM-scoped bucket, readable only by `sync-functions` and the project
