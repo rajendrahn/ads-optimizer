@@ -46,12 +46,20 @@ export interface ShopifySyncOrdersPayload {
    * meaningfully more expensive than a flat resource page — default kept conservative in
    * graphqlFetch.ts). */
   pageSize?: number;
+  /** Reporting day (YYYY-MM-DD) to start from, overriding the stored watermark. ONLY for
+   * deliberately closing a `syncState.knownGaps` hole — an incremental run starts at the
+   * watermark, which sits after the gap, so it can never fill one. Omit for normal runs. */
+  since?: string;
 }
 
 function parsePayload(raw: unknown): ShopifySyncOrdersPayload {
   if (typeof raw !== "object" || raw === null) return {};
   const pageSize = (raw as { pageSize?: unknown }).pageSize;
-  return { pageSize: typeof pageSize === "number" ? pageSize : undefined };
+  const since = (raw as { since?: unknown }).since;
+  return {
+    pageSize: typeof pageSize === "number" ? pageSize : undefined,
+    since: typeof since === "string" ? since : undefined,
+  };
 }
 
 export const shopifySyncOrdersHandler: TaskHandler = async (ctx) => {
@@ -63,9 +71,24 @@ export const shopifySyncOrdersHandler: TaskHandler = async (ctx) => {
   const syncStore = createFirestoreSyncStore(db);
   const priorState = await syncStore.getSyncState(stateKey);
 
-  const sinceInstant = priorState?.lastDataDate
-    ? reportingDayToUtcRange(priorState.lastDataDate, canon.reportingTimezone).startUtc
-    : new Date(0); // no watermark yet — Shopify's own scope bounds this, see module comment
+  // An explicit `since` overrides the watermark, for closing a KNOWN historical gap. Normal
+  // incremental runs must never pass it: starting before the watermark re-fetches data already
+  // held, and the whole point of the watermark is not doing that.
+  //
+  // This exists because `syncState.knownGaps` records a real hole ([2025-12-14, 2026-07-05) on
+  // this account) that an incremental sync structurally cannot fill — it starts at the
+  // watermark, which sits AFTER the gap, so the gap would persist forever no matter how often
+  // the task ran. Closing it needs a deliberate, operator-chosen start date. Safe to re-run:
+  // every write goes through A2's version guard, so re-fetching an order already held cannot
+  // move it backwards.
+  const sinceOverride = payload.since
+    ? reportingDayToUtcRange(payload.since, canon.reportingTimezone).startUtc
+    : null;
+  const sinceInstant =
+    sinceOverride ??
+    (priorState?.lastDataDate
+      ? reportingDayToUtcRange(priorState.lastDataDate, canon.reportingTimezone).startUtc
+      : new Date(0)); // no watermark yet — Shopify's own scope bounds this, see module comment
 
   const client = await ctx.getShopifyClient();
 
