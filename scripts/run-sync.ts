@@ -7,9 +7,17 @@
 // service account, so it does not prove that SA's permissions. Use it for the first run
 // because the diagnostics are immediate; use the deployed function to validate IAM.
 //
+// RETRIES AUTOMATICALLY. A retryable failure (rate limit, transient 5xx) is retried with
+// exponential backoff and jitter until it succeeds, the attempt budget runs out, or the wall-
+// clock budget does - so a Meta throttle no longer needs a human to come back in an hour and
+// re-run. A TERMINAL failure (bad token, malformed payload) stops immediately: retrying it
+// cannot help and would spend the rate-limit budget the retryable case needs.
+//
 // Run:
 //   npx tsx scripts/run-sync.ts                          # list task types, write nothing
-//   npx tsx scripts/run-sync.ts META_SYNC_ENTITIES       # run one task for real
+//   npx tsx scripts/run-sync.ts META_SYNC_ENTITIES       # run, auto-retrying on throttle
+//   npx tsx scripts/run-sync.ts META_SYNC_ENTITIES --max-attempts 20 --max-hours 12
+//   npx tsx scripts/run-sync.ts META_SYNC_ENTITIES --no-retry
 //   npx tsx scripts/run-sync.ts META_SYNC_INSIGHTS --payload '{"since":"2026-08-24","until":"2026-08-30"}'
 //
 // WRITES TO PRODUCTION. Every write goes through A2's monotonic version guard, so re-running
@@ -60,40 +68,105 @@ async function main() {
   const rawPayload = flagValue("--payload");
   const payload: unknown = rawPayload ? JSON.parse(rawPayload) : {};
 
-  console.log(`project  : ${GCP_PROJECT_ID}  (PRODUCTION)`);
-  console.log(`task     : ${taskType}`);
-  console.log(`payload  : ${JSON.stringify(payload)}`);
-  console.log("");
-  console.log("running...");
+  const maxAttempts = Number(flagValue("--max-attempts") ?? 12);
+  const maxHours = Number(flagValue("--max-hours") ?? 6);
+  const noRetry = args.includes("--no-retry");
 
-  const startedAt = Date.now();
-  const result = await handleSyncTaskDispatch({ taskType, payload });
-  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+  console.log(`project     : ${GCP_PROJECT_ID}  (PRODUCTION)`);
+  console.log(`task        : ${taskType}`);
+  console.log(`payload     : ${JSON.stringify(payload)}`);
+  console.log(
+    `retry       : ${noRetry ? "disabled" : `up to ${maxAttempts} attempts / ${maxHours}h`}`,
+  );
 
-  console.log("");
-  console.log(`HTTP status : ${result.status}`);
-  console.log(`runId       : ${result.body.runId}`);
-  console.log(`status      : ${result.body.status}`);
-  if (result.body.error) console.log(`error       : ${result.body.error}`);
-  if (result.body.summary) console.log(`summary     : ${JSON.stringify(result.body.summary)}`);
-  console.log(`elapsed     : ${elapsed}s`);
+  const deadline = Date.now() + maxHours * 3_600_000;
+  let attempt = 0;
 
-  // The syncRuns document is the durable record; print it so the run can be inspected without
-  // a second tool.
-  const run = await db.collection("syncRuns").doc(result.body.runId).get();
-  if (run.exists) {
-    const d = run.data() ?? {};
+  for (;;) {
+    attempt += 1;
     console.log("");
-    console.log("syncRuns entry:");
-    console.log(`  taskType    : ${d.taskType}`);
-    console.log(`  status      : ${d.status}`);
-    console.log(`  startedAt   : ${d.startedAt?.toDate?.()?.toISOString?.() ?? d.startedAt}`);
-    console.log(`  finishedAt  : ${d.finishedAt?.toDate?.()?.toISOString?.() ?? d.finishedAt}`);
-    if (d.error) console.log(`  error       : ${JSON.stringify(d.error)}`);
-  }
+    console.log(`--- attempt ${attempt}${noRetry ? "" : ` of ${maxAttempts}`} ---`);
 
-  if (result.body.status !== "SUCCEEDED") {
-    process.exitCode = 1;
+    const startedAt = Date.now();
+    const result = await handleSyncTaskDispatch({ taskType, payload });
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+    console.log(`HTTP status : ${result.status}`);
+    console.log(`runId       : ${result.body.runId}`);
+    console.log(`status      : ${result.body.status}`);
+    if (result.body.error) console.log(`error       : ${result.body.error}`);
+    if (result.body.summary) console.log(`summary     : ${JSON.stringify(result.body.summary)}`);
+    console.log(`elapsed     : ${elapsed}s`);
+
+    // The syncRuns document is the durable record; print it so a run can be inspected without
+    // reaching for a second tool.
+    const run = await db.collection("syncRuns").doc(result.body.runId).get();
+    if (run.exists) {
+      const d = run.data() ?? {};
+      console.log(
+        `syncRuns    : ${d.status} (${d.startedAt?.toDate?.()?.toISOString?.() ?? d.startedAt})`,
+      );
+    }
+
+    if (result.body.status === "SUCCEEDED") {
+      console.log("");
+      console.log(`SUCCEEDED after ${attempt} attempt(s).`);
+      return;
+    }
+
+    // B1's own convention, reused rather than re-derived: httpHandler.ts maps a RETRYABLE
+    // failure to HTTP 500 (so Cloud Tasks redelivers) and a TERMINAL one to HTTP 200 carrying
+    // the real outcome, because Cloud Tasks has no "terminal, do not retry" status. Retrying a
+    // terminal failure - a bad token, a malformed payload - just burns the rate-limit budget
+    // that the retryable case actually needs.
+    const isRetryable = result.status >= 500;
+    if (!isRetryable) {
+      console.log("");
+      console.log("TERMINAL failure - not retrying. This will not fix itself on a retry;");
+      console.log("read the error above (auth, payload or a genuine bug).");
+      process.exitCode = 1;
+      return;
+    }
+
+    if (noRetry) {
+      console.log("");
+      console.log("Retryable failure, but --no-retry was passed.");
+      process.exitCode = 1;
+      return;
+    }
+    if (attempt >= maxAttempts) {
+      console.log("");
+      console.log(`Giving up after ${attempt} attempts. Progress made so far is persisted;`);
+      console.log("re-run to continue from where it stopped.");
+      process.exitCode = 1;
+      return;
+    }
+
+    // Backoff. A Meta ad-account throttle is measured in tens of minutes, not seconds, so a
+    // rate-limit failure starts far higher than a transient one - retrying a throttle every few
+    // seconds just consumes budget and extends the lockout. Jitter avoids lock-stepping with
+    // any other client on the same account.
+    const looksRateLimited = /rate limit|too many calls|80\d{3}/i.test(result.body.error ?? "");
+    const baseMs = looksRateLimited ? 5 * 60_000 : 30_000;
+    const capMs = 30 * 60_000;
+    const backoffMs = Math.min(baseMs * Math.pow(2, attempt - 1), capMs);
+    const jittered = Math.round(backoffMs * (0.8 + Math.random() * 0.4));
+
+    if (Date.now() + jittered > deadline) {
+      console.log("");
+      console.log(`Next wait would exceed the ${maxHours}h budget. Stopping.`);
+      console.log("Progress made so far is persisted; re-run to continue.");
+      process.exitCode = 1;
+      return;
+    }
+
+    const mins = (jittered / 60_000).toFixed(1);
+    const at = new Date(Date.now() + jittered).toLocaleTimeString();
+    console.log("");
+    console.log(
+      `Retryable${looksRateLimited ? " (rate limit)" : ""}. Waiting ${mins} min, next attempt at ${at}. Ctrl+C to stop.`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, jittered));
   }
 }
 
