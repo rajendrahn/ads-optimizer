@@ -151,11 +151,21 @@ async function main() {
     const isProgressYield = /more work remaining|will resume on retry/i.test(
       result.body.error ?? "",
     );
-    if (isProgressYield && !noRetry && Date.now() < deadline) {
+    // "Report not ready yet" is Meta still computing an async report - also normal progress,
+    // not a failure, but distinct from local chunking: each check costs a real API call, so it
+    // waits meaningfully rather than hammering. Exponential backoff would be actively wrong
+    // here - a report that becomes ready at minute 10 would go unnoticed until minute 30.
+    const isAwaitingReport = /not ready yet|async_status/i.test(result.body.error ?? "");
+    if ((isProgressYield || isAwaitingReport) && !noRetry && Date.now() < deadline) {
       progressYields += 1;
       attempt -= 1; // does not count against maxAttempts
-      console.log(`  -> partial progress saved; continuing (chunk ${progressYields})`);
-      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      const waitMs = isAwaitingReport ? 20_000 : 2_000;
+      console.log(
+        isAwaitingReport
+          ? `  -> report still computing; re-checking in 20s (check ${progressYields})`
+          : `  -> partial progress saved; continuing (chunk ${progressYields})`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
       continue;
     }
 
