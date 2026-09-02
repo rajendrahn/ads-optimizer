@@ -182,17 +182,40 @@ export async function fetchCreativesByIds(
   ids: string[],
 ): Promise<CreativeIdsBatchFetchResult> {
   if (ids.length === 0) return { rows: [], page: null };
-  const { data } = await meta.get<Record<string, unknown>>("", {
-    ids: ids.join(","),
-    fields: CREATIVE_FIELDS,
-  });
+
+  // ONE GET PER ID, sequentially - not `?ids=a,b,c`.
+  //
+  // The multi-get form was the obvious choice and it is GONE: Meta answers it with
+  // `HTTP 500: The ids query parameter is deprecated in v26.0+`, which this account hits
+  // despite config naming v21.0 (Meta serves a newer version once an app goes Live). Worse,
+  // that 500 classifies as a retryable server error, so a retry loop backs off for hours
+  // against a condition no retry can fix. Found on a real run, after the change had already
+  // paged campaigns/adsets/ads successfully.
+  //
+  // Per-id GETs preserve the entire point of the narrowing fix. The binding constraint on this
+  // account is CPU time, not call count (measured: call_count 5%, total_cputime 113%), and CPU
+  // is driven by how many creatives get assembled with object_story_spec/asset_feed_spec - not
+  // by how many HTTP requests carry them. Fetching N referenced creatives one-per-call costs
+  // roughly the same CPU as N/25 batched calls and vastly less than listing all 4,000+ on the
+  // account. Call count rises, into the ~95% of that budget we are not using.
+  //
+  // Sequential, not Promise.all: MetaClient self-throttles per request against the
+  // X-Business-Use-Case-Usage header (sec 7.1), and firing a batch concurrently would sail
+  // straight past that pre-emption - the exact thing it exists to prevent.
   const rows: RawMetaCreative[] = [];
-  for (const value of Object.values(data)) {
-    if (value && typeof value === "object" && "id" in value) {
-      rows.push(value as RawMetaCreative);
+  const pages: unknown[] = [];
+  for (const id of ids) {
+    const { data } = await meta.get<Record<string, unknown>>(`/${id}`, {
+      fields: CREATIVE_FIELDS,
+    });
+    pages.push(data);
+    // A deleted or inaccessible creative can come back without an id; skip rather than
+    // fabricate a placeholder, matching the multi-get behaviour this replaces.
+    if (data && typeof data === "object" && "id" in data) {
+      rows.push(data as unknown as RawMetaCreative);
     }
   }
-  return { rows, page: data };
+  return { rows, page: pages };
 }
 
 /** One minimal live call: the ad account's own billing currency, authoritative for

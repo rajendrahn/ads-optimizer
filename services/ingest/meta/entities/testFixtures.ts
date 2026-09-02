@@ -206,8 +206,10 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
     // creative ids the run's ads actually reference instead of listing the whole account.
     // Meta returns an OBJECT keyed by id (not a `data` array), and silently omits any id it
     // has nothing for - both reproduced here.
-    const idsParam = u.searchParams.get("ids");
-    if (idsParam) {
+    // Per-id creative GET: `/{creative-id}?fields=...`. Replaced the `?ids=` multi-get, which
+    // Meta answers with "deprecated in v26.0+" on a live app - see fetch.ts's own comment.
+    const creativeIdMatch = /\/(cr_[A-Za-z0-9_]+)$/.exec(u.pathname);
+    if (creativeIdMatch) {
       if (shouldInjectFailure("adcreatives")) return rateLimitedResponse();
       const known: Record<string, unknown> = {
         cr_standard: {
@@ -231,15 +233,12 @@ export function buildTestFetchImpl(options: TestFetchImplOptions = {}) {
           },
         },
       };
-      const body: Record<string, unknown> = {};
-      for (const id of idsParam.split(",")) {
-        const hit = known[id];
-        // An unknown id is simply absent from the response, matching Meta's documented
-        // multi-get behaviour - never an error, and never a fabricated placeholder.
-        if (hit) body[id] = hit;
-        requestedCreativeIds.push(id);
-      }
-      return jsonResponse(body);
+      const id = creativeIdMatch[1] ?? "";
+      requestedCreativeIds.push(id);
+      const hit = known[id];
+      // An unknown/deleted creative comes back without an id rather than as an error - the
+      // caller skips it instead of fabricating a placeholder.
+      return jsonResponse(hit ?? {});
     }
     throw new Error(`unexpected path in test fixture: ${u.pathname}`);
   });
