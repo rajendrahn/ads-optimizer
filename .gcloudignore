@@ -27,7 +27,9 @@ _tmp_*
 .firebase/
 *-debug.log
 
-# Not needed by the reasoner image (its Dockerfile copies only shared/, services/, scripts/)
-web/
+# functions/ is deployed by the Firebase CLI, which packages it separately - no Cloud Build
+# image needs it. web/ IS needed: web/Dockerfile builds the UI image from this same context.
+# (It was excluded here originally, when the reasoner worker was the only image; the UI build
+# then failed with "unable to evaluate symlinks in Dockerfile path: lstat /workspace/web".)
 functions/
 test/

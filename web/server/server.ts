@@ -144,6 +144,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // Static assets are served BEFORE the auth gate, and must be: the browser has to fetch
+  // index.html and the JS bundle in order to render a sign-in form at all. Gating them behind
+  // a bearer token makes the app unreachable - there is no way to obtain a token without first
+  // loading the code that signs you in.
+  //
+  // This is not a hole. Nothing here is data: the bundle is public client code, every /api
+  // route below still verifies an ID token, and firestore.rules denies all direct client
+  // access, so the app can render but shows nothing until a real user signs in.
+  if (STATIC_DIR && req.method === "GET" && !url.startsWith("/api/")) {
+    const served = await serveStatic(url, res);
+    if (served) return;
+  }
+
   const deps = await getWebServerDeps();
   const user = await verifyAuthHeader(
     req.headers as Record<string, string | string[] | undefined>,
@@ -202,6 +215,50 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 
   sendJson(res, 404, { error: `no route for ${req.method} ${url}` });
+}
+
+const STATIC_DIR = process.env.WEB_STATIC_DIR ?? "";
+
+const CONTENT_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".json": "application/json; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".png": "image/png",
+  ".woff2": "font/woff2",
+};
+
+/** Returns true when it wrote a response. Falls back to index.html so client-side routing
+ * works on a deep link, which is why a miss is not automatically a 404. */
+async function serveStatic(url: string, res: ServerResponse): Promise<boolean> {
+  const { readFile } = await import("node:fs/promises");
+  const { join, normalize, extname } = await import("node:path");
+
+  const pathOnly = url.split("?")[0] ?? "/";
+  // normalize + the prefix check below stop `../` escaping the static root.
+  const candidate = normalize(join(STATIC_DIR, pathOnly === "/" ? "index.html" : pathOnly));
+  if (!candidate.startsWith(normalize(STATIC_DIR))) return false;
+
+  for (const file of [candidate, join(STATIC_DIR, "index.html")]) {
+    try {
+      const body = await readFile(file);
+      res.writeHead(200, {
+        "Content-Type": CONTENT_TYPES[extname(file)] ?? "application/octet-stream",
+        // Hashed asset filenames are immutable; index.html must never be cached or a deploy
+        // would keep serving the old bundle.
+        "Cache-Control": file.endsWith("index.html")
+          ? "no-store"
+          : "public, max-age=31536000, immutable",
+      });
+      res.end(body);
+      return true;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return false;
 }
 
 const port = Number(process.env.PORT ?? 8081);

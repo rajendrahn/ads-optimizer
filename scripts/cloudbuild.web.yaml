@@ -1,0 +1,29 @@
+# Build config for the D6 web app image (API + built frontend, one service).
+#
+# Same reason as cloudbuild.reasoner.yaml: the Dockerfile lives at web/Dockerfile but COPYs
+# shared/, services/ and scripts/, so the build CONTEXT must be the repo root while the
+# Dockerfile is elsewhere - a pairing `gcloud run deploy --source` cannot express.
+#
+# The VITE_* build args are inlined into the bundle at build time (Vite does not read runtime
+# env), which is why they are here rather than as Cloud Run env vars.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - web/Dockerfile
+      - -t
+      - ${_IMAGE}
+      - --build-arg
+      - VITE_FIREBASE_API_KEY=${_VITE_FIREBASE_API_KEY}
+      - --build-arg
+      - VITE_FIREBASE_AUTH_DOMAIN=${_VITE_FIREBASE_AUTH_DOMAIN}
+      - --build-arg
+      - VITE_FIREBASE_PROJECT_ID=${_VITE_FIREBASE_PROJECT_ID}
+      - --build-arg
+      - VITE_FIREBASE_APP_ID=${_VITE_FIREBASE_APP_ID}
+      - .
+images:
+  - ${_IMAGE}
+options:
+  logging: CLOUD_LOGGING_ONLY
