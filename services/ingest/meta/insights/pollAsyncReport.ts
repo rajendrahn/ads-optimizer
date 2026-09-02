@@ -192,8 +192,47 @@ async function pageResults(
 
 export const metaPollAsyncReportHandler: TaskHandler = async (ctx) => {
   const payload = parsePayload(ctx.payload);
+
+  // SWEEP MODE: no reportRunId means "advance every report job still in flight".
+  //
+  // This exists because META_SYNC_INSIGHTS submits a report and stops - it does NOT enqueue the
+  // poll, since the reportRunId only exists after Meta answers the submission. Under manual
+  // operation a human passes that id to the next call, but on a schedule nobody does, so a
+  // scheduled insights sync would submit reports that are never collected and no data would
+  // ever land. Sweeping is also self-healing in a way chaining is not: a job orphaned by a
+  // crashed or killed poller is picked up by the next sweep rather than stranded forever.
+  //
+  // One bounded step per job per invocation, exactly as the single-job path does, so a sweep
+  // cannot run away; the scheduler simply calls it again.
   if (!payload.reportRunId) {
-    throw terminal("META_POLL_ASYNC_REPORT: payload.reportRunId is required");
+    const jobStore = createFirestoreReportJobStore(getDb());
+    const inFlight = await jobStore.listInFlight();
+    if (inFlight.length === 0) {
+      return { newRowCount: 0, summary: { swept: 0, note: "no report jobs in flight" } };
+    }
+    let sweptRows = 0;
+    const outcomes: Record<string, string> = {};
+    for (const job of inFlight) {
+      try {
+        // Re-enter this same handler with the id filled in, rather than duplicating the
+        // single-job path. Recursion depth is exactly one: that branch has a reportRunId, so it
+        // never reaches sweep mode again.
+        const result = await metaPollAsyncReportHandler({
+          ...ctx,
+          payload: { ...payload, reportRunId: job.reportRunId },
+        });
+        sweptRows += result.newRowCount ?? 0;
+        outcomes[job.reportRunId] = "advanced";
+      } catch (err) {
+        // A job that is merely "not ready yet" or "has more pages" throws by design - that is
+        // normal progress, not a failure, and must not abort the sweep of OTHER jobs.
+        outcomes[job.reportRunId] = err instanceof Error ? err.message.slice(0, 80) : "error";
+      }
+    }
+    return {
+      newRowCount: sweptRows,
+      summary: { swept: inFlight.length, outcomes },
+    };
   }
 
   const maxPollAttempts = payload.maxPollAttempts ?? 90;

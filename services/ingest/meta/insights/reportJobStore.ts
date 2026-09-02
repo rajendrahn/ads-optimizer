@@ -10,6 +10,9 @@ import { metaInsightsReportJobSchema, type MetaInsightsReportJob } from "@shared
 export interface ReportJobStore {
   get(reportRunId: string): Promise<MetaInsightsReportJob | null>;
   set(reportRunId: string, doc: MetaInsightsReportJob): Promise<void>;
+  /** Every job not in a terminal phase (DONE/FAILED) - what a scheduled sweep advances. See
+   * pollAsyncReport.ts's sweep-mode comment for why sweeping rather than chaining. */
+  listInFlight(): Promise<MetaInsightsReportJob[]>;
 }
 
 export function createFirestoreReportJobStore(db: Firestore): ReportJobStore {
@@ -21,6 +24,14 @@ export function createFirestoreReportJobStore(db: Firestore): ReportJobStore {
   return {
     get: (reportRunId) => repo.get(reportRunId),
     set: (reportRunId, doc) => repo.set(reportRunId, doc),
+    async listInFlight() {
+      // Filtered client-side on `phase` rather than with a `where` clause: this collection holds
+      // one document per report submission (a handful per day at most), so a full read is
+      // cheaper than the composite index a query would need, and it cannot silently miss a job
+      // because an index has not finished building.
+      const all = await repo.query((c) => c);
+      return all.filter((j) => j.phase !== "DONE" && j.phase !== "FAILED");
+    },
   };
 }
 
@@ -32,6 +43,9 @@ export function createInMemoryReportJobStore(): ReportJobStore {
     },
     async set(reportRunId, doc) {
       jobs.set(reportRunId, doc);
+    },
+    async listInFlight() {
+      return [...jobs.values()].filter((j) => j.phase !== "DONE" && j.phase !== "FAILED");
     },
   };
 }
